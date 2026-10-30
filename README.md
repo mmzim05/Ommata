@@ -1,4 +1,4 @@
-# unimedia
+# anyview
 
 One Linux app for everything media-viewing related: browse and view photos
 (including camera RAW) and videos, with simple crop and trim tools.
