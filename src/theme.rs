@@ -1,0 +1,181 @@
+//! Colors from the active Omarchy theme, falling back to egui's system-following
+//! default. The theme file is watched so `omarchy theme set` restyles a running app.
+
+use eframe::egui::{self, Color32, Visuals};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Palette {
+    pub dark: bool,
+    pub bg: Color32,
+    pub surface: Color32,
+    pub fg: Color32,
+    pub muted: Color32,
+    pub accent: Color32,
+    pub selection: Color32,
+    pub danger: Color32,
+}
+
+impl Palette {
+    fn fallback(dark: bool) -> Self {
+        let v = if dark {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        };
+        Self {
+            dark,
+            bg: v.panel_fill,
+            surface: v.window_fill,
+            fg: v.text_color(),
+            muted: v.weak_text_color(),
+            accent: v.selection.stroke.color,
+            selection: v.selection.bg_fill,
+            danger: v.error_fg_color,
+        }
+    }
+}
+
+fn state_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("omarchy/current"))
+}
+
+/// `omarchy theme set` swaps the theme directory, then rewrites this file last.
+fn stamp_path() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("theme.name"))
+}
+
+fn parse_hex(s: &str) -> Option<Color32> {
+    let h = s.trim().trim_start_matches('#');
+    let v = u32::from_str_radix(h.get(..6)?, 16).ok()?;
+    Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Reads the flat `key = "value"` lines of Omarchy's colors.toml.
+fn load_omarchy() -> Option<Palette> {
+    let text = std::fs::read_to_string(state_dir()?.join("theme/colors.toml")).ok()?;
+    let get = |key: &str| {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
+        })
+    };
+    let color = |key: &str| get(key).and_then(|v| parse_hex(&v));
+    let dark = get("mode").is_none_or(|m| m != "light");
+    let bg = color("background")?;
+    let fg = color("foreground")?;
+    let base = Palette::fallback(dark);
+    let surface = color("lighter_background")
+        .filter(|c| *c != bg)
+        .unwrap_or_else(|| lerp(bg, fg, 0.08));
+    Some(Palette {
+        dark,
+        bg,
+        surface,
+        fg,
+        muted: color("dark_foreground")
+            .or(color("muted"))
+            .unwrap_or(base.muted),
+        accent: color("accent").unwrap_or(base.accent),
+        selection: color("selection").unwrap_or(base.selection),
+        danger: color("red").unwrap_or(base.danger),
+    })
+}
+
+pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+pub struct Theme {
+    pub pal: Palette,
+    omarchy: bool,
+    stamp: Option<SystemTime>,
+    last_check: f64,
+}
+
+impl Theme {
+    pub fn new(ctx: &egui::Context) -> Self {
+        let mut t = Self {
+            pal: Palette::fallback(true),
+            omarchy: false,
+            stamp: None,
+            last_check: 0.0,
+        };
+        t.reload(ctx);
+        t
+    }
+
+    fn reload(&mut self, ctx: &egui::Context) {
+        self.stamp = stamp_path().and_then(|p| p.metadata().ok()?.modified().ok());
+        match load_omarchy() {
+            Some(p) => {
+                self.omarchy = true;
+                self.pal = p;
+            }
+            None => {
+                self.omarchy = false;
+                self.pal = Palette::fallback(ctx.theme() == egui::Theme::Dark);
+            }
+        }
+        apply(ctx, &self.pal);
+    }
+
+    /// Cheap per-frame check: one stat() at most every 2 seconds, piggybacking on
+    /// repaints that happen anyway, so an idle window stays fully idle.
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if now - self.last_check < 2.0 {
+            return;
+        }
+        self.last_check = now;
+        let stamp = stamp_path().and_then(|p| p.metadata().ok()?.modified().ok());
+        let system_dark = ctx.theme() == egui::Theme::Dark;
+        if stamp != self.stamp || (!self.omarchy && system_dark != self.pal.dark) {
+            self.reload(ctx);
+        }
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+}
+
+fn apply(ctx: &egui::Context, p: &Palette) {
+    let mut v = if p.dark {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
+    v.override_text_color = Some(p.fg);
+    v.panel_fill = p.bg;
+    v.window_fill = p.surface;
+    v.extreme_bg_color = p.bg;
+    v.faint_bg_color = p.surface;
+    v.window_stroke = egui::Stroke::new(1.0, lerp(p.surface, p.fg, 0.12));
+    v.selection.bg_fill = p.selection;
+    v.selection.stroke = egui::Stroke::new(1.0, p.accent);
+    v.hyperlink_color = p.accent;
+    v.error_fg_color = p.danger;
+    let radius = egui::CornerRadius::same(8);
+    v.window_corner_radius = egui::CornerRadius::same(12);
+    let w = &mut v.widgets;
+    for (state, t) in [
+        (&mut w.noninteractive, 0.0),
+        (&mut w.inactive, 0.06),
+        (&mut w.hovered, 0.14),
+        (&mut w.active, 0.22),
+        (&mut w.open, 0.10),
+    ] {
+        state.bg_fill = lerp(p.surface, p.fg, t);
+        state.weak_bg_fill = state.bg_fill;
+        state.bg_stroke = egui::Stroke::NONE;
+        state.fg_stroke.color = p.fg;
+        state.corner_radius = radius;
+    }
+    w.noninteractive.bg_fill = p.surface;
+    w.noninteractive.weak_bg_fill = p.surface;
+    w.active.fg_stroke.color = p.accent;
+    ctx.set_visuals(v);
+}

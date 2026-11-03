@@ -1,0 +1,15 @@
+// With the `static` feature, FFmpeg's libavcodec references dav1d, built next to
+// it by scripts/build-ffmpeg.sh. Passed as a trailing link argument so it lands
+// after libavcodec on the linker command line.
+fn main() {
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    if std::env::var_os("CARGO_FEATURE_STATIC").is_none() {
+        return;
+    }
+    if let Some(dir) = std::env::var_os("FFMPEG_DIR") {
+        let lib = std::path::Path::new(&dir).join("lib/libdav1d.a");
+        if lib.exists() {
+            println!("cargo:rustc-link-arg={}", lib.display());
+        }
+    }
+}

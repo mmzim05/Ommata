@@ -1,0 +1,156 @@
+//! What kind of media a path is, and the sorted list of media files in its folder.
+
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Image,
+    Video,
+}
+
+const IMAGE_EXT: &[&str] = &[
+    "jpg", "jpeg", "jpe", "png", "webp", "gif", "tif", "tiff", "bmp",
+];
+pub const RAW_EXT: &[&str] = &[
+    "rw2", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "dng", "pef", "srw",
+    "erf", "3fr", "iiq", "mos", "kdc", "dcr", "mrw",
+];
+const VIDEO_EXT: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "webm", "ivf", "avi", "ts", "mts", "m2ts", "flv", "ogv", "wmv",
+    "mpg", "mpeg", "3gp",
+];
+
+pub fn kind(path: &Path) -> Option<Kind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if IMAGE_EXT.contains(&ext.as_str()) || RAW_EXT.contains(&ext.as_str()) {
+        Some(Kind::Image)
+    } else if VIDEO_EXT.contains(&ext.as_str()) {
+        Some(Kind::Video)
+    } else {
+        None
+    }
+}
+
+/// Media files next to `path`, naturally sorted ("img2" before "img10").
+pub fn siblings(path: &Path) -> Vec<PathBuf> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && kind(p).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    files
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.first(), b.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let na = a.iter().take_while(|c| c.is_ascii_digit()).count();
+                let nb = b.iter().take_while(|c| c.is_ascii_digit()).count();
+                let (da, db) = (trim_zeros(&a[..na]), trim_zeros(&b[..nb]));
+                let ord = da.len().cmp(&db.len()).then(da.cmp(db));
+                if ord.is_ne() {
+                    return ord;
+                }
+                a = &a[na..];
+                b = &b[nb..];
+            }
+            (Some(x), Some(y)) => {
+                let ord = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if ord.is_ne() {
+                    return ord;
+                }
+                a = &a[1..];
+                b = &b[1..];
+            }
+        }
+    }
+}
+
+fn trim_zeros(d: &[u8]) -> &[u8] {
+    let n = d.iter().take_while(|&&c| c == b'0').count();
+    &d[n.min(d.len().saturating_sub(1))..]
+}
+
+/// `photo.jpg` -> `photo-edit.jpg` (with extension `ext`, or the source's own
+/// when `None`); never clobbers an existing file (`photo-edit-2.jpg`, ...).
+pub fn edit_copy_path(path: &Path, ext: Option<&str>) -> PathBuf {
+    suffixed_path(path, "edit", ext)
+}
+
+/// `clip.mp4` -> `clip-original.mp4`, the name an overwritten file's original
+/// goes to the trash under.
+pub fn original_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "original", None)
+}
+
+fn suffixed_path(path: &Path, tag: &str, ext: Option<&str>) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = ext
+        .map(|e| format!(".{e}"))
+        .or_else(|| {
+            path.extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+        })
+        .unwrap_or_default();
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let mut n = 1;
+    loop {
+        let suffix = if n == 1 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
+        let p = dir.join(format!("{stem}-{tag}{suffix}{ext}"));
+        if !p.exists() {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+/// Temp file in the same directory, so the final rename is atomic.
+pub fn temp_path(target: &Path) -> PathBuf {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    target.with_file_name(format!(".{name}.anyview-tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn natural_order() {
+        let mut v = vec!["img10.jpg", "img2.jpg", "IMG1.jpg", "img02b.jpg"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["IMG1.jpg", "img2.jpg", "img02b.jpg", "img10.jpg"]);
+    }
+
+    #[test]
+    fn edit_name() {
+        let dir = std::env::temp_dir().join(format!("anyview-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mp4");
+        assert_eq!(edit_copy_path(&src, None), dir.join("clip-edit.mp4"));
+        std::fs::write(dir.join("clip-edit.mp4"), b"").unwrap();
+        assert_eq!(edit_copy_path(&src, None), dir.join("clip-edit-2.mp4"));
+        assert_eq!(
+            edit_copy_path(&dir.join("a.RW2"), Some("jpg")),
+            dir.join("a-edit.jpg")
+        );
+        assert_eq!(original_path(&src), dir.join("clip-original.mp4"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

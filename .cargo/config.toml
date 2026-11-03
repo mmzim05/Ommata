@@ -1,0 +1,3 @@
+# Static FFmpeg built by scripts/build-ffmpeg.sh.
+[env]
+FFMPEG_DIR = { value = "target/ffmpeg", relative = true }
