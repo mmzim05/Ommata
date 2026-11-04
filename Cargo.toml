@@ -1,5 +1,5 @@
 [package]
-name = "anyview"
+name = "omalens"
 version = "0.1.0"
 edition = "2024"
 description = "Fast unified image and video viewer with crop and trim"

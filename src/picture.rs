@@ -446,11 +446,11 @@ mod tests {
 
 #[cfg(test)]
 mod raw_tests {
-    /// Display decode time for any image: ANYVIEW_TEST_IMAGE=x.jpg cargo test image_decode -- --ignored
+    /// Display decode time for any image: OMALENS_TEST_IMAGE=x.jpg cargo test image_decode -- --ignored
     #[test]
     #[ignore]
     fn image_decode_time() {
-        let path = std::path::PathBuf::from(std::env::var("ANYVIEW_TEST_IMAGE").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_IMAGE").unwrap());
         for _ in 0..3 {
             let started = std::time::Instant::now();
             let decoded = super::decode(&path, 8192).unwrap();
@@ -460,11 +460,11 @@ mod raw_tests {
 
     /// The half-size display develop matches the full develop, scaled down.
     /// Needs a large RAW without an embedded preview (Olympus, Samsung...):
-    /// ANYVIEW_TEST_RAW=photo.orf cargo test --release half_develop -- --ignored
+    /// OMALENS_TEST_RAW=photo.orf cargo test --release half_develop -- --ignored
     #[test]
     #[ignore]
     fn half_develop_matches_full() {
-        let path = std::path::PathBuf::from(std::env::var("ANYVIEW_TEST_RAW").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
         let started = std::time::Instant::now();
         let (half, _, _) = super::read(&path, false).unwrap();
         let half_time = started.elapsed();
@@ -491,11 +491,11 @@ mod raw_tests {
         assert!(mean < 4.0, "half develop differs by {mean:.2} on average");
     }
 
-    /// Needs a real RAW file: ANYVIEW_TEST_RAW=photo.rw2 cargo test -- --ignored
+    /// Needs a real RAW file: OMALENS_TEST_RAW=photo.rw2 cargo test -- --ignored
     #[test]
     #[ignore]
     fn raw_preview_and_develop() {
-        let path = std::path::PathBuf::from(std::env::var("ANYVIEW_TEST_RAW").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
         let started = std::time::Instant::now();
         let decoded = super::decode(&path, 8192).unwrap();
         eprintln!("preview {:?} in {:?}", decoded.size, started.elapsed());

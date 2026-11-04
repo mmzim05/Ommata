@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="assets/anyview.svg" width="96" height="96" alt="anyview" />
+  <img src="assets/omalens.svg" width="96" height="96" alt="omalens" />
 </p>
 
-<h1 align="center">anyview</h1>
+<h1 align="center">omalens</h1>
 
 <p align="center">
   <strong>One fast viewer for your photos, camera RAW files and videos on Linux.</strong>
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/mmzim05/anyview" alt="Licence" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/mmzim05/omalens" alt="Licence" /></a>
   <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux" />
 </p>
 
-![anyview playing a motorbike race video, paused, with the file bar on top and the seek bar at the bottom](docs/screenshots/video.webp)
+![omalens playing a motorbike race video, paused, with the file bar on top and the seek bar at the bottom](docs/screenshots/video.webp)
 
 <table>
   <tr>
@@ -38,12 +38,12 @@
 ## Install
 
 Download the `.AppImage` file from the
-[latest release](https://github.com/mmzim05/anyview/releases/latest), make it executable,
+[latest release](https://github.com/mmzim05/omalens/releases/latest), make it executable,
 and open it:
 
 ```sh
-chmod +x anyview-*-x86_64.AppImage
-./anyview-*-x86_64.AppImage
+chmod +x omalens-*-x86_64.AppImage
+./omalens-*-x86_64.AppImage
 ```
 
 To add it to your app menu, open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever).
@@ -53,7 +53,7 @@ Intel, `libva-mesa-driver` for AMD.
 
 ## Usage
 
-Open a photo or video from your file manager with anyview, or run `anyview <file-or-folder>`.
+Open a photo or video from your file manager with omalens, or run `omalens <file-or-folder>`.
 The controls fade away when you are not using them, and come back when you move the mouse.
 
 Press `?` or click the **?** button to see the keyboard shortcuts.
@@ -76,8 +76,8 @@ On Arch:
 
 ```sh
 sudo pacman -S --needed git rust meson ninja nasm libva x264 x265
-git clone https://github.com/mmzim05/anyview
-cd anyview
+git clone https://github.com/mmzim05/omalens
+cd omalens
 ./scripts/build-ffmpeg.sh
 cargo build --release
 sudo ./scripts/install.sh

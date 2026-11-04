@@ -220,7 +220,7 @@ struct Job {
     handle: JoinHandle<Result<(PathBuf, Option<String>), String>>,
 }
 
-/// The anyview window.
+/// The omalens window.
 pub struct App {
     theme: Theme,
     loader: Loader,
@@ -270,7 +270,7 @@ impl App {
         });
         let gpu = creation.gl.clone().and_then(|gl| {
             Gpu::new(gl)
-                .inspect_err(|error| eprintln!("anyview: video decodes on the CPU: {error}"))
+                .inspect_err(|error| eprintln!("omalens: video decodes on the CPU: {error}"))
                 .ok()
         });
         let (snap_sender, snap_receiver) = channel();
@@ -336,7 +336,7 @@ impl App {
     fn go(&mut self, ctx: &egui::Context, index: usize) {
         if self.files.is_empty() {
             self.player = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title("anyview".into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("omalens".into()));
             return;
         }
         self.index = index.min(self.files.len() - 1);
@@ -371,7 +371,7 @@ impl App {
         }
         self.sync_waveform(ctx);
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — anyview")));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — omalens")));
     }
 
     /// Keep a waveform scan running for the current video while the setting is on.
@@ -1004,7 +1004,7 @@ impl App {
         ui.painter().text(
             center - vec2(0.0, 30.0),
             Align2::CENTER_CENTER,
-            "anyview",
+            "omalens",
             FontId::proportional(28.0),
             palette.fg,
         );
@@ -1735,7 +1735,7 @@ fn remove_temp(temp: &Path) {
     if let Err(error) = std::fs::remove_file(temp)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("anyview: remove {}: {error}", temp.display());
+        eprintln!("omalens: remove {}: {error}", temp.display());
     }
 }
 

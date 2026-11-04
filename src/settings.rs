@@ -1,5 +1,5 @@
 //! User settings, stored as `key = value` lines in
-//! `$XDG_CONFIG_HOME/anyview/settings.conf`.
+//! `$XDG_CONFIG_HOME/omalens/settings.conf`.
 
 use std::path::PathBuf;
 
@@ -35,7 +35,7 @@ fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("anyview/settings.conf"))
+    Some(base.join("omalens/settings.conf"))
 }
 
 impl Settings {

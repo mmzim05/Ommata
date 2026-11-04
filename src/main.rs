@@ -19,7 +19,7 @@ fn main() -> eframe::Result {
     }
     let start_path = args.first().map(std::path::PathBuf::from);
     if let Err(error) = ffmpeg_next::init() {
-        eprintln!("anyview: ffmpeg init failed: {error}");
+        eprintln!("omalens: ffmpeg init failed: {error}");
     }
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
 
@@ -29,8 +29,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_app_id("anyview")
-            .with_title("anyview")
+            .with_app_id("omalens")
+            .with_title("omalens")
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([360.0, 240.0])
             .with_drag_and_drop(true),
@@ -40,17 +40,17 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "anyview",
+        "omalens",
         options,
         Box::new(move |creation| Ok(Box::new(app::App::new(creation, loader, start)))),
     )
 }
 
-/// `anyview --thumbnail INPUT OUTPUT SIZE`, called by file managers through
-/// the freedesktop thumbnailer spec (see assets/anyview.thumbnailer).
+/// `omalens --thumbnail INPUT OUTPUT SIZE`, called by file managers through
+/// the freedesktop thumbnailer spec (see assets/omalens.thumbnailer).
 fn thumbnail(args: &[std::ffi::OsString]) -> i32 {
     let [input, output, size] = args else {
-        eprintln!("usage: anyview --thumbnail INPUT OUTPUT SIZE");
+        eprintln!("usage: omalens --thumbnail INPUT OUTPUT SIZE");
         return 2;
     };
     let size = size
@@ -60,7 +60,7 @@ fn thumbnail(args: &[std::ffi::OsString]) -> i32 {
     match picture::thumbnail(input.as_ref(), output.as_ref(), size) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("anyview: thumbnail: {error}");
+            eprintln!("omalens: thumbnail: {error}");
             1
         }
     }

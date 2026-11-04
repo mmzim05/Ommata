@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Package anyview as an AppImage in target/appimage, with linuxdeploy.
+# Package omalens as an AppImage in target/appimage, with linuxdeploy.
 # An AppImage only runs on systems whose glibc is at least as new as the
 # build machine's, so release builds run on an old distro (the release
 # workflow uses Ubuntu 22.04). x264 and x265 are bundled; libva and libdrm
@@ -40,16 +40,16 @@ main() {
   linuxdeploy="$(find_linuxdeploy)"
   # Extract-and-run: works without FUSE, as in containers and CI.
   APPIMAGE_EXTRACT_AND_RUN=1 \
-    LDAI_OUTPUT="$OUT/anyview-$(version)-x86_64.AppImage" \
+    LDAI_OUTPUT="$OUT/omalens-$(version)-x86_64.AppImage" \
     "$linuxdeploy" \
     --appdir "$APPDIR" \
-    --executable "$ROOT/target/release/anyview" \
-    --desktop-file "$ROOT/assets/anyview.desktop" \
-    --icon-file "$ROOT/assets/anyview.svg" \
+    --executable "$ROOT/target/release/omalens" \
+    --desktop-file "$ROOT/assets/omalens.desktop" \
+    --icon-file "$ROOT/assets/omalens.svg" \
     --exclude-library 'libva*' \
     --exclude-library 'libdrm*' \
     --output appimage
-  echo "Built $OUT/anyview-$(version)-x86_64.AppImage"
+  echo "Built $OUT/omalens-$(version)-x86_64.AppImage"
 }
 
 main "$@"

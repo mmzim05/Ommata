@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Install anyview. Default is system-wide under /usr/local (run with sudo),
+# Install omalens. Default is system-wide under /usr/local (run with sudo),
 # which is also what file-manager RAW thumbnails need: Nautilus runs
 # thumbnailers in a sandbox that only sees /usr. PREFIX=~/.local installs for
 # the current user without thumbnails. Builds the release binary if missing.
@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 readonly ROOT
 readonly PREFIX="${PREFIX:-/usr/local}"
-readonly BIN="$ROOT/target/release/anyview"
+readonly BIN="$ROOT/target/release/omalens"
 
 build_if_missing() {
   if [[ -x "$BIN" ]]; then
@@ -31,9 +31,9 @@ install_thumbnailer() {
     return
   fi
   mkdir -p "$thumbnailers"
-  sed "s|@BINDIR@|$PREFIX/bin|g" "$ROOT/assets/anyview.thumbnailer" \
-    > "$thumbnailers/anyview.thumbnailer"
-  chmod 644 "$thumbnailers/anyview.thumbnailer"
+  sed "s|@BINDIR@|$PREFIX/bin|g" "$ROOT/assets/omalens.thumbnailer" \
+    > "$thumbnailers/omalens.thumbnailer"
+  chmod 644 "$thumbnailers/omalens.thumbnailer"
 }
 
 # Desktop caches are optional: a missing tool or a failed refresh only delays
@@ -50,14 +50,14 @@ refresh_caches() {
 
 main() {
   build_if_missing
-  install -Dm755 "$BIN" "$PREFIX/bin/anyview"
-  install -Dm644 "$ROOT/assets/anyview.desktop" \
-    "$PREFIX/share/applications/anyview.desktop"
-  install -Dm644 "$ROOT/assets/anyview.svg" \
-    "$PREFIX/share/icons/hicolor/scalable/apps/anyview.svg"
+  install -Dm755 "$BIN" "$PREFIX/bin/omalens"
+  install -Dm644 "$ROOT/assets/omalens.desktop" \
+    "$PREFIX/share/applications/omalens.desktop"
+  install -Dm644 "$ROOT/assets/omalens.svg" \
+    "$PREFIX/share/icons/hicolor/scalable/apps/omalens.svg"
   install_thumbnailer
   refresh_caches
-  echo "Installed anyview to $PREFIX/bin/anyview"
+  echo "Installed omalens to $PREFIX/bin/omalens"
 }
 
 main "$@"

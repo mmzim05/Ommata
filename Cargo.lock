@@ -231,20 +231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyview"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "eframe",
- "ffmpeg-next",
- "image",
- "libloading",
- "rawler",
- "rfd",
- "trash",
-]
-
-[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2728,6 +2714,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "omalens"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "eframe",
+ "ffmpeg-next",
+ "image",
+ "libloading",
+ "rawler",
+ "rfd",
+ "trash",
 ]
 
 [[package]]

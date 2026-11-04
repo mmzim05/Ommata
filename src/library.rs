@@ -132,7 +132,7 @@ fn suffixed_path(path: &Path, tag: &str, ext: Option<&str>) -> PathBuf {
 /// Temp file in the same directory, so the final rename is atomic.
 pub fn temp_path(target: &Path) -> PathBuf {
     let name = target.file_name().unwrap_or_default().to_string_lossy();
-    target.with_file_name(format!(".{name}.anyview-tmp"))
+    target.with_file_name(format!(".{name}.omalens-tmp"))
 }
 
 #[cfg(test)]
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn edit_name() {
-        let dir = std::env::temp_dir().join(format!("anyview-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omalens-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("clip.mp4");
         assert_eq!(edit_copy_path(&src, None), dir.join("clip-edit.mp4"));

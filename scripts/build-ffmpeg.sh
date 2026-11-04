@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Build a minimal static FFmpeg plus dav1d (AV1 decoding) into target/ffmpeg.
-# anyview links both statically, so the final binary needs no FFmpeg at
+# omalens links both statically, so the final binary needs no FFmpeg at
 # runtime. It does link the system's libva (GPU decoding) and x264/x265
 # (re-encoding the frames before a frame-exact trim cut) dynamically:
 # pacman -S libva x264 x265. x264 and x265 make this FFmpeg build GPL.
@@ -29,7 +29,7 @@ readonly DECODERS=(
 readonly PARSERS=(h264 hevc vp8 vp9 av1 mpeg4video mpegvideo mjpeg vc1 aac
   aac_latm mpegaudio opus vorbis flac ac3 dca)
 # GPU decoding through VA-API. libva is linked dynamically: it loads the GPU
-# vendor's driver at runtime, and anyview falls back to the CPU without one.
+# vendor's driver at runtime, and omalens falls back to the CPU without one.
 readonly HWACCELS=(h264_vaapi hevc_vaapi vp8_vaapi vp9_vaapi av1_vaapi
   mpeg2_vaapi mpeg4_vaapi vc1_vaapi wmv3_vaapi)
 

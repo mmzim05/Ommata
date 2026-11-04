@@ -1,4 +1,4 @@
-# anyview: plan
+# omalens: plan
 
 ## Goal
 
