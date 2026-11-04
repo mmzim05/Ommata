@@ -20,9 +20,14 @@ pub fn is_raw(path: &Path) -> bool {
     crate::library::RAW_EXT.contains(&ext(path).as_str())
 }
 
+/// Display develops of RAW files without an embedded preview run at half
+/// size when that still leaves this many pixels on the long side.
+const HALF_DEVELOP_MIN_SIDE: usize = 3000;
+
 /// Camera RAW. For display, the camera's embedded JPEG preview is used: it
-/// decodes in milliseconds instead of a full demosaic. `full` develops the
-/// sensor data (for saving).
+/// decodes in milliseconds instead of a full demosaic. Without one (Olympus,
+/// Samsung, Phase One...), display develops at half size. `full` develops
+/// all the sensor data (for saving).
 fn read_raw(path: &Path, full: bool) -> Result<Read, String> {
     use rawler::decoders::RawDecodeParams;
     let to_text = |error: rawler::RawlerError| error.to_string();
@@ -36,17 +41,22 @@ fn read_raw(path: &Path, full: bool) -> Result<Read, String> {
             .flatten()
             .or_else(|| decoder.preview_image(&src, &params).ok().flatten())
     };
-    let develop = || -> Result<DynamicImage, String> {
+    let develop = |half: bool| -> Result<DynamicImage, String> {
         let raw = decoder.raw_image(&src, &params, false).map_err(to_text)?;
-        rawler::imgop::develop::RawDevelop::default()
-            .develop_intermediate(&raw)
+        let developed = if half && can_develop_half(&raw) {
+            develop_half(raw)
+        } else {
+            rawler::imgop::develop::RawDevelop::default().develop_intermediate(&raw)
+        };
+        developed
             .map_err(to_text)?
             .to_dynamic_image()
             .ok_or_else(|| "unsupported RAW layout".to_string())
     };
     let mut picture = match (full, embedded()) {
         (false, Some(preview)) => preview,
-        _ => develop()?,
+        (false, None) => develop(true)?,
+        (true, _) => develop(false)?,
     };
     let orientation = decoder
         .raw_metadata(&src, &params)
@@ -57,6 +67,62 @@ fn read_raw(path: &Path, full: bool) -> Result<Read, String> {
         picture.apply_orientation(orientation);
     }
     Ok((picture, None, None))
+}
+
+/// Whether `raw` is a Bayer RGB mosaic big enough to develop at half size.
+fn can_develop_half(raw: &rawler::RawImage) -> bool {
+    use rawler::imgop::sensor::SensorType;
+    use rawler::rawimage::RawPhotometricInterpretation;
+    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
+        return false;
+    };
+    raw.cpp == 1
+        && config.cfa.is_rgb()
+        && config.sensor == SensorType::Bayer
+        && raw.fuji_rotation_width.is_none()
+        && raw.width.max(raw.height) / 2 >= HALF_DEVELOP_MIN_SIDE
+}
+
+/// Develop at half size: each 2x2 Bayer cell becomes one pixel (rawler's
+/// superpixel demosaic, a quarter of the work of a full demosaic), then the
+/// usual white balance, colour calibration, crop and sRGB steps.
+fn develop_half(mut raw: rawler::RawImage) -> rawler::Result<rawler::imgop::develop::Intermediate> {
+    use rawler::imgop::develop::{ProcessingStep, RawDevelop};
+    use rawler::imgop::sensor::Demosaic;
+    use rawler::imgop::sensor::bayer::superpixel::Superpixel3Channel;
+    use rawler::rawimage::RawPhotometricInterpretation;
+    raw.apply_scaling()?;
+    let RawPhotometricInterpretation::Cfa(config) = raw.photometric.clone() else {
+        return RawDevelop::default().develop_intermediate(&raw);
+    };
+    let pixels =
+        rawler::pixarray::PixF32::new_with(raw.data.as_f32().into_owned(), raw.width, raw.height);
+    let roi = raw.active_area.unwrap_or(pixels.rect());
+    let rgb = Superpixel3Channel::new().demosaic(&pixels, &config.cfa, &config.colors, roi);
+    // The default crop is relative to the full sensor: move it into the
+    // active area, then halve it like the image.
+    let crop = raw.crop_area.map(|crop| {
+        let mut crop = match &raw.active_area {
+            Some(active) => crop.adapt(active),
+            None => crop,
+        };
+        crop.scale(0.5);
+        crop
+    });
+    raw.width = rgb.width;
+    raw.height = rgb.height;
+    raw.cpp = 3;
+    raw.data = rawler::RawImageData::Float(rgb.data.into_iter().flatten().collect());
+    raw.photometric = RawPhotometricInterpretation::LinearRaw;
+    raw.active_area = None;
+    raw.crop_area = crop;
+    RawDevelop::new_with(&[
+        ProcessingStep::WhiteBalance,
+        ProcessingStep::Calibrate,
+        ProcessingStep::CropDefault,
+        ProcessingStep::SRgb,
+    ])
+    .develop_intermediate(&raw)
 }
 
 fn read(path: &Path, full: bool) -> Result<Read, String> {
@@ -81,8 +147,10 @@ fn read(path: &Path, full: bool) -> Result<Read, String> {
 pub fn decode(path: &Path, max_side: u32) -> Result<Decoded, String> {
     let (picture, _, _) = read(path, false)?;
     let size = [picture.width() as usize, picture.height() as usize];
+    // Over the GPU's texture limit: box-filter down, which on 50+ MP images
+    // is many times faster than a Triangle resize and as good on screen.
     let picture = if picture.width() > max_side || picture.height() > max_side {
-        picture.resize(max_side, max_side, image::imageops::FilterType::Triangle)
+        picture.thumbnail(max_side, max_side)
     } else {
         picture
     };
@@ -388,6 +456,39 @@ mod raw_tests {
             let decoded = super::decode(&path, 8192).unwrap();
             eprintln!("decode {:?} in {:?}", decoded.size, started.elapsed());
         }
+    }
+
+    /// The half-size display develop matches the full develop, scaled down.
+    /// Needs a large RAW without an embedded preview (Olympus, Samsung...):
+    /// ANYVIEW_TEST_RAW=photo.orf cargo test --release half_develop -- --ignored
+    #[test]
+    #[ignore]
+    fn half_develop_matches_full() {
+        let path = std::path::PathBuf::from(std::env::var("ANYVIEW_TEST_RAW").unwrap());
+        let started = std::time::Instant::now();
+        let (half, _, _) = super::read(&path, false).unwrap();
+        let half_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let (full, _, _) = super::read(&path, true).unwrap();
+        let full_time = started.elapsed();
+        let (width, height) = (half.width(), half.height());
+        let scaled = full
+            .resize_exact(width, height, image::imageops::FilterType::Triangle)
+            .into_rgb8();
+        let half = half.into_rgb8();
+        let difference: u64 = half
+            .as_raw()
+            .iter()
+            .zip(scaled.as_raw())
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        let mean = difference as f64 / half.as_raw().len() as f64;
+        eprintln!(
+            "half {width}x{height} in {half_time:?}, full {}x{} in {full_time:?}, mean difference {mean:.2}",
+            full.width(),
+            full.height()
+        );
+        assert!(mean < 4.0, "half develop differs by {mean:.2} on average");
     }
 
     /// Needs a real RAW file: ANYVIEW_TEST_RAW=photo.rw2 cargo test -- --ignored
