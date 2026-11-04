@@ -21,7 +21,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-const CHROME_SECS: f64 = 2.5;
+/// Idle time after which the bars fade out and the cursor hides.
+const CHROME_SECS: f64 = 3.0;
 
 type LoadResult = (PathBuf, Result<Decoded, String>);
 
@@ -399,9 +400,9 @@ impl App {
             };
             self.images.insert(path, slot);
         }
-        while let Ok((path, keyframe)) = self.snap_receiver.try_recv() {
+        while let Ok((path, cut)) = self.snap_receiver.try_recv() {
             if let Some(trim) = self.trims.get_mut(&path) {
-                trim.start = keyframe.min(trim.end);
+                trim.start = cut.min(trim.end);
                 // Show the frame the trimmed video will actually start on.
                 if let Some((open, player)) = &mut self.player
                     && *open == path
@@ -694,8 +695,9 @@ impl App {
     }
 
     /// Move a trim point. Dragging pauses and scrubs to the exact frame; `done`
-    /// (end of a drag, or the I/O keys) snaps the start to the keyframe the
-    /// export will use. Keys set during playback don't interrupt it.
+    /// (end of a drag, or the I/O keys) moves the start to where the export
+    /// will really cut: the frame itself for H.264/HEVC, else the keyframe at
+    /// or before it. Keys set during playback don't interrupt it.
     fn set_trim_point(&mut self, start: bool, time: f64, done: bool) {
         let Some(path) = self.current().cloned() else {
             return;
@@ -717,9 +719,9 @@ impl App {
             if done {
                 let (sender, requested) = (self.snap_sender.clone(), trim.start);
                 std::thread::spawn(move || {
-                    if let Some(keyframe) = trim::keyframe_at_or_before(&path, requested) {
+                    if let Some(cut) = trim::cut_point(&path, requested) {
                         // The app may have quit meanwhile; nothing to update.
-                        let _ = sender.send((path, keyframe));
+                        let _ = sender.send((path, cut));
                     }
                 });
             }
@@ -1542,8 +1544,8 @@ enum BarAction {
     Seek(f64, bool),
     /// Playhead drag in progress: show the exact frame under the pointer.
     Scrub(f64),
-    /// Set a trim point (`start` or end). `done` snaps the start to its
-    /// keyframe; before that (mid-drag) it only scrubs.
+    /// Set a trim point (`start` or end). `done` moves the start to the real
+    /// cut point; before that (mid-drag) it only scrubs.
     Trim {
         start: bool,
         time: f64,
@@ -1598,7 +1600,9 @@ impl eframe::App for App {
         ui.painter().rect_filled(rect, 0.0, self.theme.palette.bg);
         self.canvas(ui, rect);
 
-        // Auto-hiding chrome.
+        // Auto-hiding chrome: after CHROME_SECS without input the bars fade
+        // out and the cursor hides, in every mode; any input brings them back.
+        // They stay while the pointer rests on a bar or a dialog is open.
         let now = ctx.input(|input| input.time);
         let active = ctx.input(|input| {
             input.pointer.is_moving() || !input.events.is_empty() || input.pointer.any_down()
@@ -1606,16 +1610,7 @@ impl eframe::App for App {
         if active {
             self.chrome_until = now + CHROME_SECS;
         }
-        let paused_video = self
-            .player
-            .as_ref()
-            .is_some_and(|(_, player)| player.paused);
-        let pinned = self.crop.is_some()
-            || self.trim_mode
-            || paused_video
-            || self.job.is_some()
-            || self.current().is_some_and(|path| self.is_dirty(path))
-            || ctx.is_pointer_over_egui();
+        let pinned = self.confirm_quit || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
             ctx.set_cursor_icon(CursorIcon::None);

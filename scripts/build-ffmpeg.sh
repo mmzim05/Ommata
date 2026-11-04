@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Build a minimal static FFmpeg (decode + remux only) plus dav1d (AV1) into
-# target/ffmpeg. anyview links both statically, so the final binary needs no
-# FFmpeg at runtime. GPU decoding needs libva (pacman -S libva).
+# Build a minimal static FFmpeg plus dav1d (AV1 decoding) into target/ffmpeg.
+# anyview links both statically, so the final binary needs no FFmpeg at
+# runtime. It does link the system's libva (GPU decoding) and x264/x265
+# (re-encoding the frames before a frame-exact trim cut) dynamically:
+# pacman -S libva x264 x265. x264 and x265 make this FFmpeg build GPL.
 
 readonly VERSION="9.0"
 readonly DAV1D_VERSION="1.5.4"
@@ -11,8 +13,10 @@ readonly ROOT
 readonly SRC="$ROOT/target/ffmpeg-src"
 readonly PREFIX="$ROOT/target/ffmpeg"
 
+# MPEG-PS identifies its video streams by probing them with the raw-stream
+# demuxers (mpegvideo, h264, hevc); without them a stream can come out as MP3.
 readonly DEMUXERS=(mov matroska avi mpegts mpegps flv ogg asf ivf mp3 wav aac
-  flac)
+  flac mpegvideo h264 hevc)
 readonly MUXERS=(mov mp4 matroska webm avi mpegts ogg flv asf ivf)
 readonly DECODERS=(
   h264 hevc vp8 vp9 libdav1d mpeg4 mpeg1video mpeg2video mjpeg prores theora
@@ -76,6 +80,8 @@ build_ffmpeg() {
     --disable-everything --disable-autodetect --disable-programs \
     --disable-doc --disable-network --disable-avdevice --disable-avfilter \
     --pkg-config-flags=--static --enable-libdav1d \
+    --enable-gpl --enable-libx264 --enable-libx265 \
+    --enable-encoder=libx264,libx265 \
     --enable-protocol=file \
     --enable-demuxer="$(join "${DEMUXERS[@]}")" \
     --enable-muxer="$(join "${MUXERS[@]}")" \
