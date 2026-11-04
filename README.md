@@ -57,20 +57,7 @@ Intel, `libva-mesa-driver` for AMD.
 Open a photo or video from your file manager with anyview, or run `anyview <file-or-folder>`.
 The controls fade away when you are not using them, and come back when you move the mouse.
 
-| Key | Action |
-|---|---|
-| `←` `→` | Previous / next file |
-| `Space` | Play / pause |
-| `J` `L` | Back / forward 5 seconds |
-| `,` `.` | Back / forward one frame |
-| `M`, `↑` `↓` | Mute, volume |
-| `C` | Crop (`Enter` to apply, `Esc` to cancel) |
-| `R`, `H` | Rotate, flip |
-| `T`, `I` `O` | Trim, set start / end |
-| Scroll, `0`, `1` | Zoom, fit to window, actual size |
-| `F` or double-click | Fullscreen |
-| `Del` | Move to trash |
-| `Ctrl+O` | Open a file |
+Press `?` or click the **?** button to see the keyboard shortcuts.
 
 **Saving edits:** `Ctrl+S` saves over the file and moves the original to the trash.
 `Ctrl+Shift+S` saves a copy next to it. `Ctrl+Z` undoes your edits. RAW files are never

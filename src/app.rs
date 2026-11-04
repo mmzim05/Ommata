@@ -24,6 +24,74 @@ use std::time::Duration;
 /// Idle time after which the bars fade out and the cursor hides.
 const CHROME_SECS: f64 = 3.0;
 
+/// A titled group of (keys, action) rows in the shortcuts popup, shown only
+/// for files of its kind when it has one.
+type ShortcutGroup = (
+    &'static str,
+    Option<Kind>,
+    &'static [(&'static str, &'static str)],
+);
+
+/// The keyboard shortcuts listed in the help popup.
+const SHORTCUTS: [ShortcutGroup; 5] = [
+    (
+        "Browse",
+        None,
+        &[
+            ("← →", "Previous / next file"),
+            ("Home  End", "First / last file"),
+            ("Del", "Move to trash"),
+            ("Ctrl+O", "Open a file"),
+        ],
+    ),
+    (
+        "Video",
+        Some(Kind::Video),
+        &[
+            ("Space", "Play / pause"),
+            ("J  L", "Back / forward 5 seconds"),
+            (",  .", "Back / forward one frame"),
+            ("M", "Mute"),
+            ("↑ ↓", "Volume"),
+            ("T", "Trim"),
+            ("I  O", "Set trim start / end"),
+            ("Esc", "Leave trim"),
+        ],
+    ),
+    (
+        "Photo",
+        Some(Kind::Image),
+        &[
+            ("C", "Crop"),
+            ("1 – 5", "Crop shape, while cropping"),
+            ("Enter", "Apply crop"),
+            ("R  Shift+R", "Rotate right / left"),
+            ("H", "Flip"),
+            ("Esc", "Cancel crop"),
+        ],
+    ),
+    (
+        "View",
+        None,
+        &[
+            ("Scroll  + -", "Zoom"),
+            ("0  1", "Fit to window / actual size"),
+            ("F", "Fullscreen"),
+            ("?", "Show these shortcuts"),
+        ],
+    ),
+    (
+        "Save",
+        None,
+        &[
+            ("Ctrl+S", "Save over the original"),
+            ("Ctrl+Shift+S", "Save a copy"),
+            ("Ctrl+Z", "Undo all edits"),
+            ("Ctrl+Q", "Quit"),
+        ],
+    ),
+];
+
 type LoadResult = (PathBuf, Result<Decoded, String>);
 
 /// Background image decoding. Created before the window so the first image
@@ -173,6 +241,7 @@ pub struct App {
     toast: Option<(String, f64)>,
     chrome_until: f64,
     confirm_quit: bool,
+    show_shortcuts: bool,
     quitting: bool,
     settings: Settings,
     /// Set while the playhead is dragged: whether to resume playing after.
@@ -225,6 +294,7 @@ impl App {
             toast: None,
             chrome_until: CHROME_SECS,
             confirm_quit: false,
+            show_shortcuts: false,
             quitting: false,
             settings: Settings::load(),
             resume_after_drag: None,
@@ -791,8 +861,11 @@ impl App {
                     }
                 }
                 Key::F | Key::F11 => toggle_fullscreen(ctx),
+                Key::Questionmark | Key::F1 => self.show_shortcuts = !self.show_shortcuts,
                 Key::Escape => {
-                    if self.crop.is_some() {
+                    if self.show_shortcuts {
+                        self.show_shortcuts = false;
+                    } else if self.crop.is_some() {
                         self.crop = None;
                     } else if self.trim_mode {
                         self.toggle_trim();
@@ -1346,6 +1419,14 @@ impl App {
                         if icon(ui, Icon::Fullscreen, "Fullscreen (F)").clicked() {
                             toggle_fullscreen(ctx);
                         }
+                        let help = icon(ui, Icon::Help, "Keyboard shortcuts (?)");
+                        if help.clicked() {
+                            self.show_shortcuts = !self.show_shortcuts;
+                        }
+                        egui::Popup::from_response(&help)
+                            .open_bool(&mut self.show_shortcuts)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| shortcuts_ui(ui, kind, &palette));
                     });
                 });
             });
@@ -1610,7 +1691,7 @@ impl eframe::App for App {
         if active {
             self.chrome_until = now + CHROME_SECS;
         }
-        let pinned = self.confirm_quit || ctx.is_pointer_over_egui();
+        let pinned = self.confirm_quit || self.show_shortcuts || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
             ctx.set_cursor_icon(CursorIcon::None);
@@ -1975,6 +2056,32 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings) {
     });
 }
 
+/// The shortcuts that apply to a file of `kind`, in two columns.
+fn shortcuts_ui(ui: &mut egui::Ui, kind: Option<Kind>, palette: &crate::theme::Palette) {
+    ui.set_width(500.0);
+    let groups = SHORTCUTS
+        .iter()
+        .filter(|(_, only, _)| only.is_none() || *only == kind);
+    ui.columns(2, |columns| {
+        for (index, (group, _, keys)) in groups.enumerate() {
+            // Browse and the file's own keys on the left; View and Save on the right.
+            let column = &mut columns[usize::from(index >= 2)];
+            column.label(egui::RichText::new(*group).strong());
+            egui::Grid::new(group)
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(column, |ui| {
+                    for (key, action) in *keys {
+                        ui.label(egui::RichText::new(*key).monospace().color(palette.accent));
+                        ui.label(*action);
+                        ui.end_row();
+                    }
+                });
+            column.add_space(10.0);
+        }
+    });
+}
+
 fn volume_bar(
     ui: &mut egui::Ui,
     width: f32,
@@ -2118,6 +2225,7 @@ enum Icon {
     Muted,
     Settings,
     Trim,
+    Help,
 }
 
 /// Icons are drawn as vector paths: no icon font to ship, crisp at any scale.
@@ -2244,6 +2352,16 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
                 painter.circle_stroke(at(4.0 * side, 5.0), 2.6, stroke);
                 painter.line_segment([at(2.4 * side, 3.0), at(-4.5 * side, -7.5)], stroke);
             }
+        }
+        Icon::Help => {
+            painter.circle_stroke(center, 7.5, stroke);
+            painter.text(
+                center + vec2(0.0, 0.5),
+                Align2::CENTER_CENTER,
+                "?",
+                egui::FontId::proportional(12.0),
+                color,
+            );
         }
         Icon::Settings => {
             painter.circle_stroke(center, 3.0, stroke);
