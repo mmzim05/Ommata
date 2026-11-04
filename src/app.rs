@@ -1,6 +1,7 @@
 //! Window, input, and the save flow. Edits stay in memory per file until the user
 //! saves (overwrite in place) or saves a copy (`name-edit.ext`).
 
+use crate::gpu::Gpu;
 use crate::library::{self, Kind};
 use crate::picture::{self, Decoded, Edit};
 use crate::settings::Settings;
@@ -27,28 +28,31 @@ type LoadResult = (PathBuf, Result<Decoded, String>);
 /// Background image decoding. Created before the window so the first image
 /// decodes while the GL context is still starting up.
 pub struct Loader {
-    tx: Sender<LoadResult>,
-    rx: Receiver<LoadResult>,
+    sender: Sender<LoadResult>,
+    receiver: Receiver<LoadResult>,
     ctx: Arc<OnceLock<egui::Context>>,
     max_side: Arc<AtomicU32>,
 }
 
 impl Loader {
+    /// A loader with no window yet; `App::new` connects it to the context.
     pub fn new() -> Self {
-        let (tx, rx) = channel();
+        let (sender, receiver) = channel();
         Self {
-            tx,
-            rx,
+            sender,
+            receiver,
             ctx: Default::default(),
             max_side: Arc::new(AtomicU32::new(8192)),
         }
     }
 
     fn spawn(&self, path: PathBuf) {
-        let (tx, ctx, max) = (self.tx.clone(), self.ctx.clone(), self.max_side.clone());
+        let sender = self.sender.clone();
+        let (ctx, max_side) = (self.ctx.clone(), self.max_side.clone());
         std::thread::spawn(move || {
-            let r = picture::decode(&path, max.load(Relaxed));
-            let _ = tx.send((path, r));
+            let result = picture::decode(&path, max_side.load(Relaxed));
+            // The receiver lives as long as the app; a closed one means exit.
+            let _ = sender.send((path, result));
             if let Some(ctx) = ctx.get() {
                 ctx.request_repaint();
             }
@@ -56,6 +60,7 @@ impl Loader {
     }
 }
 
+/// The file list the app opens with, and which file to show first.
 pub struct Start {
     files: Vec<PathBuf>,
     index: usize,
@@ -68,16 +73,16 @@ pub fn resolve_start(path: &Path, loader: &Loader) -> Start {
         (library::siblings(&path.join("x")), 0)
     } else {
         let files = library::siblings(&path);
-        match files.iter().position(|f| *f == path) {
-            Some(i) => (files, i),
+        match files.iter().position(|file| *file == path) {
+            Some(index) => (files, index),
             None => (vec![path], 0),
         }
     };
-    if let Some(p) = files
+    if let Some(first) = files
         .get(index)
-        .filter(|p| library::kind(p) == Some(Kind::Image))
+        .filter(|file| library::kind(file) == Some(Kind::Image))
     {
-        loader.spawn(p.clone());
+        loader.spawn(first.clone());
     }
     Start { files, index }
 }
@@ -116,6 +121,14 @@ enum CropDrag {
     New(Pos2),
 }
 
+/// A press that hits no edge of the crop rect.
+const NO_EDGE: CropDrag = CropDrag::Edge {
+    left: false,
+    right: false,
+    top: false,
+    bottom: false,
+};
+
 struct CropTool {
     rect: Rect,
     aspect: Option<f32>,
@@ -138,6 +151,7 @@ struct Job {
     handle: JoinHandle<Result<(PathBuf, Option<String>), String>>,
 }
 
+/// The anyview window.
 pub struct App {
     theme: Theme,
     loader: Loader,
@@ -148,8 +162,8 @@ pub struct App {
     edits: HashMap<PathBuf, Edit>,
     trims: HashMap<PathBuf, Trim>,
     trim_mode: bool,
-    snap_tx: Sender<(PathBuf, f64)>,
-    snap_rx: Receiver<(PathBuf, f64)>,
+    snap_sender: Sender<(PathBuf, f64)>,
+    snap_receiver: Receiver<(PathBuf, f64)>,
     drag: Option<Handle>,
     zoom: Option<f32>,
     pan: Vec2,
@@ -165,22 +179,31 @@ pub struct App {
     wave: Option<(PathBuf, Arc<Waveform>)>,
     /// Seek-bar columns, cached by (columns, smoothing, levels decoded so far).
     wave_cache: Option<((usize, u32, usize), Vec<f32>)>,
+    /// Zero-copy video on the window's GL context, when available.
+    gpu: Option<Gpu>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, loader: Loader, start: Option<Start>) -> Self {
-        let ctx = &cc.egui_ctx;
+    /// Set up the window and open `start`, if given.
+    pub fn new(creation: &eframe::CreationContext, loader: Loader, start: Option<Start>) -> Self {
+        let ctx = &creation.egui_ctx;
+        // Set only here, once per loader.
         let _ = loader.ctx.set(ctx.clone());
         loader
             .max_side
-            .store(ctx.input(|i| i.max_texture_side) as u32, Relaxed);
-        ctx.all_styles_mut(|s| {
-            s.spacing.button_padding = vec2(10.0, 6.0);
-            s.spacing.item_spacing = vec2(6.0, 6.0);
-            s.spacing.interact_size.y = 28.0;
-            s.interaction.selectable_labels = false;
+            .store(ctx.input(|input| input.max_texture_side) as u32, Relaxed);
+        ctx.all_styles_mut(|style| {
+            style.spacing.button_padding = vec2(10.0, 6.0);
+            style.spacing.item_spacing = vec2(6.0, 6.0);
+            style.spacing.interact_size.y = 28.0;
+            style.interaction.selectable_labels = false;
         });
-        let (snap_tx, snap_rx) = channel();
+        let gpu = creation.gl.clone().and_then(|gl| {
+            Gpu::new(gl)
+                .inspect_err(|error| eprintln!("anyview: video decodes on the CPU: {error}"))
+                .ok()
+        });
+        let (snap_sender, snap_receiver) = channel();
         let mut app = Self {
             theme: Theme::new(ctx),
             loader,
@@ -191,8 +214,8 @@ impl App {
             edits: HashMap::new(),
             trims: HashMap::new(),
             trim_mode: false,
-            snap_tx,
-            snap_rx,
+            snap_sender,
+            snap_receiver,
             drag: None,
             zoom: None,
             pan: Vec2::ZERO,
@@ -206,17 +229,23 @@ impl App {
             resume_after_drag: None,
             wave: None,
             wave_cache: None,
+            gpu,
         };
-        if let Some(s) = start {
-            if let Some(p) = s.files.get(s.index)
-                && library::kind(p) == Some(Kind::Image)
-            {
-                app.images.insert(p.clone(), Slot::Loading);
-            }
-            app.files = s.files;
-            app.go(ctx, s.index);
+        if let Some(start) = start {
+            app.open_start(ctx, start);
         }
         app
+    }
+
+    /// Show the file list of `start`, whose first image is already decoding.
+    fn open_start(&mut self, ctx: &egui::Context, start: Start) {
+        if let Some(first) = start.files.get(start.index)
+            && library::kind(first) == Some(Kind::Image)
+        {
+            self.images.insert(first.clone(), Slot::Loading);
+        }
+        self.files = start.files;
+        self.go(ctx, start.index);
     }
 
     fn current(&self) -> Option<&PathBuf> {
@@ -224,18 +253,12 @@ impl App {
     }
 
     fn current_kind(&self) -> Option<Kind> {
-        self.current().and_then(|p| library::kind(p))
+        self.current().and_then(|path| library::kind(path))
     }
 
     fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
-        let s = resolve_start(path, &self.loader);
-        if let Some(p) = s.files.get(s.index)
-            && library::kind(p) == Some(Kind::Image)
-        {
-            self.images.insert(p.clone(), Slot::Loading);
-        }
-        self.files = s.files;
-        self.go(ctx, s.index);
+        let start = resolve_start(path, &self.loader);
+        self.open_start(ctx, start);
     }
 
     /// Show file `index`: start or reuse decodes, preload neighbours, drop the rest.
@@ -253,23 +276,24 @@ impl App {
         let path = self.files[self.index].clone();
         self.trim_mode = self.trims.contains_key(&path);
 
-        let n = self.files.len();
-        let keep: Vec<PathBuf> = [n - 1, 0, 1]
+        let count = self.files.len();
+        let keep: Vec<PathBuf> = [count - 1, 0, 1]
             .iter()
-            .map(|d| self.files[(self.index + d) % n].clone())
+            .map(|offset| self.files[(self.index + offset) % count].clone())
             .collect();
-        self.images.retain(|p, _| keep.contains(p));
-        for p in &keep {
-            if library::kind(p) == Some(Kind::Image) && !self.images.contains_key(p) {
-                self.images.insert(p.clone(), Slot::Loading);
-                self.loader.spawn(p.clone());
+        self.images.retain(|image, _| keep.contains(image));
+        for image in &keep {
+            if library::kind(image) == Some(Kind::Image) && !self.images.contains_key(image) {
+                self.images.insert(image.clone(), Slot::Loading);
+                self.loader.spawn(image.clone());
             }
         }
 
         match library::kind(&path) {
             Some(Kind::Video) => {
-                if self.player.as_ref().is_none_or(|(p, _)| *p != path) {
-                    self.player = Some((path.clone(), Player::open(path.clone(), ctx)));
+                if self.player.as_ref().is_none_or(|(open, _)| *open != path) {
+                    let gpu = self.gpu.as_ref().filter(|gpu| !gpu.failed);
+                    self.player = Some((path.clone(), Player::open(path.clone(), ctx, gpu)));
                 }
             }
             _ => self.player = None,
@@ -285,93 +309,113 @@ impl App {
             .player
             .as_ref()
             .filter(|_| self.settings.waveform)
-            .map(|(p, _)| p.clone());
-        if self.wave.as_ref().map(|(p, _)| p) != want.as_ref() {
-            self.wave = want.map(|p| (p.clone(), Waveform::spawn(p, ctx.clone())));
+            .map(|(path, _)| path.clone());
+        if self.wave.as_ref().map(|(path, _)| path) != want.as_ref() {
+            self.wave = want.map(|path| (path.clone(), Waveform::spawn(path, ctx.clone())));
             self.wave_cache = None;
         }
     }
 
     fn wave_columns(&mut self, columns: usize, duration: f64) -> Option<&[f32]> {
-        let (_, w) = self.wave.as_ref()?;
-        if w.none.load(Relaxed) {
+        let (_, waveform) = self.wave.as_ref()?;
+        if waveform.none.load(Relaxed) {
             return None;
         }
-        let key = (columns, self.settings.wave_smooth.to_bits(), w.len());
-        if self.wave_cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            self.wave_cache = Some((key, w.columns(columns, duration, self.settings.wave_smooth)));
+        let smooth = self.settings.wave_smooth;
+        let key = (columns, smooth.to_bits(), waveform.len());
+        if self
+            .wave_cache
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != key)
+        {
+            self.wave_cache = Some((key, waveform.columns(columns, duration, smooth)));
         }
-        self.wave_cache.as_ref().map(|(_, c)| c.as_slice())
+        self.wave_cache
+            .as_ref()
+            .map(|(_, values)| values.as_slice())
     }
 
     fn step(&mut self, ctx: &egui::Context, delta: isize) {
         if self.files.len() > 1 {
-            let n = self.files.len() as isize;
-            self.go(ctx, (self.index as isize + delta).rem_euclid(n) as usize);
+            let count = self.files.len() as isize;
+            self.go(
+                ctx,
+                (self.index as isize + delta).rem_euclid(count) as usize,
+            );
         }
     }
 
     fn reload_listing(&mut self, ctx: &egui::Context, focus: &Path) {
         self.files = library::siblings(focus);
-        let i = self.files.iter().position(|f| f == focus).unwrap_or(0);
-        self.go(ctx, i);
+        let index = self
+            .files
+            .iter()
+            .position(|file| file == focus)
+            .unwrap_or(0);
+        self.go(ctx, index);
     }
 
     fn is_dirty(&self, path: &Path) -> bool {
-        self.edits.get(path).is_some_and(|e| !e.is_identity())
-            || self.trims.get(path).is_some_and(|t| self.trim_is_change(t))
+        self.edits.get(path).is_some_and(|edit| !edit.is_identity())
+            || self
+                .trims
+                .get(path)
+                .is_some_and(|trim| self.trim_is_change(trim))
     }
 
-    fn trim_is_change(&self, t: &Trim) -> bool {
-        let dur = self
+    fn trim_is_change(&self, trim: &Trim) -> bool {
+        let duration = self
             .player
             .as_ref()
-            .map_or(f64::INFINITY, |(_, p)| p.duration());
-        t.start > 0.01 || t.end < dur - 0.01
+            .map_or(f64::INFINITY, |(_, player)| player.duration());
+        trim.start > 0.01 || trim.end < duration - 0.01
     }
 
     fn any_dirty(&self) -> bool {
-        self.edits.values().any(|e| !e.is_identity()) || !self.trims.is_empty()
+        self.edits.values().any(|edit| !edit.is_identity()) || !self.trims.is_empty()
     }
 
-    fn notify(&mut self, ctx: &egui::Context, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), ctx.input(|i| i.time) + 2.5));
+    fn notify(&mut self, ctx: &egui::Context, message: impl Into<String>) {
+        self.toast = Some((message.into(), ctx.input(|input| input.time) + 2.5));
     }
 
     // ---- background results -------------------------------------------------
 
     fn poll(&mut self, ctx: &egui::Context) {
-        while let Ok((path, r)) = self.loader.rx.try_recv() {
+        while let Ok((path, result)) = self.loader.receiver.try_recv() {
             if !self.images.contains_key(&path) {
                 continue;
             }
-            let slot = match r {
-                Ok(d) => Slot::Ready {
+            let slot = match result {
+                Ok(decoded) => Slot::Ready {
                     texture: ctx.load_texture(
                         path.to_string_lossy(),
-                        d.image,
+                        decoded.image,
                         TextureOptions::LINEAR,
                     ),
-                    size: d.size,
+                    size: decoded.size,
                 },
-                Err(e) => Slot::Failed(e),
+                Err(error) => Slot::Failed(error),
             };
             self.images.insert(path, slot);
         }
-        while let Ok((path, t)) = self.snap_rx.try_recv() {
-            if let Some(tr) = self.trims.get_mut(&path) {
-                tr.start = t.min(tr.end);
+        while let Ok((path, keyframe)) = self.snap_receiver.try_recv() {
+            if let Some(trim) = self.trims.get_mut(&path) {
+                trim.start = keyframe.min(trim.end);
                 // Show the frame the trimmed video will actually start on.
-                if let Some((pp, p)) = &mut self.player
-                    && *pp == path
-                    && p.paused
+                if let Some((open, player)) = &mut self.player
+                    && *open == path
+                    && player.paused
                 {
-                    p.seek(tr.start, true);
+                    player.seek(trim.start, true);
                 }
             }
         }
-        if self.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
-            let job = self.job.take().unwrap();
+        let finished = self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.handle.is_finished());
+        if let Some(job) = self.job.take_if(|_| finished) {
             match job
                 .handle
                 .join()
@@ -381,7 +425,11 @@ impl App {
                     self.edits.remove(&job.src);
                     self.trims.remove(&job.src);
                     self.images.remove(&job.src);
-                    if self.player.as_ref().is_some_and(|(p, _)| *p == job.src) {
+                    if self
+                        .player
+                        .as_ref()
+                        .is_some_and(|(open, _)| *open == job.src)
+                    {
                         self.player = None;
                     }
                     let name = out
@@ -389,15 +437,15 @@ impl App {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
-                    let msg = match (job.mode, note) {
+                    let message = match (job.mode, note) {
                         (_, Some(note)) => note,
                         (SaveMode::Overwrite, None) => format!("Saved {name}"),
                         (SaveMode::Copy, None) => format!("Saved copy {name}"),
                     };
-                    self.notify(ctx, msg);
+                    self.notify(ctx, message);
                     self.reload_listing(ctx, &out);
                 }
-                Err(e) => self.notify(ctx, format!("Save failed: {e}")),
+                Err(error) => self.notify(ctx, format!("Save failed: {error}")),
             }
         } else if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -439,21 +487,26 @@ impl App {
                     self.notify(ctx, "This format can't be saved");
                     return;
                 }
-                let edit = self.edits[&src];
-                let (s, ctx2) = (src.clone(), ctx.clone());
+                let edit = self.edits.get(&src).copied().unwrap_or_default();
+                let (source, thread_ctx) = (src.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let r = save_to(&dst, mode, |tmp| picture::save(&s, tmp, &edit));
-                    ctx2.request_repaint();
-                    r.map(|note| (dst, note))
+                    let result = save_to(&dst, mode, |temp| picture::save(&source, temp, &edit));
+                    thread_ctx.request_repaint();
+                    result.map(|note| (dst, note))
                 })
             }
             Some(Kind::Video) => {
-                let t = self.trims[&src];
-                let (s, p, ctx2) = (src.clone(), progress.clone(), ctx.clone());
+                let Some(trim) = self.trims.get(&src).copied() else {
+                    return;
+                };
+                let (source, thread_ctx) = (src.clone(), ctx.clone());
+                let job_progress = progress.clone();
                 std::thread::spawn(move || {
-                    let r = save_to(&dst, mode, |tmp| trim::export(&s, tmp, t.start, t.end, p));
-                    ctx2.request_repaint();
-                    r.map(|note| (dst, note))
+                    let result = save_to(&dst, mode, |temp| {
+                        trim::export(&source, temp, trim.start, trim.end, job_progress)
+                    });
+                    thread_ctx.request_repaint();
+                    result.map(|note| (dst, note))
                 })
             }
             None => return,
@@ -467,10 +520,10 @@ impl App {
     }
 
     fn revert(&mut self, ctx: &egui::Context) {
-        if let Some(p) = self.current().cloned() {
-            let had = self.is_dirty(&p) || self.crop.is_some();
-            self.edits.remove(&p);
-            self.trims.remove(&p);
+        if let Some(path) = self.current().cloned() {
+            let had = self.is_dirty(&path) || self.crop.is_some();
+            self.edits.remove(&path);
+            self.trims.remove(&path);
             self.crop = None;
             self.trim_mode = false;
             if had {
@@ -480,29 +533,29 @@ impl App {
     }
 
     fn trash_current(&mut self, ctx: &egui::Context) {
-        let Some(p) = self.current().cloned() else {
+        let Some(path) = self.current().cloned() else {
             return;
         };
-        if self.player.as_ref().is_some_and(|(pp, _)| *pp == p) {
+        if self.player.as_ref().is_some_and(|(open, _)| *open == path) {
             self.player = None;
         }
-        match trash::delete(&p) {
+        match trash::delete(&path) {
             Ok(()) => {
-                self.edits.remove(&p);
-                self.trims.remove(&p);
-                self.images.remove(&p);
+                self.edits.remove(&path);
+                self.trims.remove(&path);
+                self.images.remove(&path);
                 self.files.remove(self.index);
-                let name = p
+                let name = path
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
                 self.notify(ctx, format!("Moved {name} to trash"));
-                let i = self.index.min(self.files.len().saturating_sub(1));
-                self.go(ctx, i);
+                let index = self.index.min(self.files.len().saturating_sub(1));
+                self.go(ctx, index);
             }
-            Err(e) => {
-                self.notify(ctx, format!("Couldn't trash: {e}"));
+            Err(error) => {
+                self.notify(ctx, format!("Couldn't trash: {error}"));
                 self.go(ctx, self.index);
             }
         }
@@ -511,27 +564,27 @@ impl App {
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let start = self
             .current()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut dlg = rfd::FileDialog::new().set_title("Open");
-        if let Some(d) = start {
-            dlg = dlg.set_directory(d);
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let mut dialog = rfd::FileDialog::new().set_title("Open");
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
         }
-        if let Some(p) = dlg.pick_file() {
-            self.open_path(ctx, &p);
+        if let Some(path) = dialog.pick_file() {
+            self.open_path(ctx, &path);
         }
     }
 
     // ---- crop ---------------------------------------------------------------
 
     fn start_crop(&mut self) {
-        let Some(p) = self.current().cloned() else {
+        let Some(path) = self.current().cloned() else {
             return;
         };
         if self.current_kind() != Some(Kind::Image) {
             return;
         }
-        let e = self.edits.entry(p).or_default();
-        let rect = e
+        let edit = self.edits.entry(path).or_default();
+        let rect = edit
             .crop
             .take()
             .unwrap_or(Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)));
@@ -563,56 +616,53 @@ impl App {
         let size = self.crop_space_size();
         let Some(tool) = &mut self.crop else { return };
         tool.aspect = aspect;
-        if let (Some(a), Some(size)) = (aspect, size) {
-            tool.rect = fit_aspect_centered(tool.rect, a, size);
+        if let (Some(aspect), Some(size)) = (aspect, size) {
+            tool.rect = fit_aspect_centered(tool.rect, aspect, size);
         }
     }
 
     fn apply_crop(&mut self) {
-        let (Some(tool), Some(p)) = (self.crop.take(), self.current().cloned()) else {
+        let (Some(tool), Some(path)) = (self.crop.take(), self.current().cloned()) else {
             return;
         };
         let full = tool.rect.width() > 0.999 && tool.rect.height() > 0.999;
-        self.edits.entry(p).or_default().crop = (!full).then_some(tool.rect);
+        self.edits.entry(path).or_default().crop = (!full).then_some(tool.rect);
     }
 
     fn edit_mut(&mut self) -> Option<&mut Edit> {
-        let p = self.current().cloned()?;
-        (library::kind(&p) == Some(Kind::Image)).then(|| self.edits.entry(p).or_default())
+        let path = self.current().cloned()?;
+        (library::kind(&path) == Some(Kind::Image)).then(|| self.edits.entry(path).or_default())
     }
 
-    fn rotate(&mut self, cw: bool) {
+    /// Apply `change` to the current edit, moving the in-progress crop rect
+    /// along with the image.
+    fn transform(&mut self, change: impl Fn(&mut Edit)) {
         let tool = self.crop.take();
-        if let Some(e) = self.edit_mut() {
-            // Rotate the in-progress crop rect along with the image.
-            let mut tmp = Edit {
-                crop: tool.as_ref().map(|t| t.rect),
-                ..*e
-            };
-            tmp.rotate(cw);
-            e.rotate(cw);
-            self.crop = tool.map(|t| CropTool {
-                rect: tmp.crop.unwrap(),
-                aspect: t.aspect.map(|a| 1.0 / a),
-                drag: None,
-            });
+        let Some(edit) = self.edit_mut() else {
+            return;
+        };
+        let mut moved = Edit {
+            crop: tool.as_ref().map(|tool| tool.rect),
+            ..*edit
+        };
+        change(&mut moved);
+        change(edit);
+        self.crop = tool
+            .zip(moved.crop)
+            .map(|(tool, rect)| CropTool { rect, ..tool });
+    }
+
+    fn rotate(&mut self, clockwise: bool) {
+        self.transform(|edit| edit.rotate(clockwise));
+        // A quarter turn swaps width and height.
+        if let Some(tool) = &mut self.crop {
+            tool.aspect = tool.aspect.map(|aspect| 1.0 / aspect);
+            tool.drag = None;
         }
     }
 
     fn flip(&mut self) {
-        let tool = self.crop.take();
-        if let Some(e) = self.edit_mut() {
-            let mut tmp = Edit {
-                crop: tool.as_ref().map(|t| t.rect),
-                ..*e
-            };
-            tmp.flip_h();
-            e.flip_h();
-            self.crop = tool.map(|t| CropTool {
-                rect: tmp.crop.unwrap(),
-                ..t
-            });
-        }
+        self.transform(Edit::flip_h);
     }
 
     // ---- trim ---------------------------------------------------------------
@@ -621,21 +671,24 @@ impl App {
         let Some(path) = self.current().cloned() else {
             return;
         };
-        let Some((_, p)) = &self.player else { return };
+        let Some((_, player)) = &self.player else {
+            return;
+        };
         if self.trim_mode {
             self.trim_mode = false;
             if self
                 .trims
                 .get(&path)
-                .is_some_and(|t| !self.trim_is_change(t))
+                .is_some_and(|trim| !self.trim_is_change(trim))
             {
                 self.trims.remove(&path);
             }
         } else {
-            let d = p.duration();
-            self.trims
-                .entry(path)
-                .or_insert(Trim { start: 0.0, end: d });
+            let duration = player.duration();
+            self.trims.entry(path).or_insert(Trim {
+                start: 0.0,
+                end: duration,
+            });
             self.trim_mode = true;
         }
     }
@@ -643,43 +696,44 @@ impl App {
     /// Move a trim point. Dragging pauses and scrubs to the exact frame; `done`
     /// (end of a drag, or the I/O keys) snaps the start to the keyframe the
     /// export will use. Keys set during playback don't interrupt it.
-    fn set_trim_point(&mut self, start: bool, t: f64, done: bool) {
+    fn set_trim_point(&mut self, start: bool, time: f64, done: bool) {
         let Some(path) = self.current().cloned() else {
             return;
         };
-        let Some((_, p)) = &mut self.player else {
+        let Some((_, player)) = &mut self.player else {
             return;
         };
-        let d = p.duration();
+        let duration = player.duration();
         if !done {
-            p.set_paused(true);
+            player.set_paused(true);
         }
         self.trim_mode = true;
-        let tr = self
-            .trims
-            .entry(path.clone())
-            .or_insert(Trim { start: 0.0, end: d });
+        let trim = self.trims.entry(path.clone()).or_insert(Trim {
+            start: 0.0,
+            end: duration,
+        });
         let shown = if start {
-            tr.start = t.min(tr.end - 0.05).max(0.0);
+            trim.start = time.min(trim.end - 0.05).max(0.0);
             if done {
-                let (tx, t) = (self.snap_tx.clone(), tr.start);
+                let (sender, requested) = (self.snap_sender.clone(), trim.start);
                 std::thread::spawn(move || {
-                    if let Some(k) = trim::keyframe_at_or_before(&path, t) {
-                        let _ = tx.send((path, k));
+                    if let Some(keyframe) = trim::keyframe_at_or_before(&path, requested) {
+                        // The app may have quit meanwhile; nothing to update.
+                        let _ = sender.send((path, keyframe));
                     }
                 });
             }
-            tr.start
+            trim.start
         } else {
-            tr.end = t.max(tr.start + 0.05).min(d);
-            tr.end
+            trim.end = time.max(trim.start + 0.05).min(duration);
+            trim.end
         };
-        if p.paused {
+        if player.paused {
             if done {
                 // Releasing: refine to the full-resolution exact frame.
-                p.seek(shown, true);
+                player.seek(shown, true);
             } else {
-                p.scrub(shown);
+                player.scrub(shown);
             }
         }
     }
@@ -690,29 +744,29 @@ impl App {
         if ctx.egui_wants_keyboard_input() || self.confirm_quit {
             return;
         }
-        let (pressed, mods) = ctx.input(|i| {
-            let keys: Vec<Key> = i
+        let (pressed, modifiers) = ctx.input(|input| {
+            let keys: Vec<Key> = input
                 .events
                 .iter()
-                .filter_map(|e| match e {
+                .filter_map(|event| match event {
                     egui::Event::Key {
                         key, pressed: true, ..
                     } => Some(*key),
                     _ => None,
                 })
                 .collect();
-            (keys, i.modifiers)
+            (keys, input.modifiers)
         });
         for key in pressed {
-            let cmd = mods.command;
+            let command = modifiers.command;
             match key {
-                Key::S if cmd && mods.shift => self.save(ctx, SaveMode::Copy),
-                Key::S if cmd => self.save(ctx, SaveMode::Overwrite),
-                Key::O if cmd => self.open_dialog(ctx),
-                Key::Z if cmd => self.revert(ctx),
-                Key::Q if cmd => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Key::ArrowLeft if mods.shift => self.seek_by(-5.0),
-                Key::ArrowRight if mods.shift => self.seek_by(5.0),
+                Key::S if command && modifiers.shift => self.save(ctx, SaveMode::Copy),
+                Key::S if command => self.save(ctx, SaveMode::Overwrite),
+                Key::O if command => self.open_dialog(ctx),
+                Key::Z if command => self.revert(ctx),
+                Key::Q if command => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Key::ArrowLeft if modifiers.shift => self.seek_by(-5.0),
+                Key::ArrowRight if modifiers.shift => self.seek_by(5.0),
                 Key::ArrowLeft | Key::PageUp => self.step(ctx, -1),
                 Key::ArrowRight | Key::PageDown => self.step(ctx, 1),
                 Key::Home => self.go(ctx, 0),
@@ -723,15 +777,15 @@ impl App {
                 Key::J => self.seek_by(-5.0),
                 Key::L => self.seek_by(5.0),
                 Key::M => {
-                    if let Some((_, p)) = &mut self.player {
-                        p.muted = !p.muted;
+                    if let Some((_, player)) = &mut self.player {
+                        player.muted = !player.muted;
                     }
                 }
                 Key::ArrowUp | Key::ArrowDown => {
-                    if let Some((_, p)) = &mut self.player {
-                        let d = if key == Key::ArrowUp { 0.05 } else { -0.05 };
-                        p.volume = (p.volume + d).clamp(0.0, 1.0);
-                        p.muted = false;
+                    if let Some((_, player)) = &mut self.player {
+                        let change = if key == Key::ArrowUp { 0.05 } else { -0.05 };
+                        player.volume = (player.volume + change).clamp(0.0, 1.0);
+                        player.muted = false;
                     }
                 }
                 Key::F | Key::F11 => toggle_fullscreen(ctx),
@@ -740,7 +794,7 @@ impl App {
                         self.crop = None;
                     } else if self.trim_mode {
                         self.toggle_trim();
-                    } else if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                    } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
                         toggle_fullscreen(ctx);
                     }
                 }
@@ -748,22 +802,22 @@ impl App {
                 Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5
                     if self.crop.is_some() =>
                 {
-                    let i = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
+                    let index = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
                         .iter()
-                        .position(|k| *k == key)
+                        .position(|number| *number == key)
                         .unwrap_or(0);
-                    self.set_crop_aspect(ASPECTS[i].1);
+                    self.set_crop_aspect(ASPECTS[index].1);
                 }
                 Key::Delete => self.trash_current(ctx),
                 Key::C if self.crop.is_some() => self.apply_crop(),
                 Key::C => self.start_crop(),
-                Key::R => self.rotate(!mods.shift),
+                Key::R => self.rotate(!modifiers.shift),
                 Key::H => self.flip(),
                 Key::T => self.toggle_trim(),
                 Key::I | Key::O => {
-                    if let Some((_, p)) = &self.player {
-                        let t = p.position;
-                        self.set_trim_point(key == Key::I, t, true);
+                    if let Some((_, player)) = &self.player {
+                        let position = player.position;
+                        self.set_trim_point(key == Key::I, position, true);
                     }
                 }
                 Key::Num0 => {
@@ -781,50 +835,53 @@ impl App {
         }
     }
 
-    fn zoom_by(&mut self, f: f32) {
+    fn zoom_by(&mut self, factor: f32) {
         if self.crop.is_none() {
-            let z = self.zoom.unwrap_or(1.0);
-            self.zoom = Some((z * f).clamp(0.02, 50.0));
+            let zoom = self.zoom.unwrap_or(1.0);
+            self.zoom = Some((zoom * factor).clamp(0.02, 50.0));
         }
     }
 
     fn toggle_play(&mut self) {
-        let trim = self.current().and_then(|p| self.trims.get(p).copied());
-        let Some((_, p)) = &mut self.player else {
+        let trim = self
+            .current()
+            .and_then(|path| self.trims.get(path).copied());
+        let Some((_, player)) = &mut self.player else {
             return;
         };
-        if p.paused {
-            let outside =
-                trim.is_some_and(|t| p.position < t.start - 0.05 || p.position >= t.end - 0.02);
-            if let (true, Some(t)) = (outside, trim) {
-                p.seek(t.start, true);
-            } else if p.at_end() {
-                p.seek(0.0, true);
+        if player.paused {
+            let position = player.position;
+            let outside_trim =
+                trim.filter(|trim| position < trim.start - 0.05 || position >= trim.end - 0.02);
+            if let Some(trim) = outside_trim {
+                player.seek(trim.start, true);
+            } else if player.at_end() {
+                player.seek(0.0, true);
             }
         }
-        let paused = !p.paused;
-        p.set_paused(paused);
+        let paused = !player.paused;
+        player.set_paused(paused);
     }
 
-    fn seek_by(&mut self, d: f64) {
-        if let Some((_, p)) = &mut self.player {
-            let t = p.position + d;
-            p.seek(t, true);
+    fn seek_by(&mut self, offset: f64) {
+        if let Some((_, player)) = &mut self.player {
+            let time = player.position + offset;
+            player.seek(time, true);
         }
     }
 
-    fn frame_step(&mut self, n: i32) {
-        if let Some((_, p)) = &mut self.player {
-            p.step(n);
+    fn frame_step(&mut self, frames: i32) {
+        if let Some((_, player)) = &mut self.player {
+            player.step(frames);
         }
     }
 
     // ---- drawing ------------------------------------------------------------
 
     fn canvas(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let pal = self.theme.pal;
-        let resp = ui.interact(rect, Id::unique("canvas"), Sense::click_and_drag());
-        if resp.double_clicked() && self.crop.is_none() {
+        let palette = self.theme.palette;
+        let response = ui.interact(rect, Id::unique("canvas"), Sense::click_and_drag());
+        if response.double_clicked() && self.crop.is_none() {
             toggle_fullscreen(ui.ctx());
         }
         let Some(path) = self.current().cloned() else {
@@ -832,23 +889,33 @@ impl App {
             return;
         };
         match library::kind(&path) {
-            Some(Kind::Image) => self.image_canvas(ui, rect, &resp, &path),
+            Some(Kind::Image) => self.image_canvas(ui, rect, &response, &path),
             Some(Kind::Video) => {
-                let Some((_, p)) = &self.player else { return };
-                if let Some(e) = &p.error {
-                    centered_text(ui, rect, &format!("Can't play this video\n{e}"), pal.muted);
+                let Some((_, player)) = &self.player else {
+                    return;
+                };
+                if let Some(error) = &player.error {
+                    centered_text(
+                        ui,
+                        rect,
+                        &format!("Can't play this video\n{error}"),
+                        palette.muted,
+                    );
                     return;
                 }
-                let (Some(tex), Some(info)) = (p.texture(), &p.info) else {
+                let (Some(texture), Some(info)) = (player.texture(), &player.info) else {
                     return;
                 };
                 let size = vec2(info.size[0] as f32, info.size[1] as f32);
-                let r = fit(rect, size, f32::INFINITY);
-                let ppp = ui.ctx().pixels_per_point();
-                p.set_target((r.width() * ppp) as u32, (r.height() * ppp) as u32);
+                let frame_rect = fit(rect, size, f32::INFINITY);
+                let scale = ui.ctx().pixels_per_point();
+                player.set_target(
+                    (frame_rect.width() * scale) as u32,
+                    (frame_rect.height() * scale) as u32,
+                );
                 let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-                ui.painter().image(tex.id(), r, uv, Color32::WHITE);
-                if resp.clicked() {
+                ui.painter().image(texture, frame_rect, uv, Color32::WHITE);
+                if response.clicked() {
                     self.toggle_play();
                 }
             }
@@ -857,35 +924,46 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let pal = self.theme.pal;
-        let c = rect.center();
+        let palette = self.theme.palette;
+        let center = rect.center();
         ui.painter().text(
-            c - vec2(0.0, 30.0),
+            center - vec2(0.0, 30.0),
             Align2::CENTER_CENTER,
             "anyview",
             FontId::proportional(28.0),
-            pal.fg,
+            palette.fg,
         );
         ui.painter().text(
-            c + vec2(0.0, 4.0),
+            center + vec2(0.0, 4.0),
             Align2::CENTER_CENTER,
             "Drop a photo or video here",
             FontId::proportional(14.0),
-            pal.muted,
+            palette.muted,
         );
-        let btn = Rect::from_center_size(c + vec2(0.0, 48.0), vec2(120.0, 32.0));
-        if ui.put(btn, egui::Button::new("Open…")).clicked() {
+        let button = Rect::from_center_size(center + vec2(0.0, 48.0), vec2(120.0, 32.0));
+        if ui.put(button, egui::Button::new("Open…")).clicked() {
             self.open_dialog(ui.ctx());
         }
     }
 
-    fn image_canvas(&mut self, ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, path: &Path) {
-        let pal = self.theme.pal;
+    fn image_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        response: &egui::Response,
+        path: &Path,
+    ) {
+        let palette = self.theme.palette;
         let (texture, size) = match self.images.get(path) {
             Some(Slot::Ready { texture, size }) => (texture.clone(), *size),
-            Some(Slot::Failed(e)) => {
-                let e = e.clone();
-                centered_text(ui, rect, &format!("Can't open this image\n{e}"), pal.muted);
+            Some(Slot::Failed(error)) => {
+                let error = error.clone();
+                centered_text(
+                    ui,
+                    rect,
+                    &format!("Can't open this image\n{error}"),
+                    palette.muted,
+                );
                 return;
             }
             _ => return,
@@ -905,52 +983,52 @@ impl App {
 
         // Zoom at the cursor, pan by dragging.
         if self.crop.is_none() {
-            let (scroll, pinch, hover) = ui.input(|i| {
+            let (scroll, pinch, hover) = ui.input(|input| {
                 (
-                    i.smooth_scroll_delta.y,
-                    i.zoom_delta(),
-                    i.pointer.hover_pos(),
+                    input.smooth_scroll_delta.y,
+                    input.zoom_delta(),
+                    input.pointer.hover_pos(),
                 )
             });
             let factor = (scroll * 0.0025).exp() * pinch;
             if (factor - 1.0).abs() > 1e-4
-                && let Some(h) = hover.filter(|h| rect.contains(*h))
+                && let Some(pointer) = hover.filter(|pointer| rect.contains(*pointer))
             {
-                let new = (scale * factor).clamp(0.02, 50.0);
-                let anchor = h - rect.center() - self.pan;
-                self.pan -= anchor * (new / scale - 1.0);
-                self.zoom = Some(new);
+                let zoom = (scale * factor).clamp(0.02, 50.0);
+                let anchor = pointer - rect.center() - self.pan;
+                self.pan -= anchor * (zoom / scale - 1.0);
+                self.zoom = Some(zoom);
             }
-            if resp.dragged() {
-                self.pan += resp.drag_delta();
+            if response.dragged() {
+                self.pan += response.drag_delta();
                 if self.zoom.is_none() {
                     self.zoom = Some(scale);
                 }
             }
         }
         let scale = self.zoom.unwrap_or(fit_scale);
-        let img_rect = Rect::from_center_size(area.center() + self.pan, out * scale);
+        let image_rect = Rect::from_center_size(area.center() + self.pan, out * scale);
 
-        let c = shown
+        let crop = shown
             .crop
             .unwrap_or(Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)));
         let mut mesh = Mesh::with_texture(texture.id());
         let corners = [
-            img_rect.left_top(),
-            img_rect.right_top(),
-            img_rect.right_bottom(),
-            img_rect.left_bottom(),
+            image_rect.left_top(),
+            image_rect.right_top(),
+            image_rect.right_bottom(),
+            image_rect.left_bottom(),
         ];
-        let norm = [
-            c.left_top(),
-            c.right_top(),
-            c.right_bottom(),
-            c.left_bottom(),
+        let normalized = [
+            crop.left_top(),
+            crop.right_top(),
+            crop.right_bottom(),
+            crop.left_bottom(),
         ];
-        for (p, n) in corners.into_iter().zip(norm) {
+        for (corner, point) in corners.into_iter().zip(normalized) {
             mesh.vertices.push(egui::epaint::Vertex {
-                pos: p,
-                uv: shown.to_uv(n),
+                pos: corner,
+                uv: shown.to_uv(point),
                 color: Color32::WHITE,
             });
         }
@@ -958,27 +1036,30 @@ impl App {
         ui.painter().with_clip_rect(rect).add(Shape::mesh(mesh));
 
         if self.crop.is_some() {
-            self.crop_overlay(ui, img_rect, resp, size, &edit);
+            self.crop_overlay(ui, image_rect, response, size, &edit);
         }
     }
 
     fn crop_overlay(
         &mut self,
         ui: &mut egui::Ui,
-        img: Rect,
-        resp: &egui::Response,
+        image: Rect,
+        response: &egui::Response,
         size: [usize; 2],
         edit: &Edit,
     ) {
-        let pal = self.theme.pal;
-        let tool = self.crop.as_mut().unwrap();
-        let rsize = edit.rotated_size(size);
-        let px_aspect = rsize[0] as f32 / rsize[1] as f32;
-        let to_screen = |p: Pos2| img.min + vec2(p.x * img.width(), p.y * img.height());
-        let to_norm = |p: Pos2| {
+        let palette = self.theme.palette;
+        let Some(tool) = self.crop.as_mut() else {
+            return;
+        };
+        let rotated = edit.rotated_size(size);
+        let pixel_aspect = rotated[0] as f32 / rotated[1] as f32;
+        let to_screen =
+            |point: Pos2| image.min + vec2(point.x * image.width(), point.y * image.height());
+        let to_norm = |point: Pos2| {
             pos2(
-                (p.x - img.min.x) / img.width(),
-                (p.y - img.min.y) / img.height(),
+                (point.x - image.min.x) / image.width(),
+                (point.y - image.min.y) / image.height(),
             )
         };
         let screen = Rect::from_min_max(to_screen(tool.rect.min), to_screen(tool.rect.max));
@@ -987,154 +1068,132 @@ impl App {
         // egui reports a drag only after the pointer has moved a few pixels;
         // decide what it grabs from where the button went down, which is
         // where the hover cursor was showing.
-        let press = ui.input(|i| i.pointer.press_origin());
-        if resp.drag_started()
-            && let Some(p) = press.or(resp.interact_pointer_pos())
+        let press = ui.input(|input| input.pointer.press_origin());
+        if response.drag_started()
+            && let Some(pointer) = press.or(response.interact_pointer_pos())
         {
-            let kind = match crop_edges(screen, p, hit) {
-                CropDrag::Edge {
-                    left: false,
-                    right: false,
-                    top: false,
-                    bottom: false,
-                } => {
-                    if screen.contains(p) {
-                        CropDrag::Move
-                    } else {
-                        CropDrag::New(to_norm(p))
-                    }
-                }
-                e => e,
+            let edges = crop_edges(screen, pointer, hit);
+            let kind = if edges != NO_EDGE {
+                edges
+            } else if screen.contains(pointer) {
+                CropDrag::Move
+            } else {
+                CropDrag::New(to_norm(pointer))
             };
-            tool.drag = Some((kind, tool.rect, to_norm(p)));
+            tool.drag = Some((kind, tool.rect, to_norm(pointer)));
         }
-        if let (Some((kind, orig, origin)), Some(p)) = (tool.drag, resp.interact_pointer_pos()) {
+        if let (Some((kind, original, origin)), Some(pointer)) =
+            (tool.drag, response.interact_pointer_pos())
+        {
             let unit = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-            let n = to_norm(p);
-            let n = pos2(n.x.clamp(0.0, 1.0), n.y.clamp(0.0, 1.0));
-            let mut r = match kind {
+            let point = to_norm(pointer);
+            let point = pos2(point.x.clamp(0.0, 1.0), point.y.clamp(0.0, 1.0));
+            let mut moved = match kind {
                 CropDrag::Move => {
-                    let d = n - origin;
-                    let d = vec2(
-                        d.x.clamp(-orig.min.x, 1.0 - orig.max.x),
-                        d.y.clamp(-orig.min.y, 1.0 - orig.max.y),
+                    let delta = point - origin;
+                    let delta = vec2(
+                        delta.x.clamp(-original.min.x, 1.0 - original.max.x),
+                        delta.y.clamp(-original.min.y, 1.0 - original.max.y),
                     );
-                    orig.translate(d)
+                    original.translate(delta)
                 }
-                CropDrag::New(a) => Rect::from_two_pos(a, n),
+                CropDrag::New(anchor) => Rect::from_two_pos(anchor, point),
                 CropDrag::Edge {
                     left,
                     right,
                     top,
                     bottom,
                 } => {
-                    let mut r = orig;
+                    let mut resized = original;
                     if left {
-                        r.min.x = n.x.min(r.max.x - 0.01)
+                        resized.min.x = point.x.min(resized.max.x - 0.01);
                     }
                     if right {
-                        r.max.x = n.x.max(r.min.x + 0.01)
+                        resized.max.x = point.x.max(resized.min.x + 0.01);
                     }
                     if top {
-                        r.min.y = n.y.min(r.max.y - 0.01)
+                        resized.min.y = point.y.min(resized.max.y - 0.01);
                     }
                     if bottom {
-                        r.max.y = n.y.max(r.min.y + 0.01)
+                        resized.max.y = point.y.max(resized.min.y + 0.01);
                     }
-                    r
+                    resized
                 }
             };
-            if let (Some(a), false) = (tool.aspect, kind == CropDrag::Move) {
-                r = constrain_aspect(r, a / px_aspect, kind);
+            if let (Some(aspect), false) = (tool.aspect, kind == CropDrag::Move) {
+                moved = constrain_aspect(moved, aspect / pixel_aspect, kind);
             }
-            tool.rect = r.intersect(unit);
+            tool.rect = moved.intersect(unit);
         }
-        if resp.drag_stopped() {
+        if response.drag_stopped() {
             tool.drag = None;
         }
 
         // Dim outside, frame, thirds, handles.
         let screen = Rect::from_min_max(to_screen(tool.rect.min), to_screen(tool.rect.max));
         let dim = Color32::from_black_alpha(150);
-        let p = ui.painter().with_clip_rect(img);
-        p.rect_filled(
-            Rect::from_min_max(img.min, pos2(img.max.x, screen.min.y)),
-            0.0,
-            dim,
-        );
-        p.rect_filled(
-            Rect::from_min_max(pos2(img.min.x, screen.max.y), img.max),
-            0.0,
-            dim,
-        );
-        p.rect_filled(
+        let clipped = ui.painter().with_clip_rect(image);
+        let outside = [
+            Rect::from_min_max(image.min, pos2(image.max.x, screen.min.y)),
+            Rect::from_min_max(pos2(image.min.x, screen.max.y), image.max),
             Rect::from_min_max(
-                pos2(img.min.x, screen.min.y),
+                pos2(image.min.x, screen.min.y),
                 pos2(screen.min.x, screen.max.y),
             ),
-            0.0,
-            dim,
-        );
-        p.rect_filled(
             Rect::from_min_max(
                 pos2(screen.max.x, screen.min.y),
-                pos2(img.max.x, screen.max.y),
+                pos2(image.max.x, screen.max.y),
             ),
-            0.0,
-            dim,
-        );
+        ];
+        for band in outside {
+            clipped.rect_filled(band, 0.0, dim);
+        }
         let thin = Stroke::new(1.0, Color32::from_white_alpha(70));
-        for k in [1.0 / 3.0, 2.0 / 3.0] {
-            let x = screen.min.x + screen.width() * k;
-            let y = screen.min.y + screen.height() * k;
-            p.line_segment([pos2(x, screen.min.y), pos2(x, screen.max.y)], thin);
-            p.line_segment([pos2(screen.min.x, y), pos2(screen.max.x, y)], thin);
+        for third in [1.0 / 3.0, 2.0 / 3.0] {
+            let x = screen.min.x + screen.width() * third;
+            let y = screen.min.y + screen.height() * third;
+            clipped.line_segment([pos2(x, screen.min.y), pos2(x, screen.max.y)], thin);
+            clipped.line_segment([pos2(screen.min.x, y), pos2(screen.max.x, y)], thin);
         }
         let painter = ui.painter();
         painter.rect_stroke(
             screen,
             0.0,
-            Stroke::new(1.5, pal.accent),
+            Stroke::new(1.5, palette.accent),
             egui::StrokeKind::Middle,
         );
-        for c in [
+        for corner in [
             screen.left_top(),
             screen.right_top(),
             screen.left_bottom(),
             screen.right_bottom(),
         ] {
-            painter.circle_filled(c, 5.0, pal.accent);
+            painter.circle_filled(corner, 5.0, palette.accent);
         }
-        let o = edit.rotated_size(size);
         let label = format!(
             "{} × {}",
-            (tool.rect.width() * o[0] as f32).round(),
-            (tool.rect.height() * o[1] as f32).round()
+            (tool.rect.width() * rotated[0] as f32).round(),
+            (tool.rect.height() * rotated[1] as f32).round()
         );
         painter.text(
             screen.center_bottom() + vec2(0.0, 14.0),
             Align2::CENTER_CENTER,
             label,
             FontId::proportional(12.0),
-            pal.fg,
+            palette.fg,
         );
         // While dragging, keep the cursor of what the drag does.
         let hover = match tool.drag {
             Some((kind, ..)) => Some(kind),
-            None => resp.hover_pos().map(|h| match crop_edges(screen, h, hit) {
-                CropDrag::Edge {
-                    left: false,
-                    right: false,
-                    top: false,
-                    bottom: false,
-                } if screen.contains(h) => CropDrag::Move,
-                CropDrag::Edge {
-                    left: false,
-                    right: false,
-                    top: false,
-                    bottom: false,
-                } => CropDrag::New(Pos2::ZERO),
-                e => e,
+            None => response.hover_pos().map(|pointer| {
+                let edges = crop_edges(screen, pointer, hit);
+                if edges != NO_EDGE {
+                    edges
+                } else if screen.contains(pointer) {
+                    CropDrag::Move
+                } else {
+                    CropDrag::New(Pos2::ZERO)
+                }
             }),
         };
         if let Some(kind) = hover {
@@ -1163,20 +1222,22 @@ impl App {
         };
         let kind = library::kind(&path);
         let dirty = self.is_dirty(&path);
-        let pal = self.theme.pal;
+        let palette = self.theme.palette;
         egui::Area::new(Id::unique("top"))
             .anchor(Align2::CENTER_TOP, vec2(0.0, 12.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
-                bar_frame(&pal).show(ui, |ui| {
+                bar_frame(&palette).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
                         let short = ellipsize(&name, 48);
                         ui.label(egui::RichText::new(short).strong());
                         if dirty {
-                            let (r, resp) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(r.center(), 3.5, pal.accent);
-                            resp.on_hover_text("Unsaved edits");
+                            let (dot, response) =
+                                ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(dot.center(), 3.5, palette.accent);
+                            response.on_hover_text("Unsaved edits");
                         }
                         if self.files.len() > 1 {
                             ui.label(
@@ -1185,14 +1246,14 @@ impl App {
                                     self.index + 1,
                                     self.files.len()
                                 ))
-                                .color(pal.muted),
+                                .color(palette.muted),
                             );
                         }
                         ui.separator();
-                        if let Some(current) = self.crop.as_ref().map(|t| t.aspect) {
-                            for (label, a) in ASPECTS {
-                                if ui.selectable_label(current == a, label).clicked() {
-                                    self.set_crop_aspect(a);
+                        if let Some(current) = self.crop.as_ref().map(|tool| tool.aspect) {
+                            for (label, aspect) in ASPECTS {
+                                if ui.selectable_label(current == aspect, label).clicked() {
+                                    self.set_crop_aspect(aspect);
                                 }
                             }
                             ui.separator();
@@ -1201,8 +1262,10 @@ impl App {
                             }
                             if ui
                                 .add(
-                                    egui::Button::new(egui::RichText::new("Done").color(pal.bg))
-                                        .fill(pal.accent),
+                                    egui::Button::new(
+                                        egui::RichText::new("Done").color(palette.bg),
+                                    )
+                                    .fill(palette.accent),
                                 )
                                 .clicked()
                             {
@@ -1237,9 +1300,9 @@ impl App {
                             ui.separator();
                             if let Some(job) = &self.job {
                                 ui.add(egui::Spinner::new());
-                                let f = job.progress.fraction();
-                                ui.label(if f > 0.0 {
-                                    format!("Saving {:.0}%", f * 100.0)
+                                let fraction = job.progress.fraction();
+                                ui.label(if fraction > 0.0 {
+                                    format!("Saving {:.0}%", fraction * 100.0)
                                 } else {
                                     "Saving…".into()
                                 });
@@ -1261,9 +1324,10 @@ impl App {
                                 {
                                     self.save(ctx, SaveMode::Copy);
                                 }
-                                let save =
-                                    egui::Button::new(egui::RichText::new("Save").color(pal.bg))
-                                        .fill(pal.accent);
+                                let save = egui::Button::new(
+                                    egui::RichText::new("Save").color(palette.bg),
+                                )
+                                .fill(palette.accent);
                                 if ui
                                     .add(save)
                                     .on_hover_text("Overwrite the original (Ctrl+S)")
@@ -1293,23 +1357,23 @@ impl App {
             .trim_mode
             .then(|| self.trims.get(&path).copied())
             .flatten();
-        let pal = self.theme.pal;
-        let Some(dur) = self
+        let palette = self.theme.palette;
+        let Some(duration) = self
             .player
             .as_ref()
-            .filter(|(_, p)| p.info.is_some())
-            .map(|(_, p)| p.duration())
+            .filter(|(_, player)| player.info.is_some())
+            .map(|(_, player)| player.duration())
         else {
             return;
         };
         let width = (ctx.content_rect().width() - 32.0).min(900.0);
         // Fixed layout: play, time, settings, mute and volume take ~290 px.
-        let tl_w = (width - 24.0 - 290.0).max(40.0);
-        let cols = ((tl_w - 12.0) / WAVE_STEP).max(1.0) as usize;
-        let wave = self.wave_columns(cols, dur).map(<[f32]>::to_vec);
-        let st = self.settings;
-        let mut new_settings = st;
-        let Some((_, p)) = &mut self.player else {
+        let timeline_width = (width - 24.0 - 290.0).max(40.0);
+        let columns = ((timeline_width - 12.0) / WAVE_STEP).max(1.0) as usize;
+        let wave = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
+        let settings = self.settings;
+        let mut new_settings = settings;
+        let Some((_, player)) = &mut self.player else {
             return;
         };
         let mut action = None;
@@ -1317,57 +1381,76 @@ impl App {
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -12.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
-                bar_frame(&pal).show(ui, |ui| {
+                bar_frame(&palette).show(ui, |ui| {
                     ui.set_width(width - 24.0);
                     ui.horizontal(|ui| {
-                        let play = if p.paused { Icon::Play } else { Icon::Pause };
+                        let play = if player.paused {
+                            Icon::Play
+                        } else {
+                            Icon::Pause
+                        };
                         if icon(ui, play, "Play/pause (Space)").clicked() {
                             action = Some(BarAction::TogglePlay);
                         }
                         ui.label(
                             egui::RichText::new(format!(
                                 "{} / {}",
-                                fmt_time(p.position),
-                                fmt_time(dur)
+                                fmt_time(player.position),
+                                fmt_time(duration)
                             ))
                             .monospace()
                             .size(12.0),
                         );
-                        let vol_w = 90.0;
-                        let wave = wave
-                            .as_deref()
-                            .filter(|_| st.waveform)
-                            .map(|w| (w, st.wave_min, st.wave_max, st.wave_filled));
-                        let (a, hover) =
-                            timeline(ui, tl_w, p.position, dur, trim, wave, &mut self.drag, &pal);
-                        if a.is_some() {
-                            action = a;
+                        let volume_width = 90.0;
+                        let wave =
+                            wave.as_deref()
+                                .filter(|_| settings.waveform)
+                                .map(|levels| Wave {
+                                    levels,
+                                    min: settings.wave_min,
+                                    max: settings.wave_max,
+                                    filled: settings.wave_filled,
+                                });
+                        let (timeline_action, hover) = timeline(
+                            ui,
+                            timeline_width,
+                            player.position,
+                            duration,
+                            trim,
+                            wave,
+                            &mut self.drag,
+                            &palette,
+                        );
+                        if timeline_action.is_some() {
+                            action = timeline_action;
                         }
-                        if let Some((t, at)) = hover {
-                            hover_preview(ctx, p, t, at, &pal);
+                        if let Some((time, at)) = hover {
+                            hover_preview(ctx, player, time, at, &palette);
                         }
                         let gear = icon(ui, Icon::Settings, "Settings");
                         egui::Popup::from_toggle_button_response(&gear)
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .show(|ui| settings_ui(ui, &mut new_settings));
-                        let vol_icon = if p.muted || p.volume == 0.0 {
+                        let volume_icon = if player.muted || player.volume == 0.0 {
                             Icon::Muted
                         } else {
                             Icon::Volume
                         };
-                        if icon(ui, vol_icon, "Mute (M)").clicked() {
-                            p.muted = !p.muted;
+                        if icon(ui, volume_icon, "Mute (M)").clicked() {
+                            player.muted = !player.muted;
                         }
-                        if volume_bar(ui, vol_w - 10.0, &mut p.volume, p.muted, &pal) {
-                            p.muted = false;
+                        let muted = player.muted;
+                        let bar_width = volume_width - 10.0;
+                        if volume_bar(ui, bar_width, &mut player.volume, muted, &palette) {
+                            player.muted = false;
                         }
                     });
                 });
             });
-        if new_settings != st {
+        if new_settings != settings {
             self.settings = new_settings.clamp();
-            if let Err(e) = self.settings.save() {
-                self.notify(ctx, format!("Couldn't save settings: {e}"));
+            if let Err(error) = self.settings.save() {
+                self.notify(ctx, format!("Couldn't save settings: {error}"));
             }
             self.sync_waveform(ctx);
         }
@@ -1375,74 +1458,77 @@ impl App {
             Some(BarAction::TogglePlay) => self.toggle_play(),
             // Dragging the playhead pauses so each frame under the pointer
             // shows; playback resumes on release if it was running.
-            Some(BarAction::Scrub(t)) => {
-                if let Some((_, p)) = &mut self.player {
+            Some(BarAction::Scrub(time)) => {
+                if let Some((_, player)) = &mut self.player {
                     if self.resume_after_drag.is_none() {
-                        self.resume_after_drag = Some(!p.paused);
-                        p.set_paused(true);
+                        self.resume_after_drag = Some(!player.paused);
+                        player.set_paused(true);
                     }
-                    p.scrub(t);
+                    player.scrub(time);
                 }
             }
-            Some(BarAction::Seek(t, exact)) => {
-                if let Some((_, p)) = &mut self.player {
+            Some(BarAction::Seek(time, exact)) => {
+                if let Some((_, player)) = &mut self.player {
                     // Ending an active drag: the drag preview stays on screen
                     // until the full-resolution exact frame replaces it.
-                    p.seek(t, exact);
+                    player.seek(time, exact);
                     if self.resume_after_drag.take() == Some(true) {
-                        p.set_paused(false);
+                        player.set_paused(false);
                     }
                 }
             }
-            Some(BarAction::Trim { start, t, done }) => self.set_trim_point(start, t, done),
+            Some(BarAction::Trim { start, time, done }) => {
+                self.set_trim_point(start, time, done);
+            }
             None => {}
         }
     }
 
     fn toast(&mut self, ctx: &egui::Context) {
-        let Some((msg, until)) = &self.toast else {
+        let Some((message, until)) = &self.toast else {
             return;
         };
-        let now = ctx.input(|i| i.time);
+        let now = ctx.input(|input| input.time);
         if now > *until {
             self.toast = None;
             return;
         }
         ctx.request_repaint_after(Duration::from_secs_f64(until - now));
-        let pal = self.theme.pal;
-        let y = if self.player.is_some() { -84.0 } else { -24.0 };
+        let palette = self.theme.palette;
+        let offset = if self.player.is_some() { -84.0 } else { -24.0 };
         egui::Area::new(Id::unique("toast"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, y))
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, offset))
             .interactable(false)
             .show(ctx, |ui| {
-                bar_frame(&pal).show(ui, |ui| ui.label(msg.as_str()));
+                bar_frame(&palette).show(ui, |ui| ui.label(message.as_str()));
             });
     }
 
     fn quit_dialog(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.any_dirty() {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && !self.quitting && self.any_dirty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_quit = true;
         }
         if !self.confirm_quit {
             return;
         }
-        let pal = self.theme.pal;
+        let palette = self.theme.palette;
         egui::Modal::new(Id::unique("quit")).show(ctx, |ui| {
             ui.set_width(300.0);
             ui.heading("Discard unsaved edits?");
             ui.label(
                 egui::RichText::new("Your crops, rotations and trims haven't been saved.")
-                    .color(pal.muted),
+                    .color(palette.muted),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
                     self.confirm_quit = false;
                 }
-                let b = egui::Button::new(egui::RichText::new("Discard").color(pal.bg))
-                    .fill(pal.danger);
-                if ui.add(b).clicked() {
+                let discard = egui::Button::new(egui::RichText::new("Discard").color(palette.bg))
+                    .fill(palette.danger);
+                if ui.add(discard).clicked() {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1460,72 +1546,82 @@ enum BarAction {
     /// keyframe; before that (mid-drag) it only scrubs.
     Trim {
         start: bool,
-        t: f64,
+        time: f64,
         done: bool,
     },
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.theme.poll(&ctx);
         self.poll(&ctx);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.register(|texture| frame.register_native_glow_texture(texture));
+            gpu.collect_garbage();
+        }
 
-        let dropped = ctx.input(|i| {
-            i.raw
+        let dropped = ctx.input(|input| {
+            input
+                .raw
                 .dropped_files
                 .first()
-                .map(|f| f.path().to_path_buf())
-                .filter(|p| !p.as_os_str().is_empty())
+                .map(|file| file.path().to_path_buf())
+                .filter(|path| !path.as_os_str().is_empty())
         });
-        if let Some(p) = dropped {
-            self.open_path(&ctx, &p);
+        if let Some(path) = dropped {
+            self.open_path(&ctx, &path);
         }
         self.keys(&ctx);
 
         // Video clock and trim-range preview.
         let trim = self
             .current()
-            .and_then(|p| self.trims.get(p).copied())
+            .and_then(|path| self.trims.get(path).copied())
             .filter(|_| self.trim_mode);
         let mut next = None;
-        if let Some((_, p)) = &mut self.player {
-            next = p.update(&ctx);
-            if let Some(t) = trim
-                && !p.paused
-                && p.position >= t.end
+        if let Some((_, player)) = &mut self.player {
+            next = player.update(&ctx, self.gpu.as_mut());
+            if let Some(trim) = trim
+                && !player.paused
+                && player.position >= trim.end
             {
-                p.set_paused(true);
-                p.seek(t.end, true);
+                player.set_paused(true);
+                player.seek(trim.end, true);
             }
-            if !p.paused && p.at_end() {
-                p.set_paused(true);
+            if !player.paused && player.at_end() {
+                player.set_paused(true);
             }
         }
 
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, self.theme.pal.bg);
+        ui.painter().rect_filled(rect, 0.0, self.theme.palette.bg);
         self.canvas(ui, rect);
 
         // Auto-hiding chrome.
-        let now = ctx.input(|i| i.time);
-        let active =
-            ctx.input(|i| i.pointer.is_moving() || !i.events.is_empty() || i.pointer.any_down());
+        let now = ctx.input(|input| input.time);
+        let active = ctx.input(|input| {
+            input.pointer.is_moving() || !input.events.is_empty() || input.pointer.any_down()
+        });
         if active {
             self.chrome_until = now + CHROME_SECS;
         }
-        let paused_video = self.player.as_ref().is_some_and(|(_, p)| p.paused);
+        let paused_video = self
+            .player
+            .as_ref()
+            .is_some_and(|(_, player)| player.paused);
         let pinned = self.crop.is_some()
             || self.trim_mode
             || paused_video
             || self.job.is_some()
-            || self.current().is_some_and(|p| self.is_dirty(p))
+            || self.current().is_some_and(|path| self.is_dirty(path))
             || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
             ctx.set_cursor_icon(CursorIcon::None);
         } else if !pinned {
-            ctx.request_repaint_after(Duration::from_secs_f64((self.chrome_until - now).max(0.0)));
+            let left = (self.chrome_until - now).max(0.0);
+            ctx.request_repaint_after(Duration::from_secs_f64(left));
         }
         let opacity = ctx.animate_bool_with_time(Id::unique("chrome"), visible, 0.15);
         if opacity > 0.0 {
@@ -1535,25 +1631,36 @@ impl eframe::App for App {
         self.toast(&ctx);
         self.quit_dialog(&ctx);
 
-        if let Some(d) = next {
-            ctx.request_repaint_after(d);
+        if let Some(wait) = next {
+            ctx.request_repaint_after(wait);
         }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        self.theme.pal.bg.to_normalized_gamma_f32()
+        self.theme.palette.bg.to_normalized_gamma_f32()
     }
 }
 
 /// Write via a temp file in the target's directory, then rename over the target,
 /// so a failed or cancelled save never leaves a half-written file behind.
 fn write_atomic(dst: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
-    let tmp = library::temp_path(dst);
-    let r = write(&tmp).and_then(|_| std::fs::rename(&tmp, dst).map_err(|e| e.to_string()));
-    if r.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let temp = library::temp_path(dst);
+    let result =
+        write(&temp).and_then(|()| std::fs::rename(&temp, dst).map_err(|error| error.to_string()));
+    if result.is_err() {
+        remove_temp(&temp);
     }
-    r
+    result
+}
+
+/// Clean up a temp file after a failed save. The save error is what the user
+/// needs to see; a leftover temp file is only clutter, so it is just logged.
+fn remove_temp(temp: &Path) {
+    if let Err(error) = std::fs::remove_file(temp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("anyview: remove {}: {error}", temp.display());
+    }
 }
 
 /// Write a copy atomically, or overwrite while keeping the original in the trash.
@@ -1576,21 +1683,27 @@ fn replace_trashing_original(
     dst: &Path,
     write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
-    let tmp = library::temp_path(dst);
-    if let Err(e) = write(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let temp = library::temp_path(dst);
+    if let Err(error) = write(&temp) {
+        remove_temp(&temp);
+        return Err(error);
     }
     let original = library::original_path(dst);
-    if let Err(e) = std::fs::rename(dst, &original) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("couldn't move the original aside: {e}"));
+    if let Err(error) = std::fs::rename(dst, &original) {
+        remove_temp(&temp);
+        return Err(format!("couldn't move the original aside: {error}"));
     }
-    if let Err(e) = std::fs::rename(&tmp, dst) {
+    if let Err(error) = std::fs::rename(&temp, dst) {
         // Put the original back; nothing has changed for the user.
-        let _ = std::fs::rename(&original, dst);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
+        if let Err(restore) = std::fs::rename(&original, dst) {
+            remove_temp(&temp);
+            return Err(format!(
+                "{error}; the original is kept as {}: {restore}",
+                original.display()
+            ));
+        }
+        remove_temp(&temp);
+        return Err(error.to_string());
     }
     let name = original
         .file_name()
@@ -1599,37 +1712,51 @@ fn replace_trashing_original(
         .to_string();
     Ok(Some(match trash::delete(&original) {
         Ok(()) => format!("Saved. Original is in the trash as {name}"),
-        Err(e) => format!("Saved. Couldn't trash the original ({e}); kept as {name}"),
+        Err(error) => format!("Saved. Couldn't trash the original ({error}); kept as {name}"),
     }))
 }
 
+/// Seek-bar waveform: column levels and the bar heights they map to.
+#[derive(Clone, Copy)]
+struct Wave<'a> {
+    levels: &'a [f32],
+    min: f32,
+    max: f32,
+    filled: bool,
+}
+
+/// The seek bar. Returns what the pointer did, and the hovered time with the
+/// point above the bar where its preview goes.
 #[allow(clippy::too_many_arguments)]
 fn timeline(
     ui: &mut egui::Ui,
     width: f32,
-    pos: f64,
-    dur: f64,
+    position: f64,
+    duration: f64,
     trim: Option<Trim>,
-    wave: Option<(&[f32], f32, f32, bool)>,
+    wave: Option<Wave>,
     drag: &mut Option<Handle>,
-    pal: &crate::theme::Palette,
+    palette: &crate::theme::Palette,
 ) -> (Option<BarAction>, Option<(f64, Pos2)>) {
-    let height = wave.map_or(24.0, |(_, _, max, _)| (max + 8.0).max(24.0));
-    let (rect, resp) =
+    let height = wave.map_or(24.0, |wave| (wave.max + 8.0).max(24.0));
+    let (rect, response) =
         ui.allocate_exact_size(vec2(width.max(40.0), height), Sense::click_and_drag());
     let track = Rect::from_center_size(rect.center(), vec2(rect.width() - 12.0, 4.0));
-    let x_of = |t: f64| track.left() + (t / dur.max(1e-6)).clamp(0.0, 1.0) as f32 * track.width();
-    let t_of = |x: f32| ((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64 * dur;
+    let x_of = |time: f64| {
+        track.left() + (time / duration.max(1e-6)).clamp(0.0, 1.0) as f32 * track.width()
+    };
+    let time_of = |x: f32| ((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64 * duration;
     let mut action = None;
 
     // Trim handle under `x`, if any: the nearer one within the grab zone.
     const HANDLE_HIT: f32 = 14.0;
     let handle_at = |x: f32| {
-        let t = trim?;
-        let (ds, de) = ((x - x_of(t.start)).abs(), (x - x_of(t.end)).abs());
-        if ds.min(de) > HANDLE_HIT {
+        let trim = trim?;
+        let to_start = (x - x_of(trim.start)).abs();
+        let to_end = (x - x_of(trim.end)).abs();
+        if to_start.min(to_end) > HANDLE_HIT {
             None
-        } else if ds <= de {
+        } else if to_start <= to_end {
             Some(Handle::Start)
         } else {
             Some(Handle::End)
@@ -1637,21 +1764,21 @@ fn timeline(
     };
     // Decide from where the button went down (a drag registers only after
     // the pointer has moved a few pixels), matching the hover cursor.
-    let press = ui.input(|i| i.pointer.press_origin());
-    if (resp.drag_started() || resp.clicked())
-        && let Some(p) = press.or(resp.interact_pointer_pos())
+    let press = ui.input(|input| input.pointer.press_origin());
+    if (response.drag_started() || response.clicked())
+        && let Some(pointer) = press.or(response.interact_pointer_pos())
     {
-        *drag = Some(handle_at(p.x).unwrap_or(Handle::Seek));
+        *drag = Some(handle_at(pointer.x).unwrap_or(Handle::Seek));
     }
-    if let (Some(h), Some(p)) = (*drag, resp.interact_pointer_pos()) {
-        let t = t_of(p.x);
-        let released = resp.drag_stopped() || resp.clicked();
-        action = Some(match h {
-            Handle::Seek if released => BarAction::Seek(t, true),
-            Handle::Seek => BarAction::Scrub(t),
+    if let (Some(handle), Some(pointer)) = (*drag, response.interact_pointer_pos()) {
+        let time = time_of(pointer.x);
+        let released = response.drag_stopped() || response.clicked();
+        action = Some(match handle {
+            Handle::Seek if released => BarAction::Seek(time, true),
+            Handle::Seek => BarAction::Scrub(time),
             Handle::Start | Handle::End => BarAction::Trim {
-                start: h == Handle::Start,
-                t,
+                start: handle == Handle::Start,
+                time,
                 done: released,
             },
         });
@@ -1660,114 +1787,119 @@ fn timeline(
         }
     }
     let over_handle = match *drag {
-        Some(h) => h != Handle::Seek,
-        None => resp.hover_pos().and_then(|h| handle_at(h.x)).is_some(),
+        Some(handle) => handle != Handle::Seek,
+        None => response
+            .hover_pos()
+            .and_then(|pointer| handle_at(pointer.x))
+            .is_some(),
     };
     if over_handle {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
-    } else if resp.hovered() || drag.is_some() {
+    } else if response.hovered() || drag.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
 
     // Hovered time and the point above the bar where its preview goes.
     // Hidden while any drag is underway (or about to start) and over a trim
     // handle, where the main view already shows the exact frame.
-    let pressed = ui.input(|i| i.pointer.any_down());
-    let hover = resp
+    let pressed = ui.input(|input| input.pointer.any_down());
+    let hover = response
         .hover_pos()
-        .filter(|h| drag.is_none() && !pressed && handle_at(h.x).is_none())
-        .map(|h| {
+        .filter(|pointer| drag.is_none() && !pressed && handle_at(pointer.x).is_none())
+        .map(|pointer| {
             (
-                t_of(h.x),
-                pos2(h.x.clamp(track.left(), track.right()), rect.top()),
+                time_of(pointer.x),
+                pos2(pointer.x.clamp(track.left(), track.right()), rect.top()),
             )
         });
-    let p = ui.painter();
-    let base = lerp(pal.surface, pal.fg, 0.18);
+    let painter = ui.painter();
+    let base = lerp(palette.surface, palette.fg, 0.18);
     // Grey out the parts the trim will cut, over whatever the bar shows.
     let shade_clipped = || {
-        let Some(t) = trim else { return };
-        let veil = pal.surface.gamma_multiply(0.8);
-        let (a, b) = (x_of(t.start), x_of(t.end));
-        for (l, r) in [(rect.left(), a), (b, rect.right())] {
-            if r > l {
-                p.rect_filled(Rect::from_x_y_ranges(l..=r, rect.y_range()), 0.0, veil);
+        let Some(trim) = trim else {
+            return;
+        };
+        let veil = palette.surface.gamma_multiply(0.8);
+        let (start, end) = (x_of(trim.start), x_of(trim.end));
+        for (left, right) in [(rect.left(), start), (end, rect.right())] {
+            if right > left {
+                let band = Rect::from_x_y_ranges(left..=right, rect.y_range());
+                painter.rect_filled(band, 0.0, veil);
             }
         }
     };
-    if let Some((levels, min, max, filled)) = wave {
-        // Waveform, accent up to the playhead.
-        let px = x_of(pos);
-        let unplayed = lerp(pal.surface, pal.fg, 0.32);
-        let color_at = |x: f32| if x <= px { pal.accent } else { unplayed };
-        let cy = rect.center().y;
-        let col = |i: usize| {
-            let x = track.left() + (i as f32 + 0.5) * WAVE_STEP;
-            (x, min + (max - min) * levels[i])
+    let trim_handles = |width: f32, active_width: f32, height: f32, color: Color32| {
+        let Some(trim) = trim else {
+            return;
         };
-        if filled {
+        for (x, active) in [
+            (x_of(trim.start), *drag == Some(Handle::Start)),
+            (x_of(trim.end), *drag == Some(Handle::End)),
+        ] {
+            let size = vec2(if active { active_width } else { width }, height);
+            let handle = Rect::from_center_size(pos2(x, rect.center().y), size);
+            painter.rect_filled(handle, CornerRadius::same(2), color);
+        }
+    };
+    let playhead_x = x_of(position);
+    if let Some(wave) = wave {
+        // Waveform, accent up to the playhead.
+        let unplayed = lerp(palette.surface, palette.fg, 0.32);
+        let color_at = |x: f32| {
+            if x <= playhead_x {
+                palette.accent
+            } else {
+                unplayed
+            }
+        };
+        let center_y = rect.center().y;
+        let column = |index: usize| {
+            let x = track.left() + (index as f32 + 0.5) * WAVE_STEP;
+            (x, wave.min + (wave.max - wave.min) * wave.levels[index])
+        };
+        if wave.filled {
             // One continuous shape: a quad between each pair of columns,
             // coloured per segment so the playhead split stays sharp.
             let mut mesh = Mesh::default();
-            for i in 1..levels.len() {
-                let ((x0, h0), (x1, h1)) = (col(i - 1), col(i));
-                let c = color_at((x0 + x1) * 0.5);
-                let base = mesh.vertices.len() as u32;
-                for (x, h) in [(x0, h0), (x1, h1)] {
-                    mesh.colored_vertex(pos2(x, cy - h * 0.5), c);
-                    mesh.colored_vertex(pos2(x, cy + h * 0.5), c);
+            for index in 1..wave.levels.len() {
+                let ((left_x, left_height), (right_x, right_height)) =
+                    (column(index - 1), column(index));
+                let color = color_at((left_x + right_x) * 0.5);
+                let first = mesh.vertices.len() as u32;
+                for (x, bar_height) in [(left_x, left_height), (right_x, right_height)] {
+                    mesh.colored_vertex(pos2(x, center_y - bar_height * 0.5), color);
+                    mesh.colored_vertex(pos2(x, center_y + bar_height * 0.5), color);
                 }
-                mesh.add_triangle(base, base + 1, base + 2);
-                mesh.add_triangle(base + 1, base + 3, base + 2);
+                mesh.add_triangle(first, first + 1, first + 2);
+                mesh.add_triangle(first + 1, first + 3, first + 2);
             }
-            p.add(Shape::mesh(mesh));
+            painter.add(Shape::mesh(mesh));
         } else {
-            for i in 0..levels.len() {
-                let (x, h) = col(i);
-                let bar = Rect::from_center_size(pos2(x, cy), vec2(WAVE_STEP - 1.0, h));
-                p.rect_filled(bar, CornerRadius::same(1), color_at(x));
+            for index in 0..wave.levels.len() {
+                let (x, bar_height) = column(index);
+                let size = vec2(WAVE_STEP - 1.0, bar_height);
+                let bar = Rect::from_center_size(pos2(x, center_y), size);
+                painter.rect_filled(bar, CornerRadius::same(1), color_at(x));
             }
         }
         shade_clipped();
-        if let Some(t) = trim {
-            for (x, active) in [
-                (x_of(t.start), *drag == Some(Handle::Start)),
-                (x_of(t.end), *drag == Some(Handle::End)),
-            ] {
-                let h = Rect::from_center_size(
-                    pos2(x, rect.center().y),
-                    vec2(if active { 4.0 } else { 3.0 }, height),
-                );
-                p.rect_filled(h, CornerRadius::same(2), pal.fg);
-            }
-        }
-        p.rect_filled(
-            Rect::from_center_size(pos2(px, rect.center().y), vec2(2.0, height)),
+        trim_handles(3.0, 4.0, height, palette.fg);
+        painter.rect_filled(
+            Rect::from_center_size(pos2(playhead_x, rect.center().y), vec2(2.0, height)),
             CornerRadius::same(1),
-            pal.fg,
+            palette.fg,
         );
         return (action, hover);
     }
-    p.rect_filled(track, CornerRadius::same(2), base);
-    let played = Rect::from_x_y_ranges(track.left()..=x_of(pos), track.y_range());
-    p.rect_filled(played, CornerRadius::same(2), pal.accent);
+    painter.rect_filled(track, CornerRadius::same(2), base);
+    let played = Rect::from_x_y_ranges(track.left()..=playhead_x, track.y_range());
+    painter.rect_filled(played, CornerRadius::same(2), palette.accent);
     shade_clipped();
-    if let Some(t) = trim {
-        for (x, active) in [
-            (x_of(t.start), *drag == Some(Handle::Start)),
-            (x_of(t.end), *drag == Some(Handle::End)),
-        ] {
-            let h = Rect::from_center_size(
-                pos2(x, rect.center().y),
-                vec2(if active { 6.0 } else { 4.0 }, 18.0),
-            );
-            p.rect_filled(h, CornerRadius::same(2), pal.accent);
-        }
-    }
-    p.circle_filled(
-        pos2(x_of(pos), track.center().y),
-        if resp.hovered() { 6.0 } else { 5.0 },
-        pal.fg,
+    trim_handles(4.0, 6.0, 18.0, palette.accent);
+    painter.circle_filled(
+        pos2(playhead_x, track.center().y),
+        if response.hovered() { 6.0 } else { 5.0 },
+        palette.fg,
     );
     (action, hover)
 }
@@ -1775,16 +1907,18 @@ fn timeline(
 const WAVE_STEP: f32 = 3.0;
 
 /// YouTube-style thumbnail above the hovered timeline point: the nearest
-/// keyframe at or before `t`, with the hovered time under it.
+/// keyframe at or before `time`, with the hovered time under it.
 fn hover_preview(
     ctx: &egui::Context,
-    p: &mut Player,
-    t: f64,
+    player: &mut Player,
+    time: f64,
     at: Pos2,
-    pal: &crate::theme::Palette,
+    palette: &crate::theme::Palette,
 ) {
-    let tex = p.preview_at(t, ctx).map(|t| (t.id(), t.size_vec2()));
-    let size = tex.map_or(vec2(0.0, 0.0), |(_, s)| s * 0.75);
+    let thumbnail = player
+        .preview_at(time, ctx)
+        .map(|texture| (texture.id(), texture.size_vec2()));
+    let size = thumbnail.map_or(vec2(0.0, 0.0), |(_, size)| size * 0.75);
     egui::Area::new(Id::unique("hover-preview"))
         .order(egui::Order::Tooltip)
         .interactable(false)
@@ -1792,34 +1926,34 @@ fn hover_preview(
         .fixed_pos(at - vec2(0.0, 18.0))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(pal.surface)
-                .stroke(Stroke::new(1.0, lerp(pal.surface, pal.fg, 0.15)))
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, lerp(palette.surface, palette.fg, 0.15)))
                 .corner_radius(CornerRadius::same(10))
                 .inner_margin(egui::Margin::same(4))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        if let Some((id, _)) = tex {
-                            let img =
+                        if let Some((id, _)) = thumbnail {
+                            let image =
                                 egui::Image::new((id, size)).corner_radius(CornerRadius::same(7));
-                            ui.add(img);
+                            ui.add(image);
                         }
-                        ui.label(egui::RichText::new(fmt_time(t)).monospace().size(11.0));
+                        ui.label(egui::RichText::new(fmt_time(time)).monospace().size(11.0));
                     });
                 });
         });
 }
 
-fn settings_ui(ui: &mut egui::Ui, s: &mut Settings) {
+fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.set_width(240.0);
     ui.spacing_mut().interact_size.y = 20.0;
     ui.spacing_mut().slider_width = 130.0;
     ui.label(egui::RichText::new("Seek bar").strong());
-    ui.checkbox(&mut s.waveform, "Show audio waveform");
-    ui.add_enabled_ui(s.waveform, |ui| {
+    ui.checkbox(&mut settings.waveform, "Show audio waveform");
+    ui.add_enabled_ui(settings.waveform, |ui| {
         ui.horizontal(|ui| {
             ui.label("Style");
-            ui.selectable_value(&mut s.wave_filled, false, "Bars");
-            ui.selectable_value(&mut s.wave_filled, true, "Filled");
+            ui.selectable_value(&mut settings.wave_filled, false, "Bars");
+            ui.selectable_value(&mut settings.wave_filled, true, "Filled");
         });
         egui::Grid::new("wave-settings")
             .num_columns(2)
@@ -1827,20 +1961,20 @@ fn settings_ui(ui: &mut egui::Ui, s: &mut Settings) {
             .show(ui, |ui| {
                 ui.label("Min height");
                 ui.add(
-                    egui::Slider::new(&mut s.wave_min, 1.0..=40.0)
+                    egui::Slider::new(&mut settings.wave_min, 1.0..=40.0)
                         .suffix(" px")
                         .max_decimals(0),
                 );
                 ui.end_row();
                 ui.label("Max height");
                 ui.add(
-                    egui::Slider::new(&mut s.wave_max, 2.0..=40.0)
+                    egui::Slider::new(&mut settings.wave_max, 2.0..=40.0)
                         .suffix(" px")
                         .max_decimals(0),
                 );
                 ui.end_row();
                 ui.label("Smoothing");
-                ui.add(egui::Slider::new(&mut s.wave_smooth, 0.0..=1.0).max_decimals(2));
+                ui.add(egui::Slider::new(&mut settings.wave_smooth, 0.0..=1.0).max_decimals(2));
                 ui.end_row();
             });
     });
@@ -1851,70 +1985,80 @@ fn volume_bar(
     width: f32,
     volume: &mut f32,
     muted: bool,
-    pal: &crate::theme::Palette,
+    palette: &crate::theme::Palette,
 ) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click_and_drag());
     let track = Rect::from_center_size(rect.center(), vec2(rect.width() - 8.0, 4.0));
     let mut changed = false;
-    if let Some(p) = resp
+    if let Some(pointer) = response
         .interact_pointer_pos()
-        .filter(|_| resp.dragged() || resp.clicked())
+        .filter(|_| response.dragged() || response.clicked())
     {
-        *volume = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        *volume = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
         changed = true;
     }
-    let v = if muted { 0.0 } else { *volume };
-    let x = track.left() + v * track.width();
+    let shown = if muted { 0.0 } else { *volume };
+    let x = track.left() + shown * track.width();
     let painter = ui.painter();
     painter.rect_filled(
         track,
         CornerRadius::same(2),
-        lerp(pal.surface, pal.fg, 0.18),
+        lerp(palette.surface, palette.fg, 0.18),
     );
     painter.rect_filled(
         Rect::from_x_y_ranges(track.left()..=x, track.y_range()),
         CornerRadius::same(2),
-        pal.fg,
+        palette.fg,
     );
-    if resp.hovered() || resp.dragged() {
-        painter.circle_filled(pos2(x, track.center().y), 5.0, pal.fg);
+    if response.hovered() || response.dragged() {
+        painter.circle_filled(pos2(x, track.center().y), 5.0, palette.fg);
     }
     changed
 }
 
-fn constrain_aspect(r: Rect, a: f32, kind: CropDrag) -> Rect {
-    // `a` is width/height in normalized units. Keep the anchored corner fixed.
-    let (w, h) = (r.width(), r.height());
-    let (nw, nh) = if w / h > a { (h * a, h) } else { (w, w / a) };
-    let (anchor_x_right, anchor_y_bottom) = match kind {
-        CropDrag::Edge { left, top, .. } => (left, top),
-        CropDrag::New(a0) => (a0.x > r.center().x, a0.y > r.center().y),
-        CropDrag::Move => (false, false),
-    };
-    let x0 = if anchor_x_right {
-        r.max.x - nw
+/// The largest size with width/height `aspect` that fits in `rect`.
+fn aspect_size(rect: Rect, aspect: f32) -> Vec2 {
+    let (width, height) = (rect.width(), rect.height());
+    if width / height > aspect {
+        vec2(height * aspect, height)
     } else {
-        r.min.x
-    };
-    let y0 = if anchor_y_bottom {
-        r.max.y - nh
-    } else {
-        r.min.y
-    };
-    Rect::from_min_size(pos2(x0, y0), vec2(nw, nh))
+        vec2(width, width / aspect)
+    }
 }
 
-/// Which crop edges a pointer at `p` grabs: within `hit` px of an edge line,
-/// and along that edge's extent. Two edges at once means a corner.
-fn crop_edges(screen: Rect, p: Pos2, hit: f32) -> CropDrag {
-    let near = |a: f32, b: f32| (a - b).abs() < hit;
-    let inside_y = p.y > screen.top() - hit && p.y < screen.bottom() + hit;
-    let inside_x = p.x > screen.left() - hit && p.x < screen.right() + hit;
+/// Shrink `rect` to width/height `aspect` (normalized units), keeping the
+/// corner the drag is anchored to fixed.
+fn constrain_aspect(rect: Rect, aspect: f32, kind: CropDrag) -> Rect {
+    let size = aspect_size(rect, aspect);
+    let (anchor_right, anchor_bottom) = match kind {
+        CropDrag::Edge { left, top, .. } => (left, top),
+        CropDrag::New(anchor) => (anchor.x > rect.center().x, anchor.y > rect.center().y),
+        CropDrag::Move => (false, false),
+    };
+    let x = if anchor_right {
+        rect.max.x - size.x
+    } else {
+        rect.min.x
+    };
+    let y = if anchor_bottom {
+        rect.max.y - size.y
+    } else {
+        rect.min.y
+    };
+    Rect::from_min_size(pos2(x, y), size)
+}
+
+/// Which crop edges a pointer at `pointer` grabs: within `hit` px of an edge
+/// line, and along that edge's extent. Two edges at once means a corner.
+fn crop_edges(screen: Rect, pointer: Pos2, hit: f32) -> CropDrag {
+    let near = |position: f32, edge: f32| (position - edge).abs() < hit;
+    let inside_y = pointer.y > screen.top() - hit && pointer.y < screen.bottom() + hit;
+    let inside_x = pointer.x > screen.left() - hit && pointer.x < screen.right() + hit;
     CropDrag::Edge {
-        left: near(p.x, screen.left()) && inside_y,
-        right: near(p.x, screen.right()) && inside_y,
-        top: near(p.y, screen.top()) && inside_x,
-        bottom: near(p.y, screen.bottom()) && inside_x,
+        left: near(pointer.x, screen.left()) && inside_y,
+        right: near(pointer.x, screen.right()) && inside_y,
+        top: near(pointer.y, screen.top()) && inside_x,
+        bottom: near(pointer.y, screen.bottom()) && inside_x,
     }
 }
 
@@ -1926,20 +2070,19 @@ const ASPECTS: [(&str, Option<f32>); 5] = [
     ("16:9", Some(16.0 / 9.0)),
 ];
 
-/// Largest centered rect inside `r` with pixel aspect `aspect`, for an image of
-/// pixel size `size` (`r` is normalized).
-fn fit_aspect_centered(r: Rect, aspect: f32, size: [usize; 2]) -> Rect {
-    let a = aspect / (size[0] as f32 / size[1] as f32);
-    let (w, h) = (r.width(), r.height());
-    let (nw, nh) = if w / h > a { (h * a, h) } else { (w, w / a) };
-    Rect::from_center_size(r.center(), vec2(nw, nh))
+/// Largest centered rect inside `rect` with pixel aspect `aspect`, for an
+/// image of pixel size `size` (`rect` is normalized).
+fn fit_aspect_centered(rect: Rect, aspect: f32, size: [usize; 2]) -> Rect {
+    let normalized = aspect / (size[0] as f32 / size[1] as f32);
+    Rect::from_center_size(rect.center(), aspect_size(rect, normalized))
 }
 
+/// `size` scaled to fit centered in `area`, at most `max_scale`.
 fn fit(area: Rect, size: Vec2, max_scale: f32) -> Rect {
-    let s = (area.width() / size.x)
+    let scale = (area.width() / size.x)
         .min(area.height() / size.y)
         .min(max_scale);
-    Rect::from_center_size(area.center(), size * s)
+    Rect::from_center_size(area.center(), size * scale)
 }
 
 fn centered_text(ui: &egui::Ui, rect: Rect, text: &str, color: Color32) {
@@ -1952,10 +2095,10 @@ fn centered_text(ui: &egui::Ui, rect: Rect, text: &str, color: Color32) {
     );
 }
 
-fn bar_frame(pal: &crate::theme::Palette) -> egui::Frame {
+fn bar_frame(palette: &crate::theme::Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(pal.surface.gamma_multiply(0.94))
-        .stroke(Stroke::new(1.0, lerp(pal.surface, pal.fg, 0.10)))
+        .fill(palette.surface.gamma_multiply(0.94))
+        .stroke(Stroke::new(1.0, lerp(palette.surface, palette.fg, 0.10)))
         .corner_radius(CornerRadius::same(14))
         .inner_margin(egui::Margin::symmetric(10, 6))
         .shadow(egui::Shadow {
@@ -1989,42 +2132,39 @@ fn icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
 
 /// Icon button that stays highlighted while `selected` (a mode is on).
 fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
-    let v = ui.style().interact(&resp);
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+    let visuals = ui.style().interact(&response);
     if selected {
         let fill = ui.visuals().selection.bg_fill;
         ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
-    } else if resp.hovered() {
+    } else if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(8), v.weak_bg_fill);
+            .rect_filled(rect, CornerRadius::same(8), visuals.weak_bg_fill);
     }
-    let color = v.fg_stroke.color;
-    let st = Stroke::new(1.6, color);
-    let p = ui.painter();
-    let c = rect.center();
-    let at = |x: f32, y: f32| c + vec2(x, y);
-    let arc = |cw: bool| {
+    let color = visuals.fg_stroke.color;
+    let stroke = Stroke::new(1.6, color);
+    let painter = ui.painter();
+    let center = rect.center();
+    let at = |x: f32, y: f32| center + vec2(x, y);
+    let arc = |clockwise: bool| {
         // 270° arc with an arrowhead at its open end.
-        let (r, a0, a1) = (
-            6.0_f32,
-            -0.25 * std::f32::consts::PI,
-            1.25 * std::f32::consts::PI,
-        );
-        let pts: Vec<Pos2> = (0..=24)
+        let radius = 6.0_f32;
+        let (first, last) = (-0.25 * std::f32::consts::PI, 1.25 * std::f32::consts::PI);
+        let points: Vec<Pos2> = (0..=24)
             .map(|i| {
-                let a = a0 + (a1 - a0) * i as f32 / 24.0;
-                let x = if cw { -a.cos() } else { a.cos() };
-                at(x * r, -a.sin() * r)
+                let angle = first + (last - first) * i as f32 / 24.0;
+                let x = if clockwise { -angle.cos() } else { angle.cos() };
+                at(x * radius, -angle.sin() * radius)
             })
             .collect();
-        let end = pts[0];
-        p.add(Shape::line(pts, st));
-        let s = if cw { 1.0 } else { -1.0 };
-        p.add(Shape::convex_polygon(
+        let end = points[0];
+        painter.add(Shape::line(points, stroke));
+        let side = if clockwise { 1.0 } else { -1.0 };
+        painter.add(Shape::convex_polygon(
             vec![
-                end + vec2(-3.5 * s, -3.5),
-                end + vec2(1.5 * s, -0.5),
-                end + vec2(-3.0 * s, 1.5),
+                end + vec2(-3.5 * side, -3.5),
+                end + vec2(1.5 * side, -0.5),
+                end + vec2(-3.0 * side, 1.5),
             ],
             color,
             Stroke::NONE,
@@ -2032,7 +2172,7 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
     };
     match icon {
         Icon::Play => {
-            p.add(Shape::convex_polygon(
+            painter.add(Shape::convex_polygon(
                 vec![at(-4.0, -6.5), at(6.5, 0.0), at(-4.0, 6.5)],
                 color,
                 Stroke::NONE,
@@ -2040,7 +2180,7 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
         }
         Icon::Pause => {
             for x in [-3.5, 3.5] {
-                p.rect_filled(
+                painter.rect_filled(
                     Rect::from_center_size(at(x, 0.0), vec2(3.0, 12.0)),
                     CornerRadius::same(1),
                     color,
@@ -2050,16 +2190,16 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
         Icon::RotateLeft => arc(true),
         Icon::RotateRight => arc(false),
         Icon::Flip => {
-            p.add(Shape::convex_polygon(
+            painter.add(Shape::convex_polygon(
                 vec![at(-1.8, -6.0), at(-1.8, 6.0), at(-7.5, 6.0)],
                 color,
                 Stroke::NONE,
             ));
-            p.add(Shape::closed_line(
+            painter.add(Shape::closed_line(
                 vec![at(1.8, -6.0), at(1.8, 6.0), at(7.5, 6.0)],
-                st,
+                stroke,
             ));
-            p.add(Shape::dashed_line(
+            painter.add(Shape::dashed_line(
                 &[at(0.0, -8.0), at(0.0, 8.0)],
                 Stroke::new(1.0, color),
                 2.0,
@@ -2067,60 +2207,61 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
             ));
         }
         Icon::Crop => {
-            p.add(Shape::line(
+            painter.add(Shape::line(
                 vec![at(-4.0, -8.0), at(-4.0, 4.0), at(8.0, 4.0)],
-                st,
+                stroke,
             ));
-            p.add(Shape::line(
+            painter.add(Shape::line(
                 vec![at(-8.0, -4.0), at(4.0, -4.0), at(4.0, 8.0)],
-                st,
+                stroke,
             ));
         }
         Icon::Trash => {
-            p.line_segment([at(-6.5, -4.5), at(6.5, -4.5)], st);
-            p.add(Shape::line(
+            painter.line_segment([at(-6.5, -4.5), at(6.5, -4.5)], stroke);
+            painter.add(Shape::line(
                 vec![at(-2.5, -4.5), at(-2.5, -7.0), at(2.5, -7.0), at(2.5, -4.5)],
-                st,
+                stroke,
             ));
-            p.add(Shape::line(
+            painter.add(Shape::line(
                 vec![at(-5.0, -4.5), at(-4.0, 7.0), at(4.0, 7.0), at(5.0, -4.5)],
-                st,
+                stroke,
             ));
             for x in [-1.5, 1.5] {
-                p.line_segment([at(x, -1.5), at(x, 4.0)], Stroke::new(1.2, color));
+                painter.line_segment([at(x, -1.5), at(x, 4.0)], Stroke::new(1.2, color));
             }
         }
         Icon::Fullscreen => {
-            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-                let corner = at(7.0 * sx, 7.0 * sy);
-                p.add(Shape::line(
+            for (x_sign, y_sign) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let corner = at(7.0 * x_sign, 7.0 * y_sign);
+                painter.add(Shape::line(
                     vec![
-                        corner - vec2(0.0, 4.0 * sy),
+                        corner - vec2(0.0, 4.0 * y_sign),
                         corner,
-                        corner - vec2(4.0 * sx, 0.0),
+                        corner - vec2(4.0 * x_sign, 0.0),
                     ],
-                    st,
+                    stroke,
                 ));
             }
         }
         Icon::Trim => {
             // Scissors: two finger loops, blades crossing above them.
-            for sx in [-1.0, 1.0] {
-                p.circle_stroke(at(4.0 * sx, 5.0), 2.6, st);
-                p.line_segment([at(2.4 * sx, 3.0), at(-4.5 * sx, -7.5)], st);
+            for side in [-1.0, 1.0] {
+                painter.circle_stroke(at(4.0 * side, 5.0), 2.6, stroke);
+                painter.line_segment([at(2.4 * side, 3.0), at(-4.5 * side, -7.5)], stroke);
             }
         }
         Icon::Settings => {
-            p.circle_stroke(c, 3.0, st);
+            painter.circle_stroke(center, 3.0, stroke);
             for i in 0..8 {
-                let a = i as f32 * std::f32::consts::FRAC_PI_4;
-                let d = vec2(a.cos(), a.sin());
-                p.line_segment([c + d * 5.5, c + d * 8.0], Stroke::new(2.4, color));
+                let angle = i as f32 * std::f32::consts::FRAC_PI_4;
+                let direction = vec2(angle.cos(), angle.sin());
+                let tooth = [center + direction * 5.5, center + direction * 8.0];
+                painter.line_segment(tooth, Stroke::new(2.4, color));
             }
-            p.circle_stroke(c, 6.0, st);
+            painter.circle_stroke(center, 6.0, stroke);
         }
         Icon::Volume | Icon::Muted => {
-            p.add(Shape::convex_polygon(
+            painter.add(Shape::convex_polygon(
                 vec![
                     at(-7.5, -2.5),
                     at(-4.5, -2.5),
@@ -2133,35 +2274,36 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
                 Stroke::NONE,
             ));
             if matches!(icon, Icon::Muted) {
-                p.line_segment([at(3.0, -3.0), at(8.0, 3.0)], st);
-                p.line_segment([at(3.0, 3.0), at(8.0, -3.0)], st);
+                painter.line_segment([at(3.0, -3.0), at(8.0, 3.0)], stroke);
+                painter.line_segment([at(3.0, 3.0), at(8.0, -3.0)], stroke);
             } else {
-                for r in [4.0_f32, 7.5] {
-                    let pts: Vec<Pos2> = (0..=12)
+                for radius in [4.0_f32, 7.5] {
+                    let points: Vec<Pos2> = (0..=12)
                         .map(|i| {
-                            let a = -0.9 + 1.8 * i as f32 / 12.0;
-                            at(a.cos() * r, a.sin() * r)
+                            let angle = -0.9 + 1.8 * i as f32 / 12.0;
+                            at(angle.cos() * radius, angle.sin() * radius)
                         })
                         .collect();
-                    p.add(Shape::line(pts, st));
+                    painter.add(Shape::line(points, stroke));
                 }
             }
         }
     }
-    resp.on_hover_text(tip)
+    response.on_hover_text(tip)
 }
 
 fn toggle_fullscreen(ctx: &egui::Context) {
-    let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+    let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
 }
 
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+/// Shorten `text` to `max` characters by cutting out its middle.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    let head: String = s.chars().take(max / 2).collect();
-    let tail: String = s
+    let head: String = text.chars().take(max / 2).collect();
+    let tail: String = text
         .chars()
         .rev()
         .take(max / 2 - 1)
@@ -2172,13 +2314,14 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
-fn fmt_time(t: f64) -> String {
-    let t = t.max(0.0);
-    let s = t as u64;
-    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
+/// `m:ss.t`, or `h:mm:ss` from an hour up.
+fn fmt_time(time: f64) -> String {
+    let time = time.max(0.0);
+    let total = time as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
-        format!("{m}:{s:02}.{}", ((t.fract()) * 10.0) as u32)
+        format!("{minutes}:{seconds:02}.{}", (time.fract() * 10.0) as u32)
     }
 }

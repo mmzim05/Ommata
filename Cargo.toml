@@ -3,7 +3,7 @@ name = "anyview"
 version = "0.1.0"
 edition = "2024"
 description = "Fast unified image and video viewer with crop and trim"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "accesskit"] }
@@ -13,6 +13,8 @@ cpal = "0.18"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 trash = "5"
 rawler = "0.8.0"
+# Loads libEGL at runtime for zero-copy video (src/gpu.rs); already used by glutin.
+libloading = "0.8"
 
 [features]
 # Link the minimal FFmpeg from scripts/build-ffmpeg.sh statically (single binary).

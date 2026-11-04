@@ -1,6 +1,7 @@
 // With the `static` feature, FFmpeg's libavcodec references dav1d, built next to
 // it by scripts/build-ffmpeg.sh. Passed as a trailing link argument so it lands
-// after libavcodec on the linker command line.
+// after libavcodec on the linker command line. FFmpeg's VA-API support needs
+// the system libva (dynamic: it loads the GPU vendor's driver at runtime).
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     if std::env::var_os("CARGO_FEATURE_STATIC").is_none() {
@@ -12,4 +13,6 @@ fn main() {
             println!("cargo:rustc-link-arg={}", lib.display());
         }
     }
+    println!("cargo:rustc-link-lib=dylib=va-drm");
+    println!("cargo:rustc-link-lib=dylib=va");
 }

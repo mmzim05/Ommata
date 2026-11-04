@@ -4,10 +4,16 @@ One fast Linux app for viewing photos and videos, with non-destructive crop,
 rotate and trim. Ships as a single executable: FFmpeg is linked statically, the
 UI is GPU-rendered egui, and colours follow the active Omarchy theme.
 
+Videos decode on the GPU through VA-API and stay there: frames are imported
+into OpenGL as DMA-BUFs and converted to RGB by a shader, never copied
+through the CPU. This needs libva and the GPU's VA-API driver (Intel:
+`intel-media-driver`, AMD: `libva-mesa-driver`) and an EGL session (Wayland).
+Without them, video decodes on the CPU.
+
 ## Build
 
 ```sh
-sudo pacman -S --needed nasm        # SIMD for FFmpeg's decoders
+sudo pacman -S --needed nasm libva  # SIMD for FFmpeg's decoders, VA-API
 ./scripts/build-ffmpeg.sh           # minimal static FFmpeg into target/ffmpeg
 cargo build --release               # target/release/anyview
 ```
@@ -50,3 +56,9 @@ before the in point, and the timeline shows that snapped point.
 
 Settings (seek-bar waveform style, min/max height, smoothing) are in the gear
 menu on the video bar and saved to `~/.config/anyview/settings.conf`.
+
+## License
+
+GPL-3.0-or-later. You may use, change and share anyview; versions you
+distribute, modified or not, must stay under the same license with their
+source available. See [LICENSE](LICENSE).

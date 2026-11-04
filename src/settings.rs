@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+/// User preferences for the video seek bar.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     /// Draw the seek bar as the audio waveform (falls back to a plain bar
@@ -33,33 +34,38 @@ impl Default for Settings {
 fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("anyview/settings.conf"))
 }
 
 impl Settings {
+    /// Read the settings file; missing files and bad values fall back to
+    /// the defaults.
     pub fn load() -> Self {
-        let mut s = Self::default();
-        let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-            return s;
+        let mut settings = Self::default();
+        let Some(text) = path().and_then(|file| std::fs::read_to_string(file).ok()) else {
+            return settings;
         };
         for line in text.lines() {
-            let Some((k, v)) = line.split_once('=') else {
+            let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let v = v.trim();
-            match k.trim() {
-                "waveform" => s.waveform = v != "false",
-                "wave_style" => s.wave_filled = v == "filled",
-                "wave_min" => s.wave_min = v.parse().unwrap_or(s.wave_min),
-                "wave_max" => s.wave_max = v.parse().unwrap_or(s.wave_max),
-                "wave_smooth" => s.wave_smooth = v.parse().unwrap_or(s.wave_smooth),
+            let value = value.trim();
+            match key.trim() {
+                "waveform" => settings.waveform = value != "false",
+                "wave_style" => settings.wave_filled = value == "filled",
+                "wave_min" => settings.wave_min = value.parse().unwrap_or(settings.wave_min),
+                "wave_max" => settings.wave_max = value.parse().unwrap_or(settings.wave_max),
+                "wave_smooth" => {
+                    settings.wave_smooth = value.parse().unwrap_or(settings.wave_smooth);
+                }
                 _ => {}
             }
         }
-        s.clamp()
+        settings.clamp()
     }
 
+    /// Keep every value inside the range the settings UI offers.
     pub fn clamp(mut self) -> Self {
         self.wave_max = self.wave_max.clamp(2.0, 40.0);
         self.wave_min = self.wave_min.clamp(1.0, self.wave_max);
@@ -67,13 +73,14 @@ impl Settings {
         self
     }
 
+    /// Write the settings file, creating its directory if needed.
     pub fn save(&self) -> std::io::Result<()> {
-        let Some(p) = path() else { return Ok(()) };
-        if let Some(dir) = p.parent() {
+        let Some(file) = path() else { return Ok(()) };
+        if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(
-            p,
+            file,
             format!(
                 "waveform = {}\nwave_style = {}\nwave_min = {}\nwave_max = {}\nwave_smooth = {}\n",
                 self.waveform,

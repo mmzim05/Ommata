@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+/// The kind of media a file holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Image,
@@ -11,6 +12,7 @@ pub enum Kind {
 const IMAGE_EXT: &[&str] = &[
     "jpg", "jpeg", "jpe", "png", "webp", "gif", "tif", "tiff", "bmp",
 ];
+/// Camera RAW extensions, decoded through rawler.
 pub const RAW_EXT: &[&str] = &[
     "rw2", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "dng", "pef", "srw",
     "erf", "3fr", "iiq", "mos", "kdc", "dcr", "mrw",
@@ -20,6 +22,7 @@ const VIDEO_EXT: &[&str] = &[
     "mpg", "mpeg", "3gp",
 ];
 
+/// The media kind of `path`, from its extension.
 pub fn kind(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if IMAGE_EXT.contains(&ext.as_str()) || RAW_EXT.contains(&ext.as_str()) {
@@ -34,14 +37,15 @@ pub fn kind(path: &Path) -> Option<Kind> {
 /// Media files next to `path`, naturally sorted ("img2" before "img10").
 pub fn siblings(path: &Path) -> Vec<PathBuf> {
     let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && kind(p).is_some())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|file| file.is_file() && kind(file).is_some())
                 .collect()
         })
         .unwrap_or_default();
@@ -56,21 +60,25 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             (None, None) => return std::cmp::Ordering::Equal,
             (None, _) => return std::cmp::Ordering::Less,
             (_, None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let na = a.iter().take_while(|c| c.is_ascii_digit()).count();
-                let nb = b.iter().take_while(|c| c.is_ascii_digit()).count();
-                let (da, db) = (trim_zeros(&a[..na]), trim_zeros(&b[..nb]));
-                let ord = da.len().cmp(&db.len()).then(da.cmp(db));
-                if ord.is_ne() {
-                    return ord;
+            (Some(left), Some(right)) if left.is_ascii_digit() && right.is_ascii_digit() => {
+                let left_len = a.iter().take_while(|byte| byte.is_ascii_digit()).count();
+                let right_len = b.iter().take_while(|byte| byte.is_ascii_digit()).count();
+                let left_digits = trim_zeros(&a[..left_len]);
+                let right_digits = trim_zeros(&b[..right_len]);
+                let order = left_digits
+                    .len()
+                    .cmp(&right_digits.len())
+                    .then(left_digits.cmp(right_digits));
+                if order.is_ne() {
+                    return order;
                 }
-                a = &a[na..];
-                b = &b[nb..];
+                a = &a[left_len..];
+                b = &b[right_len..];
             }
-            (Some(x), Some(y)) => {
-                let ord = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
-                if ord.is_ne() {
-                    return ord;
+            (Some(left), Some(right)) => {
+                let order = left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase());
+                if order.is_ne() {
+                    return order;
                 }
                 a = &a[1..];
                 b = &b[1..];
@@ -79,9 +87,9 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-fn trim_zeros(d: &[u8]) -> &[u8] {
-    let n = d.iter().take_while(|&&c| c == b'0').count();
-    &d[n.min(d.len().saturating_sub(1))..]
+fn trim_zeros(digits: &[u8]) -> &[u8] {
+    let zeros = digits.iter().take_while(|&&byte| byte == b'0').count();
+    &digits[zeros.min(digits.len().saturating_sub(1))..]
 }
 
 /// `photo.jpg` -> `photo-edit.jpg` (with extension `ext`, or the source's own
@@ -99,25 +107,25 @@ pub fn original_path(path: &Path) -> PathBuf {
 fn suffixed_path(path: &Path, tag: &str, ext: Option<&str>) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = ext
-        .map(|e| format!(".{e}"))
+        .map(|extension| format!(".{extension}"))
         .or_else(|| {
             path.extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
+                .map(|extension| format!(".{}", extension.to_string_lossy()))
         })
         .unwrap_or_default();
     let dir = path.parent().unwrap_or(Path::new(""));
-    let mut n = 1;
+    let mut number = 1;
     loop {
-        let suffix = if n == 1 {
+        let suffix = if number == 1 {
             String::new()
         } else {
-            format!("-{n}")
+            format!("-{number}")
         };
-        let p = dir.join(format!("{stem}-{tag}{suffix}{ext}"));
-        if !p.exists() {
-            return p;
+        let candidate = dir.join(format!("{stem}-{tag}{suffix}{ext}"));
+        if !candidate.exists() {
+            return candidate;
         }
-        n += 1;
+        number += 1;
     }
 }
 
@@ -133,9 +141,9 @@ mod tests {
 
     #[test]
     fn natural_order() {
-        let mut v = vec!["img10.jpg", "img2.jpg", "IMG1.jpg", "img02b.jpg"];
-        v.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v, ["IMG1.jpg", "img2.jpg", "img02b.jpg", "img10.jpg"]);
+        let mut names = vec!["img10.jpg", "img2.jpg", "IMG1.jpg", "img02b.jpg"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, ["IMG1.jpg", "img2.jpg", "img02b.jpg", "img10.jpg"]);
     }
 
     #[test]
