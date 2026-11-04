@@ -19,25 +19,14 @@
 
 ![anyview playing a motorbike race video, paused, with the file bar on top and the seek bar at the bottom](docs/screenshots/video.webp)
 
-*A 1080p60 race clip, paused. The bars fade out after three seconds without input and come
-back when you move the mouse or press a key.*
-
 <table>
   <tr>
     <td><img src="docs/screenshots/hover.webp" alt="Hovering the seek bar shows a thumbnail of that point" /></td>
     <td><img src="docs/screenshots/trim.webp" alt="Trim mode with in and out handles on the seek bar" /></td>
   </tr>
   <tr>
-    <td align="center"><em>Hover the seek bar for a preview</em></td>
-    <td align="center"><em>Trim to the exact frame</em></td>
-  </tr>
-  <tr>
     <td><img src="docs/screenshots/photo.webp" alt="A black and white race car photo" /></td>
     <td><img src="docs/screenshots/crop.webp" alt="Cropping a photo to 16:9" /></td>
-  </tr>
-  <tr>
-    <td align="center"><em>Photos of any size, up to 100 MP</em></td>
-    <td align="center"><em>Crop with aspect presets</em></td>
   </tr>
 </table>
 
