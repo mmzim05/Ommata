@@ -1,0 +1,41 @@
+# Build the AppImage on every v* tag and attach it to that tag's release.
+# Ubuntu 22.04 keeps the AppImage's glibc requirement low, so it runs on
+# most current distros.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm meson ninja-build pkg-config clang libclang-dev \
+            libva-dev libdrm-dev libx264-dev libx265-dev libasound2-dev file
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build AppImage
+        run: ./scripts/build-appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anyview-appimage
+          path: target/appimage/*.AppImage
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/appimage/*.AppImage

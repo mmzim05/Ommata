@@ -33,21 +33,20 @@
 - **Trim clips:** cut a video to the exact frame you choose, with no loss in quality.
 - **Quick edits:** crop, rotate and flip photos, then save or keep a copy.
 - **Browse a folder:** step through every photo and video with the arrow keys.
-- **Fits your desktop:** follows your Omarchy theme, and shows RAW thumbnails in your file
-  manager.
+- **Fits your desktop:** follows your Omarchy theme.
 
 ## Install
 
-anyview runs on Linux. On Arch, install the build tools, then build and install:
+Download the `.AppImage` file from the
+[latest release](https://github.com/mmzim05/anyview/releases/latest), make it executable,
+and open it:
 
 ```sh
-sudo pacman -S --needed git rust meson ninja nasm libva x264 x265
-git clone https://github.com/mmzim05/anyview
-cd anyview
-./scripts/build-ffmpeg.sh
-cargo build --release
-sudo ./scripts/install.sh
+chmod +x anyview-*-x86_64.AppImage
+./anyview-*-x86_64.AppImage
 ```
+
+To add it to your app menu, open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever).
 
 For smooth video, install your graphics driver's video package: `intel-media-driver` for
 Intel, `libva-mesa-driver` for AMD.
@@ -73,11 +72,19 @@ overwritten; they save as a JPEG copy.
 
 ## Build from source
 
-For development, run against the system FFmpeg without the build script:
+On Arch:
 
 ```sh
-FFMPEG_DIR=/usr cargo run --no-default-features -- <file-or-folder>
+sudo pacman -S --needed git rust meson ninja nasm libva x264 x265
+git clone https://github.com/mmzim05/anyview
+cd anyview
+./scripts/build-ffmpeg.sh
+cargo build --release
+sudo ./scripts/install.sh
 ```
+
+Installing this way also shows RAW thumbnails in your file manager.
+`./scripts/build-appimage.sh` packages an AppImage.
 
 ## License
 
