@@ -22,6 +22,23 @@ pub struct VaDisplay(*mut c_void);
 // SAFETY: a VADisplay is a thread-safe libva handle; libva serializes calls.
 unsafe impl Send for VaDisplay {}
 
+impl VaDisplay {
+    /// Whether the driver decodes the VAProfile `profile`; a profile the
+    /// GPU only encodes has no VLD (decode) entry point.
+    fn can_decode(self, profile: i32) -> bool {
+        const VA_ENTRYPOINT_VLD: i32 = 1;
+        // SAFETY: libva fills at most vaMaxNumEntrypoints() entries.
+        unsafe {
+            let mut entrypoints = vec![0; vaMaxNumEntrypoints(self.0).max(0) as usize];
+            let mut count = 0;
+            let status =
+                vaQueryConfigEntrypoints(self.0, profile, entrypoints.as_mut_ptr(), &mut count);
+            status == VA_STATUS_SUCCESS
+                && entrypoints[..count.max(0) as usize].contains(&VA_ENTRYPOINT_VLD)
+        }
+    }
+}
+
 const VA_STATUS_SUCCESS: i32 = 0;
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
@@ -62,6 +79,13 @@ struct DrmDescriptor {
 #[link(name = "va")]
 unsafe extern "C" {
     fn vaSyncSurface(display: *mut c_void, surface: u32) -> i32;
+    fn vaMaxNumEntrypoints(display: *mut c_void) -> i32;
+    fn vaQueryConfigEntrypoints(
+        display: *mut c_void,
+        profile: i32,
+        entrypoints: *mut i32,
+        count: *mut i32,
+    ) -> i32;
     fn vaExportSurfaceHandle(
         display: *mut c_void,
         surface: u32,
@@ -69,6 +93,38 @@ unsafe extern "C" {
         flags: u32,
         descriptor: *mut c_void,
     ) -> i32;
+}
+
+/// FFmpeg's decoder for `codec` that can decode on a VA-API device. For AV1
+/// this is FFmpeg's own decoder, not the default libdav1d.
+pub fn decoder(codec: ff::codec::Id) -> Option<ff::Codec> {
+    const HW_DEVICE_CTX: i32 = 0x01;
+    let mut state = std::ptr::null_mut();
+    // SAFETY: walks FFmpeg's static codec list and their static configs.
+    unsafe {
+        loop {
+            let candidate = ff::ffi::av_codec_iterate(&mut state);
+            if candidate.is_null() {
+                return None;
+            }
+            if ff::ffi::av_codec_is_decoder(candidate) == 0 || (*candidate).id != codec.into() {
+                continue;
+            }
+            let mut index = 0;
+            loop {
+                let config = ff::ffi::avcodec_get_hw_config(candidate, index);
+                if config.is_null() {
+                    break;
+                }
+                if (*config).device_type == ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+                    && (*config).methods & HW_DEVICE_CTX != 0
+                {
+                    return Some(ff::Codec::wrap(candidate));
+                }
+                index += 1;
+            }
+        }
+    }
 }
 
 /// The VA-API device a decoder renders into.
@@ -95,29 +151,23 @@ impl VaDevice {
         (status >= 0 && !device.is_null()).then_some(Self(device))
     }
 
-    /// Whether FFmpeg's decoder for `codec` can decode on a VA-API device.
-    pub fn supports(codec: ff::codec::Id) -> bool {
-        const HW_DEVICE_CTX: i32 = 0x01;
-        // SAFETY: lookups of static codec descriptions.
-        unsafe {
-            let decoder = ff::ffi::avcodec_find_decoder(codec.into());
-            if decoder.is_null() {
-                return false;
-            }
-            let mut index = 0;
-            loop {
-                let config = ff::ffi::avcodec_get_hw_config(decoder, index);
-                if config.is_null() {
-                    return false;
-                }
-                if (*config).device_type == ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
-                    && (*config).methods & HW_DEVICE_CTX != 0
-                {
-                    return true;
-                }
-                index += 1;
-            }
+    /// Whether this GPU can decode the stream of `parameters`. Only AV1 is
+    /// checked: FFmpeg's AV1 decoder has no CPU fallback, while the other
+    /// decoders fall back on their own when the GPU lacks a profile.
+    pub fn decodes(&self, parameters: &ff::codec::Parameters) -> bool {
+        const VA_PROFILE_AV1_PROFILE0: i32 = 32;
+        const VA_PROFILE_AV1_PROFILE1: i32 = 33;
+        const AV_PROFILE_AV1_HIGH: i32 = 1;
+        if parameters.id() != ff::codec::Id::AV1 {
+            return true;
         }
+        // SAFETY: plain field read on valid codec parameters.
+        let profile = match unsafe { (*parameters.as_ptr()).profile } {
+            AV_PROFILE_AV1_HIGH => VA_PROFILE_AV1_PROFILE1,
+            // Main, and streams that don't say, which are almost always main.
+            _ => VA_PROFILE_AV1_PROFILE0,
+        };
+        self.display().can_decode(profile)
     }
 
     /// Make `decoder` decode into this device's surfaces when it supports the
@@ -939,7 +989,19 @@ mod tests {
     #[ignore]
     fn va_device_decodes_hevc() {
         ffmpeg_next::init().unwrap();
-        assert!(super::VaDevice::supports(ffmpeg_next::codec::Id::HEVC));
+        assert!(super::decoder(ffmpeg_next::codec::Id::HEVC).is_some());
         assert!(super::VaDevice::open().is_some(), "no VA-API device");
+    }
+
+    /// Needs an AV1-capable VA-API driver: cargo test --release av1 -- --ignored
+    #[test]
+    #[ignore]
+    fn av1_decodes_on_the_gpu() {
+        ffmpeg_next::init().unwrap();
+        let codec = super::decoder(ffmpeg_next::codec::Id::AV1).expect("no AV1 VA-API decoder");
+        assert_eq!(codec.name(), "av1");
+        let device = super::VaDevice::open().expect("no VA-API device");
+        // Main profile, which every AV1-capable GPU decodes.
+        assert!(device.display().can_decode(32), "GPU lacks AV1 decoding");
     }
 }

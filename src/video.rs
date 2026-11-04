@@ -960,20 +960,23 @@ fn decode(
     };
     let frame = 1.0 / fps;
     let mut video_codec = ff::codec::Context::from_parameters(video_stream.parameters())?;
-    let device = (use_gpu && VaDevice::supports(video_codec.id()))
-        .then(VaDevice::open)
-        .flatten();
-    if let Some(device) = &device {
+    let hardware = use_gpu
+        .then(|| gpu::decoder(video_codec.id()))
+        .flatten()
+        .and_then(|codec| Some((VaDevice::open()?, codec)))
+        .filter(|(device, _)| device.decodes(&video_stream.parameters()));
+    let va_display = hardware.as_ref().map(|(device, _)| device.display());
+    let mut video_decoder = if let Some((device, codec)) = &hardware {
         // The GPU decodes; extra CPU frame threads would only add latency.
         device.attach(&mut video_codec, EXTRA_SURFACES);
+        video_codec.decoder().open_as(*codec)?.video()?
     } else {
         video_codec.set_threading(ff::codec::threading::Config {
             kind: ff::codec::threading::Type::Frame,
             count: 0,
         });
-    }
-    let va_display = device.as_ref().map(VaDevice::display);
-    let mut video_decoder = video_codec.decoder().video()?;
+        video_codec.decoder().video()?
+    };
 
     let mut audio_decoder = None;
     let mut audio_time_base = 0.0;

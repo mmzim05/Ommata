@@ -18,8 +18,10 @@ readonly PREFIX="$ROOT/target/ffmpeg"
 readonly DEMUXERS=(mov matroska avi mpegts mpegps flv ogg asf ivf mp3 wav aac
   flac mpegvideo h264 hevc)
 readonly MUXERS=(mov mp4 matroska webm avi mpegts ogg flv asf ivf)
+# AV1 has two decoders: FFmpeg's own (av1) decodes only on the GPU, and
+# libdav1d on the CPU when the GPU can't.
 readonly DECODERS=(
-  h264 hevc vp8 vp9 libdav1d mpeg4 mpeg1video mpeg2video mjpeg prores theora
+  h264 hevc vp8 vp9 av1 libdav1d mpeg4 mpeg1video mpeg2video mjpeg prores theora
   vc1 wmv3 h263 msmpeg4v3 dvvideo
   aac aac_latm mp3 mp3float mp2 opus vorbis flac ac3 eac3 alac dca truehd wmav2
   pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8
@@ -28,8 +30,8 @@ readonly PARSERS=(h264 hevc vp8 vp9 av1 mpeg4video mpegvideo mjpeg vc1 aac
   aac_latm mpegaudio opus vorbis flac ac3 dca)
 # GPU decoding through VA-API. libva is linked dynamically: it loads the GPU
 # vendor's driver at runtime, and anyview falls back to the CPU without one.
-readonly HWACCELS=(h264_vaapi hevc_vaapi vp8_vaapi vp9_vaapi mpeg2_vaapi
-  mpeg4_vaapi vc1_vaapi wmv3_vaapi)
+readonly HWACCELS=(h264_vaapi hevc_vaapi vp8_vaapi vp9_vaapi av1_vaapi
+  mpeg2_vaapi mpeg4_vaapi vc1_vaapi wmv3_vaapi)
 
 join() {
   local IFS=,
@@ -46,7 +48,7 @@ check_tools() {
   done
 }
 
-# dav1d: FFmpeg's own AV1 decoder only works with hardware acceleration.
+# dav1d: AV1 on the CPU, since FFmpeg's own AV1 decoder needs the GPU.
 build_dav1d() {
   local dav1d_src="$ROOT/target/dav1d-src"
   if [[ -f "$PREFIX/lib/libdav1d.a" ]]; then

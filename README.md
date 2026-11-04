@@ -121,8 +121,9 @@ brands are likely to work.
 | MPEG-PS | `.mpg` `.mpeg` | MPEG-2, MPEG-1 | ✅ |
 | 3GP | `.3gp` | H.263 | ✅ |
 
-GPU decoding (VA-API) is tested for H.264, HEVC, VP8, VP9 and MPEG-2; MPEG-4 Part 2 and VC-1
-are enabled but untested. AV1 decodes on the CPU with dav1d.
+GPU decoding (VA-API) is tested for H.264, HEVC, VP8, VP9, AV1 (8- and 10-bit) and MPEG-2;
+MPEG-4 Part 2 and VC-1 are enabled but untested. On a GPU without AV1 decoding, AV1 decodes on
+the CPU with dav1d.
 
 ## Keys
 
