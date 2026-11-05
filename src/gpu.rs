@@ -39,6 +39,195 @@ impl VaDisplay {
     }
 }
 
+impl VaDisplay {
+    /// The driver's vendor string, such as "Mesa Gallium driver ..." or
+    /// "VA-API NVDEC driver [direct backend]".
+    fn vendor(self) -> String {
+        // SAFETY: libva returns a static string owned by the display, or null.
+        unsafe {
+            let vendor = vaQueryVendorString(self.0);
+            if vendor.is_null() {
+                return String::new();
+            }
+            CStr::from_ptr(vendor).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Whether an AV1 stream may use film grain, from the sequence header in its
+/// extradata (an av1C record followed by config OBUs). `None` when the
+/// extradata carries no readable sequence header.
+fn av1_film_grain(extradata: &[u8]) -> Option<bool> {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    // av1C: marker and version, profile and level, tier and colour, delay.
+    let mut obus = extradata.get(4..)?;
+    while let Some((&header, rest)) = obus.split_first() {
+        let kind = (header >> 3) & 0x0f;
+        let rest = if header & 0x04 != 0 {
+            rest.get(1..)?
+        } else {
+            rest
+        };
+        let (payload, rest) = if header & 0x02 != 0 {
+            let mut bits = Bits::new(rest);
+            let size = bits.leb128()?;
+            let start = bits.at / 8;
+            let end = start.checked_add(usize::try_from(size).ok()?)?;
+            (rest.get(start..end)?, &rest[end..])
+        } else {
+            (rest, &[][..])
+        };
+        if kind == OBU_SEQUENCE_HEADER {
+            return sequence_film_grain(payload);
+        }
+        obus = rest;
+    }
+    None
+}
+
+/// `film_grain_params_present` of an AV1 sequence header OBU payload (AV1
+/// spec 5.5).
+fn sequence_film_grain(payload: &[u8]) -> Option<bool> {
+    let mut bits = Bits::new(payload);
+    let profile = bits.read(3)?;
+    bits.skip(1)?; // still_picture
+    let reduced = bits.flag()?;
+    let mut decoder_model = false;
+    if reduced {
+        bits.skip(5)?; // seq_level_idx
+    } else {
+        if bits.flag()? {
+            // timing_info
+            bits.skip(64)?;
+            if bits.flag()? {
+                bits.uvlc()?;
+            }
+            decoder_model = bits.flag()?;
+        }
+        let mut delay_length = 0;
+        if decoder_model {
+            delay_length = bits.read(5)? + 1;
+            bits.skip(32 + 5 + 5)?;
+        }
+        let display_delay = bits.flag()?;
+        for _ in 0..=bits.read(5)? {
+            bits.skip(12)?; // operating_point_idc
+            if bits.read(5)? > 7 {
+                bits.skip(1)?; // seq_tier
+            }
+            if decoder_model && bits.flag()? {
+                bits.skip(2 * delay_length as usize + 1)?;
+            }
+            if display_delay && bits.flag()? {
+                bits.skip(4)?;
+            }
+        }
+    }
+    let width_bits = bits.read(4)? + 1;
+    let height_bits = bits.read(4)? + 1;
+    bits.skip((width_bits + height_bits) as usize)?;
+    if !reduced && bits.flag()? {
+        bits.skip(4 + 3)?; // frame id lengths
+    }
+    bits.skip(3)?; // superblock size, filter intra, intra edge
+    if !reduced {
+        bits.skip(4)?; // interintra, masked compound, warped motion, dual filter
+        let order_hint = bits.flag()?;
+        if order_hint {
+            bits.skip(2)?; // jnt_comp, ref_frame_mvs
+        }
+        let screen_content = if bits.flag()? { 2 } else { bits.read(1)? };
+        if screen_content > 0 && !bits.flag()? {
+            bits.skip(1)?; // seq_force_integer_mv
+        }
+        if order_hint {
+            bits.skip(3)?;
+        }
+    }
+    bits.skip(3)?; // superres, cdef, restoration
+    // color_config
+    let high_bitdepth = bits.flag()?;
+    let twelve_bit = profile == 2 && high_bitdepth && bits.flag()?;
+    let mono = profile != 1 && bits.flag()?;
+    let (mut primaries, mut transfer, mut matrix) = (2, 2, 2);
+    if bits.flag()? {
+        primaries = bits.read(8)?;
+        transfer = bits.read(8)?;
+        matrix = bits.read(8)?;
+    }
+    if mono {
+        bits.skip(1)?; // color_range
+    } else {
+        // BT.709 primaries, sRGB transfer, identity matrix: 4:4:4, full range.
+        if !(primaries == 1 && transfer == 13 && matrix == 0) {
+            bits.skip(1)?; // color_range
+            let subsampled = match profile {
+                0 => true,
+                1 => false,
+                _ if twelve_bit => bits.flag()? && bits.flag()?,
+                _ => false,
+            };
+            if subsampled {
+                bits.skip(2)?; // chroma_sample_position
+            }
+        }
+        bits.skip(1)?; // separate_uv_delta_q
+    }
+    bits.flag()
+}
+
+/// Big-endian bit reader for AV1 headers.
+struct Bits<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Bits<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, at: 0 }
+    }
+
+    fn flag(&mut self) -> Option<bool> {
+        let byte = self.data.get(self.at / 8)?;
+        let bit = byte >> (7 - self.at % 8) & 1;
+        self.at += 1;
+        Some(bit == 1)
+    }
+
+    fn read(&mut self, count: u32) -> Option<u32> {
+        (0..count).try_fold(0, |value, _| Some(value << 1 | u32::from(self.flag()?)))
+    }
+
+    fn skip(&mut self, count: usize) -> Option<()> {
+        self.at += count;
+        (self.at <= self.data.len() * 8).then_some(())
+    }
+
+    fn uvlc(&mut self) -> Option<()> {
+        let mut zeros = 0;
+        while !self.flag()? {
+            zeros += 1;
+            if zeros >= 32 {
+                return None;
+            }
+        }
+        self.skip(zeros)
+    }
+
+    /// A byte-aligned leb128 value (OBU sizes).
+    fn leb128(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for index in 0..8 {
+            let byte = self.read(8)? as u64;
+            value |= (byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
 const VA_STATUS_SUCCESS: i32 = 0;
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
@@ -80,6 +269,7 @@ struct DrmDescriptor {
 unsafe extern "C" {
     fn vaSyncSurface(display: *mut c_void, surface: u32) -> i32;
     fn vaMaxNumEntrypoints(display: *mut c_void) -> i32;
+    fn vaQueryVendorString(display: *mut c_void) -> *const c_char;
     fn vaQueryConfigEntrypoints(
         display: *mut c_void,
         profile: i32,
@@ -167,7 +357,16 @@ impl VaDevice {
             // Main, and streams that don't say, which are almost always main.
             _ => VA_PROFILE_AV1_PROFILE0,
         };
-        self.display().can_decode(profile)
+        let display = self.display();
+        // NVIDIA's VA-API driver (NVDEC) breaks on AV1 film grain: frames
+        // come out black or fail to decode. dav1d applies the grain on the
+        // CPU instead; a stream that doesn't say goes there too.
+        if display.vendor().contains("NVDEC")
+            && av1_film_grain(&crate::trim::extradata(parameters)) != Some(false)
+        {
+            return false;
+        }
+        display.can_decode(profile)
     }
 
     /// Make `decoder` decode into this device's surfaces when it supports the
@@ -984,6 +1183,55 @@ pub mod headless {
 
 #[cfg(test)]
 mod tests {
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Extradata of real files, with FFmpeg's trace_headers reading of
+    /// film_grain_params_present.
+    #[test]
+    fn reads_av1_film_grain_flag() {
+        for (name, extradata, grain) in [
+            // AV1 10-bit anime episode that played black frames on NVDEC.
+            (
+                "mkv 10-bit",
+                "81044d000a0e00000024c597dd00be14180418b0",
+                Some(true),
+            ),
+            (
+                "svt grain",
+                "81000c000a0b0200000561e7fde017c006",
+                Some(true),
+            ),
+            (
+                "svt plain",
+                "81000c000a0b0200000561e7fde017c002",
+                Some(false),
+            ),
+            (
+                "aom grain",
+                "81000c000a0b000000043cffbcdaf900c0",
+                Some(true),
+            ),
+            (
+                "aom 10-bit",
+                "81004c000a0b000000043cffbcdaf94040",
+                Some(false),
+            ),
+            ("aom 4:4:4", "812000000a0a200000043cffbcdaf902", Some(false)),
+            // rav1e writes no config OBUs.
+            ("no sequence header", "811f0c00", None),
+            ("empty", "", None),
+            ("truncated", "81000c000a0b02000005", None),
+        ] {
+            let extradata = hex(extradata);
+            assert_eq!(super::av1_film_grain(&extradata), grain, "{name}");
+        }
+    }
+
     /// Needs a VA-API driver: cargo test --release va_device -- --ignored
     #[test]
     #[ignore]

@@ -2017,7 +2017,8 @@ impl App {
         let width = (ctx.content_rect().width() - 32.0).min(900.0);
         // Fixed layout: play, time, mute and volume take ~256 px.
         let timeline_width = (width - 24.0 - 256.0).max(40.0);
-        let columns = ((timeline_width - 12.0) / WAVE_STEP).max(1.0) as usize;
+        let step = wave_step(ctx.pixels_per_point());
+        let columns = ((timeline_width - 12.0) / step).max(1.0) as usize;
         let wave = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
         let settings = self.settings.clone();
         let Some((_, player)) = &mut self.player else {
@@ -2791,8 +2792,13 @@ fn timeline(
             }
         };
         let center_y = rect.center().y;
+        // Columns start on a whole pixel and are a whole number of pixels
+        // apart, so every bar comes out the same width on any display scale.
+        let pixels = ui.ctx().pixels_per_point();
+        let step = wave_step(pixels);
+        let left = (track.left() * pixels).round() / pixels;
         let column = |index: usize| {
-            let x = track.left() + (index as f32 + 0.5) * WAVE_STEP;
+            let x = left + (index as f32 + 0.5) * step;
             (x, wave.min + (wave.max - wave.min) * wave.levels[index])
         };
         if wave.filled {
@@ -2813,10 +2819,16 @@ fn timeline(
             }
             painter.add(Shape::mesh(mesh));
         } else {
+            // A third of each step (at least a pixel) is the gap.
+            let step_pixels = (step * pixels).round();
+            let bar_width = (step_pixels - (step_pixels / 3.0).round().max(1.0)) / pixels;
             for index in 0..wave.levels.len() {
                 let (x, bar_height) = column(index);
-                let size = vec2(WAVE_STEP - 1.0, bar_height);
-                let bar = Rect::from_center_size(pos2(x, center_y), size);
+                let bar_left = left + index as f32 * step;
+                let bar = Rect::from_x_y_ranges(
+                    bar_left..=bar_left + bar_width,
+                    center_y - bar_height * 0.5..=center_y + bar_height * 0.5,
+                );
                 painter.rect_filled(bar, CornerRadius::same(1), color_at(x));
             }
         }
@@ -2843,6 +2855,12 @@ fn timeline(
 }
 
 const WAVE_STEP: f32 = 3.0;
+
+/// Distance between waveform columns in points: WAVE_STEP rounded to whole
+/// pixels at `pixels_per_point`.
+fn wave_step(pixels_per_point: f32) -> f32 {
+    (WAVE_STEP * pixels_per_point).round().max(2.0) / pixels_per_point
+}
 
 /// YouTube-style thumbnail above the hovered timeline point: the nearest
 /// keyframe at or before `time`, with the hovered time under it.

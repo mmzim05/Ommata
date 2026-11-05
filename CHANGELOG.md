@@ -21,6 +21,12 @@ the new version.
   to files with chosen tags, a minimum rating, a label, or only rejected files.
 - Keyboard focus is visible on stars, colour swatches and icon buttons.
 
+### Fixed
+
+- AV1 videos with film grain flickered to black on NVIDIA GPUs, whose VA-API driver
+  can't apply the grain. They now decode on the CPU there, grain included.
+- Waveform bars on the seek bar are all the same width on scaled displays.
+
 ## [0.2.0] - 2026-11-05
 
 ### Added
