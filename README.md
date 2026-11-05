@@ -193,8 +193,8 @@ cargo build --release
 sudo ./scripts/install.sh   # installs to /usr/local, with file-manager thumbnails
 ```
 
-`./scripts/build-appimage.sh` packages an AppImage, and `cargo release patch --execute`
-publishes a new version (see [CHANGELOG.md](CHANGELOG.md)).
+`cargo release patch --execute` tags a new version (see [CHANGELOG.md](CHANGELOG.md)),
+and `./scripts/build-appimage.sh` builds its AppImage and `.zsync` for the GitHub release.
 
 ## Licence
 

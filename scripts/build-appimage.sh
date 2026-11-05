@@ -2,10 +2,9 @@
 set -euo pipefail
 # Package omalens as an AppImage in target/appimage, with linuxdeploy.
 # An AppImage only runs on systems whose glibc is at least as new as the
-# build machine's, so release builds run on an old distro (the release
-# workflow uses Ubuntu 22.04). x264 and x265 are bundled; libva and libdrm
-# come from the host so they match its GPU driver, and graphics and audio
-# libraries always come from the host.
+# build machine's. x264 and x265 are bundled; libva and libdrm come from the
+# host so they match its GPU driver, and graphics and audio libraries always
+# come from the host.
 
 readonly LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
