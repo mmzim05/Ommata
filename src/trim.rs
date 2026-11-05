@@ -294,7 +294,7 @@ fn parameter_sets(codec: Codec, extradata: &[u8]) -> (Framing, Vec<Vec<u8>>) {
 }
 
 /// The stream's extradata (codec configuration) bytes.
-pub(crate) fn extradata(parameters: &ff::codec::Parameters) -> Vec<u8> {
+fn extradata(parameters: &ff::codec::Parameters) -> Vec<u8> {
     // SAFETY: plain reads of the parameters' extradata buffer.
     unsafe {
         let raw = parameters.as_ptr();

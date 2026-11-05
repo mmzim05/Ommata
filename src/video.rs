@@ -3,6 +3,7 @@
 //! its queues are full, so a paused video costs no CPU.
 
 use crate::gpu::{self, Garbage, Gpu, VaDevice, VaFrame};
+use crate::grain::Grain;
 use crate::lock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
@@ -1275,10 +1276,16 @@ fn decode(
             let surface_display = va_display
                 .filter(|_| gpu::is_hardware(&video_frame) && !shared.cpu_only.load(Relaxed));
             if surface_display.is_none() && gpu::is_hardware(&video_frame) {
+                // The decoder exports film grain instead of applying it;
+                // add it to the copy in system memory.
+                let grain = Grain::of(&video_frame);
                 if !gpu::download(&video_frame, &mut downloaded) {
                     continue;
                 }
                 std::mem::swap(&mut video_frame, &mut downloaded);
+                if let Some(grain) = grain {
+                    grain.apply_to(&mut video_frame);
+                }
             }
             let mut take_surface = |width: u32, height: u32| {
                 let decoded = std::mem::replace(&mut video_frame, ff::frame::Video::empty());

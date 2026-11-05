@@ -1,5 +1,6 @@
 mod app;
 mod gpu;
+mod grain;
 mod library;
 mod picture;
 mod preview;

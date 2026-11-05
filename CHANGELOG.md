@@ -9,6 +9,12 @@ the new version.
 
 ## [Unreleased]
 
+### Fixed
+
+- AV1 film grain is drawn by omalens's own shader, matching dav1d bit for bit, so
+  videos with grain decode on the GPU with every driver. 0.3.0 sent them to the CPU on
+  NVIDIA, whose VA-API driver turns grained frames black.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

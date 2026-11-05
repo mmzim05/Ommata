@@ -3,6 +3,7 @@
 //! from YUV to RGB by a shader straight into GPU textures. Pixels never pass
 //! through the CPU.
 
+use crate::grain::{self, Grain};
 use crate::lock;
 use eframe::egui::TextureId;
 use eframe::egui_glow::ShaderVersion;
@@ -39,200 +40,13 @@ impl VaDisplay {
     }
 }
 
-impl VaDisplay {
-    /// The driver's vendor string, such as "Mesa Gallium driver ..." or
-    /// "VA-API NVDEC driver [direct backend]".
-    fn vendor(self) -> String {
-        // SAFETY: libva returns a static string owned by the display, or null.
-        unsafe {
-            let vendor = vaQueryVendorString(self.0);
-            if vendor.is_null() {
-                return String::new();
-            }
-            CStr::from_ptr(vendor).to_string_lossy().into_owned()
-        }
-    }
-}
-
-/// Whether an AV1 stream may use film grain, from the sequence header in its
-/// extradata (an av1C record followed by config OBUs). `None` when the
-/// extradata carries no readable sequence header.
-fn av1_film_grain(extradata: &[u8]) -> Option<bool> {
-    const OBU_SEQUENCE_HEADER: u8 = 1;
-    // av1C: marker and version, profile and level, tier and colour, delay.
-    let mut obus = extradata.get(4..)?;
-    while let Some((&header, rest)) = obus.split_first() {
-        let kind = (header >> 3) & 0x0f;
-        let rest = if header & 0x04 != 0 {
-            rest.get(1..)?
-        } else {
-            rest
-        };
-        let (payload, rest) = if header & 0x02 != 0 {
-            let mut bits = Bits::new(rest);
-            let size = bits.leb128()?;
-            let start = bits.at / 8;
-            let end = start.checked_add(usize::try_from(size).ok()?)?;
-            (rest.get(start..end)?, &rest[end..])
-        } else {
-            (rest, &[][..])
-        };
-        if kind == OBU_SEQUENCE_HEADER {
-            return sequence_film_grain(payload);
-        }
-        obus = rest;
-    }
-    None
-}
-
-/// `film_grain_params_present` of an AV1 sequence header OBU payload (AV1
-/// spec 5.5).
-fn sequence_film_grain(payload: &[u8]) -> Option<bool> {
-    let mut bits = Bits::new(payload);
-    let profile = bits.read(3)?;
-    bits.skip(1)?; // still_picture
-    let reduced = bits.flag()?;
-    let mut decoder_model = false;
-    if reduced {
-        bits.skip(5)?; // seq_level_idx
-    } else {
-        if bits.flag()? {
-            // timing_info
-            bits.skip(64)?;
-            if bits.flag()? {
-                bits.uvlc()?;
-            }
-            decoder_model = bits.flag()?;
-        }
-        let mut delay_length = 0;
-        if decoder_model {
-            delay_length = bits.read(5)? + 1;
-            bits.skip(32 + 5 + 5)?;
-        }
-        let display_delay = bits.flag()?;
-        for _ in 0..=bits.read(5)? {
-            bits.skip(12)?; // operating_point_idc
-            if bits.read(5)? > 7 {
-                bits.skip(1)?; // seq_tier
-            }
-            if decoder_model && bits.flag()? {
-                bits.skip(2 * delay_length as usize + 1)?;
-            }
-            if display_delay && bits.flag()? {
-                bits.skip(4)?;
-            }
-        }
-    }
-    let width_bits = bits.read(4)? + 1;
-    let height_bits = bits.read(4)? + 1;
-    bits.skip((width_bits + height_bits) as usize)?;
-    if !reduced && bits.flag()? {
-        bits.skip(4 + 3)?; // frame id lengths
-    }
-    bits.skip(3)?; // superblock size, filter intra, intra edge
-    if !reduced {
-        bits.skip(4)?; // interintra, masked compound, warped motion, dual filter
-        let order_hint = bits.flag()?;
-        if order_hint {
-            bits.skip(2)?; // jnt_comp, ref_frame_mvs
-        }
-        let screen_content = if bits.flag()? { 2 } else { bits.read(1)? };
-        if screen_content > 0 && !bits.flag()? {
-            bits.skip(1)?; // seq_force_integer_mv
-        }
-        if order_hint {
-            bits.skip(3)?;
-        }
-    }
-    bits.skip(3)?; // superres, cdef, restoration
-    // color_config
-    let high_bitdepth = bits.flag()?;
-    let twelve_bit = profile == 2 && high_bitdepth && bits.flag()?;
-    let mono = profile != 1 && bits.flag()?;
-    let (mut primaries, mut transfer, mut matrix) = (2, 2, 2);
-    if bits.flag()? {
-        primaries = bits.read(8)?;
-        transfer = bits.read(8)?;
-        matrix = bits.read(8)?;
-    }
-    if mono {
-        bits.skip(1)?; // color_range
-    } else {
-        // BT.709 primaries, sRGB transfer, identity matrix: 4:4:4, full range.
-        if !(primaries == 1 && transfer == 13 && matrix == 0) {
-            bits.skip(1)?; // color_range
-            let subsampled = match profile {
-                0 => true,
-                1 => false,
-                _ if twelve_bit => bits.flag()? && bits.flag()?,
-                _ => false,
-            };
-            if subsampled {
-                bits.skip(2)?; // chroma_sample_position
-            }
-        }
-        bits.skip(1)?; // separate_uv_delta_q
-    }
-    bits.flag()
-}
-
-/// Big-endian bit reader for AV1 headers.
-struct Bits<'a> {
-    data: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, at: 0 }
-    }
-
-    fn flag(&mut self) -> Option<bool> {
-        let byte = self.data.get(self.at / 8)?;
-        let bit = byte >> (7 - self.at % 8) & 1;
-        self.at += 1;
-        Some(bit == 1)
-    }
-
-    fn read(&mut self, count: u32) -> Option<u32> {
-        (0..count).try_fold(0, |value, _| Some(value << 1 | u32::from(self.flag()?)))
-    }
-
-    fn skip(&mut self, count: usize) -> Option<()> {
-        self.at += count;
-        (self.at <= self.data.len() * 8).then_some(())
-    }
-
-    fn uvlc(&mut self) -> Option<()> {
-        let mut zeros = 0;
-        while !self.flag()? {
-            zeros += 1;
-            if zeros >= 32 {
-                return None;
-            }
-        }
-        self.skip(zeros)
-    }
-
-    /// A byte-aligned leb128 value (OBU sizes).
-    fn leb128(&mut self) -> Option<u64> {
-        let mut value = 0u64;
-        for index in 0..8 {
-            let byte = self.read(8)? as u64;
-            value |= (byte & 0x7f) << (index * 7);
-            if byte & 0x80 == 0 {
-                return Some(value);
-            }
-        }
-        None
-    }
-}
-
 const VA_STATUS_SUCCESS: i32 = 0;
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
 const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// DRM fourcc "R16 ": the 16-bit luma plane of P010 and P012 surfaces.
+const DRM_FORMAT_R16: u32 = 0x2036_3152;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -269,7 +83,6 @@ struct DrmDescriptor {
 unsafe extern "C" {
     fn vaSyncSurface(display: *mut c_void, surface: u32) -> i32;
     fn vaMaxNumEntrypoints(display: *mut c_void) -> i32;
-    fn vaQueryVendorString(display: *mut c_void) -> *const c_char;
     fn vaQueryConfigEntrypoints(
         display: *mut c_void,
         profile: i32,
@@ -357,16 +170,7 @@ impl VaDevice {
             // Main, and streams that don't say, which are almost always main.
             _ => VA_PROFILE_AV1_PROFILE0,
         };
-        let display = self.display();
-        // NVIDIA's VA-API driver (NVDEC) breaks on AV1 film grain: frames
-        // come out black or fail to decode. dav1d applies the grain on the
-        // CPU instead; a stream that doesn't say goes there too.
-        if display.vendor().contains("NVDEC")
-            && av1_film_grain(&crate::trim::extradata(parameters)) != Some(false)
-        {
-            return false;
-        }
-        display.can_decode(profile)
+        self.display().can_decode(profile)
     }
 
     /// Make `decoder` decode into this device's surfaces when it supports the
@@ -379,6 +183,9 @@ impl VaDevice {
             (*context).hw_device_ctx = ff::ffi::av_buffer_ref(self.0);
             (*context).get_format = Some(prefer_vaapi);
             (*context).extra_hw_frames = surfaces;
+            // Film grain comes back as parameters for the shader instead of
+            // being left to the driver, which may not apply it (grain.rs).
+            (*context).export_side_data |= ff::ffi::AV_CODEC_EXPORT_DATA_FILM_GRAIN;
         }
     }
 
@@ -442,6 +249,8 @@ pub fn download(hardware: &ff::frame::Video, software: &mut ff::frame::Video) ->
 pub struct VaFrame {
     frame: ff::frame::Video,
     display: VaDisplay,
+    /// AV1 film grain to add while drawing.
+    grain: Option<Box<Grain>>,
     pub width: u32,
     pub height: u32,
 }
@@ -457,7 +266,8 @@ impl VaFrame {
         let surface = surface_id(&frame);
         // SAFETY: the surface belongs to `display` and is kept alive by `frame`.
         let status = unsafe { vaSyncSurface(display.0, surface) };
-        (status == VA_STATUS_SUCCESS).then_some(Self {
+        (status == VA_STATUS_SUCCESS).then(|| Self {
+            grain: Grain::of(&frame).map(Box::new),
             frame,
             display,
             width,
@@ -584,6 +394,313 @@ void main() {
 }
 "#;
 
+/// Film grain (grain.rs) per pixel, shared by both grain passes. Pixel
+/// values are integers at the stream's bit depth, as the specification
+/// computes them.
+const GRAIN_COMMON: &str = r#"
+#ifdef GL_ES
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
+#endif
+uniform sampler2D u_luma;
+uniform sampler2D u_chroma;
+uniform sampler2D u_grain;
+uniform sampler2D u_offsets;
+uniform sampler2D u_scaling;
+uniform int u_scaling_rows;
+uniform int u_overlap;
+uniform int u_grain_min;
+uniform int u_grain_max;
+uniform int u_scaling_shift;
+uniform float u_unorm;
+uniform int u_shift;
+uniform ivec2 u_size;
+uniform int u_depth;
+uniform int u_min;
+
+// Division by 2^n rounding down, also for negative values.
+int shr(int value, int n) {
+    return value >= 0 ? value >> n : -((-value - 1) >> n) - 1;
+}
+
+int round2(int value, int n) {
+    return n == 0 ? value : shr(value + (1 << (n - 1)), n);
+}
+
+int luma_value(ivec2 at) {
+    return int(texelFetch(u_luma, at, 0).r * u_unorm + 0.5) >> u_shift;
+}
+
+int template_grain(int plane, int row, int block, int i, int j) {
+    int offset = int(texelFetch(u_offsets, ivec2(block, row), 0).r);
+    int sub = plane == 0 ? 0 : 1;
+    int x = 3 + (2 >> sub) * (3 + (offset >> 4)) + j;
+    int y = 3 + (2 >> sub) * (3 + (offset & 15)) + i;
+    int first = plane == 0 ? 0 : (plane == 1 ? CB_ROW : CR_ROW);
+    return int(texelFetch(u_grain, ivec2(x, first + y), 0).r);
+}
+
+int blend(int previous, int current, int index, int sub) {
+    int mixed = sub == 1 ? previous * 23 + current * 22
+        : (index == 0 ? previous * 27 + current * 17 : previous * 17 + current * 27);
+    return clamp(round2(mixed, 5), u_grain_min, u_grain_max);
+}
+
+int row_grain(int plane, int row, int i, int x) {
+    int sub = plane == 0 ? 0 : 1;
+    int size = 32 >> sub;
+    int block = x / size;
+    int j = x - block * size;
+    int grain = template_grain(plane, row, block, i, j);
+    if (u_overlap != 0 && block > 0 && j < (2 >> sub)) {
+        grain = blend(template_grain(plane, row, block - 1, i, j + size), grain, j, sub);
+    }
+    return grain;
+}
+
+int grain_at(int plane, ivec2 at) {
+    int sub = plane == 0 ? 0 : 1;
+    int size = 32 >> sub;
+    int row = at.y / size;
+    int i = at.y - row * size;
+    int grain = row_grain(plane, row, i, at.x);
+    if (u_overlap != 0 && row > 0 && i < (2 >> sub)) {
+        grain = blend(row_grain(plane, row - 1, i + size, at.x), grain, i, sub);
+    }
+    return grain;
+}
+
+int scaling(int curve, int value) {
+    ivec2 at = ivec2(value & 255, curve * u_scaling_rows + (value >> 8));
+    return int(texelFetch(u_scaling, at, 0).r);
+}
+"#;
+
+/// First grain pass, at chroma resolution: grained Cb and Cr as integers.
+const CHROMA_GRAIN_SHADER: &str = r#"
+uniform ivec2 u_apply;
+uniform int u_from_luma;
+uniform ivec2 u_mult;
+uniform ivec2 u_mult_luma;
+uniform ivec2 u_uv_offset;
+uniform int u_max_chroma;
+out uvec4 f_value;
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    ivec2 luma_at = at * 2;
+    int average = luma_value(luma_at);
+    if (luma_at.x + 1 < u_size.x) {
+        average = (average + luma_value(luma_at + ivec2(1, 0)) + 1) >> 1;
+    }
+    vec2 stored = texelFetch(u_chroma, at, 0).rg;
+    int values[2];
+    for (int plane = 0; plane < 2; plane++) {
+        int value = int(stored[plane] * u_unorm + 0.5) >> u_shift;
+        if (u_apply[plane] != 0) {
+            int merged = average;
+            int curve = 0;
+            if (u_from_luma == 0) {
+                int combined = average * u_mult_luma[plane] + value * u_mult[plane];
+                merged = clamp(
+                    shr(combined, 6) + u_uv_offset[plane] * (1 << (u_depth - 8)),
+                    0,
+                    (1 << u_depth) - 1
+                );
+                curve = plane + 1;
+            }
+            int grain = round2(scaling(curve, merged) * grain_at(plane + 1, at), u_scaling_shift);
+            value = clamp(value + grain, u_min, u_max_chroma);
+        }
+        values[plane] = value;
+    }
+    f_value = uvec4(uint(values[0]), uint(values[1]), 0u, 1u);
+}
+"#;
+
+/// Second grain pass, at full resolution: grained luma, chroma from the
+/// first pass filtered like the clean path's textures, converted to RGB.
+const LUMA_GRAIN_SHADER: &str = r#"
+uniform usampler2D u_chroma_grain;
+uniform int u_apply_luma;
+uniform int u_max_luma;
+uniform mat3 u_matrix;
+uniform vec3 u_offset;
+out vec4 f_color;
+vec2 grained_chroma(ivec2 at, ivec2 last) {
+    return vec2(texelFetch(u_chroma_grain, clamp(at, ivec2(0), last), 0).rg);
+}
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    int luma = luma_value(at);
+    if (u_apply_luma != 0) {
+        int grain = round2(scaling(0, luma) * grain_at(0, at), u_scaling_shift);
+        luma = clamp(luma + grain, u_min, u_max_luma);
+    }
+    vec2 position = (vec2(at) + 0.5) * 0.5 - 0.5;
+    vec2 base = floor(position);
+    vec2 weight = position - base;
+    ivec2 corner = ivec2(base);
+    ivec2 last = textureSize(u_chroma_grain, 0) - 1;
+    vec2 chroma = mix(
+        mix(grained_chroma(corner, last), grained_chroma(corner + ivec2(1, 0), last), weight.x),
+        mix(grained_chroma(corner + ivec2(0, 1), last), grained_chroma(corner + ivec2(1, 1), last), weight.x),
+        weight.y
+    );
+    // Back to the normalized values the clean path samples.
+    float unit = float(1 << u_shift) / u_unorm;
+    vec3 yuv = vec3(float(luma), chroma) * unit;
+    f_color = vec4(u_matrix * (yuv - u_offset), 1.0);
+}
+"#;
+
+/// Compile and link the vertex shader with `fragment`.
+fn program(
+    gl: &glow::Context,
+    version: ShaderVersion,
+    fragment: &str,
+) -> Result<glow::Program, String> {
+    let header = format!(
+        "{}\n#define CB_ROW {}\n#define CR_ROW {}\n",
+        version.version_declaration(),
+        grain::CB_ROW,
+        grain::CR_ROW
+    );
+    // SAFETY: GL calls on the current context with valid arguments.
+    unsafe {
+        let program = gl.create_program()?;
+        for (kind, source) in [
+            (glow::VERTEX_SHADER, VERTEX_SHADER),
+            (glow::FRAGMENT_SHADER, fragment),
+        ] {
+            let shader = gl.create_shader(kind)?;
+            gl.shader_source(shader, &format!("{header}{source}"));
+            gl.compile_shader(shader);
+            if !gl.get_shader_compile_status(shader) {
+                let log = gl.get_shader_info_log(shader);
+                gl.delete_shader(shader);
+                gl.delete_program(program);
+                return Err(log);
+            }
+            gl.attach_shader(program, shader);
+            gl.delete_shader(shader);
+        }
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            gl.delete_program(program);
+            return Err(log);
+        }
+        Ok(program)
+    }
+}
+
+/// GL objects of the film grain passes.
+#[derive(Clone, Copy)]
+struct GrainPasses {
+    chroma_program: glow::Program,
+    luma_program: glow::Program,
+    templates: glow::Texture,
+    offsets: glow::Texture,
+    scaling: glow::Texture,
+    /// Grained Cb and Cr of the current frame, and their size.
+    chroma: glow::Texture,
+    chroma_size: [u32; 2],
+    /// The grained frame at full size, when it is drawn scaled.
+    full: glow::Texture,
+    full_size: [u32; 2],
+}
+
+impl GrainPasses {
+    fn new(gl: &glow::Context, version: ShaderVersion) -> Result<Self, String> {
+        let chroma_program = program(gl, version, &format!("{GRAIN_COMMON}{CHROMA_GRAIN_SHADER}"))?;
+        let luma_program = program(gl, version, &format!("{GRAIN_COMMON}{LUMA_GRAIN_SHADER}"))?;
+        // SAFETY: GL calls on the current context.
+        unsafe {
+            Ok(Self {
+                chroma_program,
+                luma_program,
+                templates: gl.create_texture()?,
+                offsets: gl.create_texture()?,
+                scaling: gl.create_texture()?,
+                chroma: gl.create_texture()?,
+                chroma_size: [0, 0],
+                full: gl.create_texture()?,
+                full_size: [0, 0],
+            })
+        }
+    }
+
+    fn delete(&self, gl: &glow::Context) {
+        // SAFETY: GL calls on the current context with objects it created.
+        unsafe {
+            gl.delete_program(self.chroma_program);
+            gl.delete_program(self.luma_program);
+            for texture in [
+                self.templates,
+                self.offsets,
+                self.scaling,
+                self.chroma,
+                self.full,
+            ] {
+                gl.delete_texture(texture);
+            }
+        }
+    }
+}
+
+/// Upload `values` (`width`×`height`) as a single-channel float texture,
+/// read with texelFetch.
+///
+/// # Safety
+/// The GL context must be current.
+unsafe fn upload_values(
+    gl: &glow::Context,
+    texture: glow::Texture,
+    width: usize,
+    height: usize,
+    values: &[f32],
+) {
+    debug_assert_eq!(values.len(), width * height);
+    // SAFETY: f32 has no padding or invalid bit patterns as bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) };
+    // SAFETY: GL calls on the current context; `bytes` holds the whole image.
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::R32F as i32,
+            width as i32,
+            height as i32,
+            0,
+            glow::RED,
+            glow::FLOAT,
+            glow::PixelUnpackData::Slice(Some(bytes)),
+        );
+        nearest(gl);
+    }
+}
+
+/// Sample the bound texture without filtering.
+///
+/// # Safety
+/// The GL context must be current.
+unsafe fn nearest(gl: &glow::Context) {
+    // SAFETY: GL calls on the current context.
+    unsafe {
+        for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::NEAREST as i32);
+        }
+        for parameter in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::CLAMP_TO_EDGE as i32);
+        }
+    }
+}
+
 /// Converts VA-API frames into GL textures and owns the texture egui shows
 /// video through.
 pub struct Gpu {
@@ -605,6 +722,8 @@ pub struct Gpu {
     in_flight: Vec<(glow::Fence, VaFrame)>,
     /// Set once an import fails; players then decode for the CPU.
     pub failed: bool,
+    /// Film grain passes; `None` if their shaders don't compile here.
+    grain: Option<GrainPasses>,
 }
 
 impl Gpu {
@@ -616,27 +735,13 @@ impl Gpu {
         if !version.is_new_shader_interface() {
             return Err("GLSL too old for the video shader".into());
         }
+        let program = program(&gl, version, FRAGMENT_SHADER)?;
+        // Without the grain passes, frames with film grain go to the CPU.
+        let grain = GrainPasses::new(&gl, version)
+            .inspect_err(|error| eprintln!("omalens: film grain shader unavailable: {error}"))
+            .ok();
         // SAFETY: GL calls on the current context with valid arguments.
         unsafe {
-            let program = gl.create_program()?;
-            for (kind, source) in [
-                (glow::VERTEX_SHADER, VERTEX_SHADER),
-                (glow::FRAGMENT_SHADER, FRAGMENT_SHADER),
-            ] {
-                let shader = gl.create_shader(kind)?;
-                let header = version.version_declaration();
-                gl.shader_source(shader, &format!("{header}\n{source}"));
-                gl.compile_shader(shader);
-                if !gl.get_shader_compile_status(shader) {
-                    return Err(gl.get_shader_info_log(shader));
-                }
-                gl.attach_shader(program, shader);
-                gl.delete_shader(shader);
-            }
-            gl.link_program(program);
-            if !gl.get_program_link_status(program) {
-                return Err(gl.get_program_info_log(program));
-            }
             gl.use_program(Some(program));
             let luma = gl.get_uniform_location(program, "u_luma");
             let chroma = gl.get_uniform_location(program, "u_chroma");
@@ -658,6 +763,7 @@ impl Gpu {
                 garbage: Garbage::default(),
                 in_flight: Vec::new(),
                 failed: false,
+                grain,
             })
         }
     }
@@ -853,14 +959,24 @@ impl Gpu {
             descriptor.width.div_ceil(2),
             descriptor.height.div_ceil(2),
         );
-        let result = chroma.map(|chroma| {
-            let crop = [
-                frame.frame.width() as f32 / descriptor.width as f32,
-                frame.frame.height() as f32 / descriptor.height as f32,
-            ];
+        let result = chroma.and_then(|chroma| {
             let colors = colors(&frame.frame);
-            self.draw(&luma, &chroma, crop, colors, target, width, height);
+            let drawn = match &frame.grain {
+                Some(grain) => {
+                    let wide = descriptor.layers[0].drm_format == DRM_FORMAT_R16;
+                    self.draw_grain(&luma, &chroma, grain, wide, colors, target, width, height)
+                }
+                None => {
+                    let crop = [
+                        frame.frame.width() as f32 / descriptor.width as f32,
+                        frame.frame.height() as f32 / descriptor.height as f32,
+                    ];
+                    self.draw(&luma, &chroma, crop, colors, target, width, height);
+                    Ok(())
+                }
+            };
             self.release(chroma);
+            drawn
         });
         self.release(luma);
         result?;
@@ -949,6 +1065,216 @@ impl Gpu {
         }
     }
 
+    /// Draw `luma` and `chroma` with `grain` added into `target`
+    /// (`width`×`height`): grain at full resolution in two passes, then
+    /// scaled into `target` if it is another size. `wide` planes hold 16-bit
+    /// samples (P010), others 8-bit.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_grain(
+        &mut self,
+        luma: &Imported,
+        chroma: &Imported,
+        grain: &Grain,
+        wide: bool,
+        colors: Colors,
+        target: glow::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let mut passes = self.grain.ok_or("no film grain shader")?;
+        let gl = &self.gl;
+        let (full_width, full_height) = (grain.width as u32, grain.height as u32);
+        let chroma_size = [full_width.div_ceil(2), full_height.div_ceil(2)];
+        let direct = [width, height] == [full_width, full_height];
+        let (grain_min, grain_max) = grain.grain_range();
+        // SAFETY: GL calls on the current context with valid objects. State
+        // egui relies on (framebuffer, texture units, program) is restored.
+        unsafe {
+            upload_values(
+                gl,
+                passes.templates,
+                grain::TEXTURE_WIDTH,
+                grain::TEXTURE_HEIGHT,
+                &grain.template_texture(),
+            );
+            upload_values(
+                gl,
+                passes.offsets,
+                grain.blocks,
+                grain.rows,
+                &grain.offset_texture(),
+            );
+            upload_values(
+                gl,
+                passes.scaling,
+                256,
+                grain.scaling_rows() * 3,
+                &grain.scaling_texture(),
+            );
+            if passes.chroma_size != chroma_size {
+                gl.bind_texture(glow::TEXTURE_2D, Some(passes.chroma));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RG16UI as i32,
+                    chroma_size[0] as i32,
+                    chroma_size[1] as i32,
+                    0,
+                    glow::RG_INTEGER,
+                    glow::UNSIGNED_SHORT,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                nearest(gl);
+                passes.chroma_size = chroma_size;
+            }
+            if !direct && passes.full_size != [full_width, full_height] {
+                self.allocate(passes.full, full_width, full_height);
+                passes.full_size = [full_width, full_height];
+            }
+            for (unit, texture) in [
+                (0, luma.texture),
+                (1, chroma.texture),
+                (2, passes.templates),
+                (3, passes.offsets),
+                (4, passes.scaling),
+                (5, passes.chroma),
+            ] {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            }
+            let common = |program: glow::Program| {
+                gl.use_program(Some(program));
+                let int = move |name: &str, value: i32| {
+                    gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
+                };
+                for (unit, name) in ["u_luma", "u_chroma", "u_grain", "u_offsets", "u_scaling"]
+                    .iter()
+                    .enumerate()
+                {
+                    int(name, unit as i32);
+                }
+                int("u_scaling_rows", grain.scaling_rows() as i32);
+                int("u_overlap", i32::from(grain.overlap));
+                int("u_grain_min", grain_min);
+                int("u_grain_max", grain_max);
+                int("u_scaling_shift", grain.scaling_shift);
+                int("u_shift", if wide { 16 - grain.depth as i32 } else { 0 });
+                int("u_depth", grain.depth as i32);
+                int("u_min", grain.min);
+                gl.uniform_1_f32(
+                    gl.get_uniform_location(program, "u_unorm").as_ref(),
+                    if wide { 65535.0 } else { 255.0 },
+                );
+                gl.uniform_2_i32(
+                    gl.get_uniform_location(program, "u_size").as_ref(),
+                    full_width as i32,
+                    full_height as i32,
+                );
+                int
+            };
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.bind_vertex_array(Some(self.vertex_array));
+
+            // Pass 1: Cb and Cr at chroma resolution.
+            let program = passes.chroma_program;
+            let int = common(program);
+            let pair = |name: &str, values: [i32; 2]| {
+                gl.uniform_2_i32(
+                    gl.get_uniform_location(program, name).as_ref(),
+                    values[0],
+                    values[1],
+                );
+            };
+            pair("u_apply", grain.apply_chroma.map(i32::from));
+            pair("u_mult", grain.uv_mult);
+            pair("u_mult_luma", grain.uv_mult_luma);
+            pair("u_uv_offset", grain.uv_offset);
+            int("u_from_luma", i32::from(grain.from_luma));
+            int("u_max_chroma", grain.max_chroma);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(passes.chroma),
+                0,
+            );
+            gl.viewport(0, 0, chroma_size[0] as i32, chroma_size[1] as i32);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+
+            // Pass 2: luma, and the frame in RGB at full resolution.
+            let program = passes.luma_program;
+            let int = common(program);
+            int("u_chroma_grain", 5);
+            int("u_apply_luma", i32::from(grain.apply_luma));
+            int("u_max_luma", grain.max_luma);
+            gl.uniform_matrix_3_f32_slice(
+                gl.get_uniform_location(program, "u_matrix").as_ref(),
+                false,
+                &colors.matrix,
+            );
+            let [y, u, v] = colors.offset;
+            gl.uniform_3_f32(
+                gl.get_uniform_location(program, "u_offset").as_ref(),
+                y,
+                u,
+                v,
+            );
+            let output = if direct { target } else { passes.full };
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(output),
+                0,
+            );
+            gl.viewport(0, 0, full_width as i32, full_height as i32);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+
+            if !direct {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.read_framebuffer));
+                gl.framebuffer_texture_2d(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(passes.full),
+                    0,
+                );
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
+                gl.framebuffer_texture_2d(
+                    glow::DRAW_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(target),
+                    0,
+                );
+                gl.blit_framebuffer(
+                    0,
+                    0,
+                    full_width as i32,
+                    full_height as i32,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::LINEAR,
+                );
+            }
+
+            for unit in (0..6).rev() {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+            }
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        self.grain = Some(passes);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
@@ -1007,6 +1333,9 @@ impl Drop for Gpu {
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_framebuffer(self.framebuffer);
             self.gl.delete_framebuffer(self.read_framebuffer);
+        }
+        if let Some(grain) = &self.grain {
+            grain.delete(&self.gl);
         }
     }
 }
@@ -1183,55 +1512,6 @@ pub mod headless {
 
 #[cfg(test)]
 mod tests {
-    fn hex(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
-            .collect()
-    }
-
-    /// Extradata of real files, with FFmpeg's trace_headers reading of
-    /// film_grain_params_present.
-    #[test]
-    fn reads_av1_film_grain_flag() {
-        for (name, extradata, grain) in [
-            // AV1 10-bit anime episode that played black frames on NVDEC.
-            (
-                "mkv 10-bit",
-                "81044d000a0e00000024c597dd00be14180418b0",
-                Some(true),
-            ),
-            (
-                "svt grain",
-                "81000c000a0b0200000561e7fde017c006",
-                Some(true),
-            ),
-            (
-                "svt plain",
-                "81000c000a0b0200000561e7fde017c002",
-                Some(false),
-            ),
-            (
-                "aom grain",
-                "81000c000a0b000000043cffbcdaf900c0",
-                Some(true),
-            ),
-            (
-                "aom 10-bit",
-                "81004c000a0b000000043cffbcdaf94040",
-                Some(false),
-            ),
-            ("aom 4:4:4", "812000000a0a200000043cffbcdaf902", Some(false)),
-            // rav1e writes no config OBUs.
-            ("no sequence header", "811f0c00", None),
-            ("empty", "", None),
-            ("truncated", "81000c000a0b02000005", None),
-        ] {
-            let extradata = hex(extradata);
-            assert_eq!(super::av1_film_grain(&extradata), grain, "{name}");
-        }
-    }
-
     /// Needs a VA-API driver: cargo test --release va_device -- --ignored
     #[test]
     #[ignore]
