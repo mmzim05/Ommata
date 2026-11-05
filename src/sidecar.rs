@@ -1007,6 +1007,36 @@ mod tests {
         assert_eq!(parse(&updated).unwrap(), meta(&["Best"], 1, None));
     }
 
+    /// A shoot's worth of sidecars reads in well under the time it takes to
+    /// show the first file (it runs in the background anyway).
+    #[test]
+    fn reads_a_shoot_quickly() {
+        let first = scratch("shoot", "P_S50000.MOV");
+        let dir = first.parent().unwrap().to_path_buf();
+        let files: Vec<PathBuf> = (0..300)
+            .map(|n| dir.join(format!("P_S5{n:04}.MOV")))
+            .collect();
+        for (n, file) in files.iter().enumerate() {
+            std::fs::write(file, b"").unwrap();
+            let tags = if n % 2 == 0 {
+                vec!["Shot/Action", "Best"]
+            } else {
+                vec!["Day 1"]
+            };
+            write(file, &meta(&tags, (n % 6) as i8, None)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let tagged = files.iter().filter(|file| !read(file).is_empty()).count();
+        let elapsed = started.elapsed();
+        eprintln!("read 300 sidecars in {elapsed:?}");
+        assert_eq!(tagged, 300);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// exiv2 (the library digiKam writes with) reads what omalens writes.
     #[test]
     fn exiv2_reads_the_fields() {
