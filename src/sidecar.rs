@@ -673,7 +673,9 @@ fn write_fields(writer: &mut Writer<Vec<u8>>, meta: &Meta, prefixes: &Prefixes, 
         }
         out.extend(format!("{indent} </{container}>{indent}</{property}>").bytes());
     };
-    let leaves: BTreeSet<&str> = meta.tags.iter().map(|tag| leaf(tag)).collect();
+    // Other apps' own tags (darktable's) go back only where they keep them.
+    let shared = || meta.tags.iter().filter(|tag| !is_internal(tag));
+    let leaves: BTreeSet<&str> = shared().map(|tag| leaf(tag)).collect();
     list(
         out,
         format!("{}:subject", prefixes.dc),
@@ -690,7 +692,7 @@ fn write_fields(writer: &mut Writer<Vec<u8>>, meta: &Meta, prefixes: &Prefixes, 
         out,
         format!("{}:TagsList", prefixes.digikam),
         "Seq",
-        meta.tags.iter().cloned().collect(),
+        shared().cloned().collect(),
     );
     let xmp = &prefixes.xmp;
     out.extend(format!("{indent}<{xmp}:Rating>{}</{xmp}:Rating>", meta.rating).bytes());
@@ -906,6 +908,20 @@ mod tests {
             let updated = update(text, &empty).unwrap();
             assert!(!updated.own && updated.foreign, "{name}");
         }
+    }
+
+    #[test]
+    fn keeps_darktables_own_tags_to_itself() {
+        let new = meta(&["Best", "Shot/Action", "darktable/format/rw2"], 0, None);
+        let updated = update(DARKTABLE, &new).unwrap().text;
+        assert_eq!(parse(&updated).unwrap(), new);
+        let subject =
+            &updated[updated.find("<dc:subject>").unwrap()..updated.find("</dc:subject>").unwrap()];
+        assert!(!subject.contains("rw2"), "{subject}");
+        let list = &updated[updated.find("<digiKam:TagsList>").unwrap()
+            ..updated.find("</digiKam:TagsList>").unwrap()];
+        assert!(!list.contains("darktable"), "{list}");
+        assert!(updated.contains("<rdf:li>darktable|format|rw2</rdf:li>"));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 use std::path::PathBuf;
 
 /// User preferences.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
+    /// Tags toggled with Alt+1 to Alt+9, `/` between levels; empty when unset.
+    pub quick_tags: [String; 9],
     /// Look for a new release once a day.
     pub check_updates: bool,
     /// Draw the seek bar as the audio waveform (falls back to a plain bar
@@ -24,6 +26,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            quick_tags: Default::default(),
             check_updates: true,
             waveform: true,
             wave_filled: false,
@@ -45,16 +48,30 @@ impl Settings {
     /// Read the settings file; missing files and bad values fall back to
     /// the defaults.
     pub fn load() -> Self {
+        path()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map_or_else(Self::default, |text| Self::parse(&text))
+    }
+
+    /// Settings from the file's `key = value` lines.
+    fn parse(text: &str) -> Self {
         let mut settings = Self::default();
-        let Some(text) = path().and_then(|file| std::fs::read_to_string(file).ok()) else {
-            return settings;
-        };
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             let value = value.trim();
-            match key.trim() {
+            let key = key.trim();
+            if let Some(slot) = key
+                .strip_prefix("quick_tag_")
+                .and_then(|number| number.parse::<usize>().ok())
+                .and_then(|number| number.checked_sub(1))
+                .and_then(|index| settings.quick_tags.get_mut(index))
+            {
+                *slot = value.to_string();
+                continue;
+            }
+            match key {
                 "check_updates" => settings.check_updates = value != "false",
                 "waveform" => settings.waveform = value != "false",
                 "wave_style" => settings.wave_filled = value == "filled",
@@ -83,9 +100,19 @@ impl Settings {
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(
-            file,
-            format!(
+        std::fs::write(file, self.to_text())
+    }
+
+    /// The settings file's text.
+    fn to_text(&self) -> String {
+        let quick: String = self
+            .quick_tags
+            .iter()
+            .enumerate()
+            .map(|(index, tag)| format!("quick_tag_{} = {}\n", index + 1, tag.trim()))
+            .collect();
+        quick
+            + &format!(
                 "check_updates = {}\nwaveform = {}\nwave_style = {}\nwave_min = {}\n\
                  wave_max = {}\nwave_smooth = {}\n",
                 self.check_updates,
@@ -94,7 +121,36 @@ impl Settings {
                 self.wave_min,
                 self.wave_max,
                 self.wave_smooth
-            ),
-        )
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_through_text() {
+        let mut settings = Settings::default();
+        settings.quick_tags[0] = "Shot/Establishing".into();
+        settings.quick_tags[4] = "Shot/Motion".into();
+        settings.check_updates = false;
+        settings.wave_filled = true;
+        assert_eq!(Settings::parse(&settings.to_text()), settings);
+    }
+
+    #[test]
+    fn reads_quick_tags_by_number() {
+        let settings = Settings::parse(
+            "quick_tag_2 = Shot/Action\nquick_tag_10 = ignored\nquick_tag_0 = no\n",
+        );
+        assert_eq!(settings.quick_tags[1], "Shot/Action");
+        assert!(
+            settings
+                .quick_tags
+                .iter()
+                .enumerate()
+                .all(|(index, tag)| index == 1 || tag.is_empty())
+        );
     }
 }

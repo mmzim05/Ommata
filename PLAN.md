@@ -12,9 +12,12 @@ video player, and quick-edit tools:
 - Crop and rotate photos.
 - Trim videos (cut start/end).
 
-Non-goals: photo library/catalog management, tagging, full RAW development
+Non-goals: photo library/catalog management, full RAW development
 (exposure curves, masks), multi-track video editing. Tools like darktable and
 Kdenlive already do those well.
+
+Tagging is now in scope: tags, ratings and colour labels in XMP sidecars that
+digiKam, darktable and Lightroom share, so sorting a shoot needs no catalog app.
 
 ## Stack
 

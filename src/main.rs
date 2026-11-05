@@ -5,6 +5,7 @@ mod picture;
 mod preview;
 mod settings;
 mod sidecar;
+mod tags;
 mod theme;
 mod trim;
 mod update;

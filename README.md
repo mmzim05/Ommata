@@ -57,6 +57,14 @@ Save over the original (it goes to the trash, not away) or keep a copy.
 
 <img src="docs/screenshots/crop.webp" alt="Cropping a photo to 16:9 and saving a copy" width="800" />
 
+### Tags, ratings and colour labels
+
+Sort a shoot as you step through it: one key adds a tag, rates a clip or rejects it, and
+**Filter** then shows only the files you want. Tags live in XMP sidecar files next to your
+media (`clip.MOV.xmp`), never inside it, and use the same fields as digiKam, darktable,
+Lightroom and exiftool, so they keep working in those apps too. An existing sidecar keeps
+everything else in it, like a darktable edit history.
+
 ### And also
 
 - **Browse a folder:** step through every photo and video with the arrow keys.
@@ -135,6 +143,16 @@ problem. Settings are behind the gear in the top bar, or on the start screen.
 | `Ctrl+Shift+S` | Save a copy next to it                              |
 | `Ctrl+Z`       | Undo all edits                                      |
 | `Ctrl+Q`       | Quit                                                |
+
+| Tags           |                                            |
+| -------------- | ------------------------------------------ |
+| `Alt+1` – `9`  | Quick tag on or off (set them in Settings) |
+| `Ctrl+1` – `5` | Rating; the same rating again clears it    |
+| `Ctrl+0`       | Clear the rating                           |
+| `X`            | Reject                                     |
+| `Ctrl+6` – `9` | Red, yellow, green or blue label           |
+| `Ctrl+K`       | Tags panel                                 |
+| `Ctrl+F`       | Filter                                     |
 
 Edits to a camera RAW save as a DNG: all the original sensor data, with the crop and
 rotation stored in the file for RAW editors (Lightroom, darktable, RawTherapee) to apply.

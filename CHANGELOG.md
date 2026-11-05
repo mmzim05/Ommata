@@ -9,6 +9,18 @@ the new version.
 
 ## [Unreleased]
 
+### Added
+
+- Tags, star ratings, reject and colour labels for photos and videos, stored in XMP
+  sidecars (`name.ext.xmp`, or Lightroom's `name.xmp` when present) that digiKam,
+  darktable, Lightroom and exiftool read too. Other apps' data in a sidecar is kept as
+  it was. Sidecars follow their file when it is renamed, saved as DNG or trashed.
+- Quick tags on `Alt+1` to `Alt+9` (set in Settings), ratings on `Ctrl+0` to `Ctrl+5`,
+  reject on `X`, labels on `Ctrl+6` to `Ctrl+9`.
+- A tag panel (`Ctrl+K`, or the tag button) and a filter (`Ctrl+F`) that limits browsing
+  to files with chosen tags, a minimum rating, a label, or only rejected files.
+- Keyboard focus is visible on stars, colour swatches and icon buttons.
+
 ## [0.2.0] - 2026-11-05
 
 ### Added

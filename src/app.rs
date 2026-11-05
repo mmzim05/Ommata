@@ -5,6 +5,8 @@ use crate::gpu::Gpu;
 use crate::library::{self, Kind};
 use crate::picture::{self, Decoded, Edit};
 use crate::settings::Settings;
+use crate::sidecar::{self, Meta};
+use crate::tags::{self, Filter};
 use crate::theme::{Theme, lerp};
 use crate::trim::{self, Progress};
 use crate::update::{self, Updater};
@@ -29,7 +31,7 @@ const CHROME_SECS: f64 = 3.0;
 type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
 
 /// The keyboard shortcuts listed in Help.
-const SHORTCUTS: [ShortcutGroup; 5] = [
+const SHORTCUTS: [ShortcutGroup; 6] = [
     (
         "Browse",
         &[
@@ -51,6 +53,18 @@ const SHORTCUTS: [ShortcutGroup; 5] = [
             ("T", "Trim"),
             ("I  O", "Set trim start / end"),
             ("Esc", "Leave trim"),
+        ],
+    ),
+    (
+        "Tags",
+        &[
+            ("Alt+1 – 9", "Quick tag on / off"),
+            ("Ctrl+1 – 5", "Rating (again: clear)"),
+            ("Ctrl+0", "Clear rating"),
+            ("X", "Reject"),
+            ("Ctrl+6 – 9", "Red, yellow, green, blue label"),
+            ("Ctrl+K", "Tags panel"),
+            ("Ctrl+F", "Filter"),
         ],
     ),
     (
@@ -218,6 +232,10 @@ struct Rename {
 enum Page {
     Settings,
     Help(HelpTab),
+    /// Tags, rating and label of the current file.
+    Tags,
+    /// Which files browsing stops on.
+    Filter,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -272,6 +290,18 @@ pub struct App {
     page: Option<Page>,
     /// The new name being typed for the current file.
     rename: Option<Rename>,
+    /// Every file in the folder; `files` is the part the filter lets through.
+    listing: Vec<PathBuf>,
+    /// Tags, rating and label per file, from the sidecars.
+    meta: HashMap<PathBuf, Meta>,
+    /// Files tagged this session: a folder scan still running must not
+    /// overwrite them with what their sidecar said before.
+    meta_written: std::collections::HashSet<PathBuf>,
+    meta_sender: Sender<Vec<(PathBuf, Meta)>>,
+    meta_receiver: Receiver<Vec<(PathBuf, Meta)>>,
+    filter: Filter,
+    /// The new tag being typed in the tag panel.
+    tag_input: String,
     /// The top bar is too wide for the window, so its controls take a
     /// second row.
     top_bar_wrap: bool,
@@ -312,6 +342,8 @@ impl App {
             style.spacing.interact_size.y = 28.0;
             style.interaction.selectable_labels = false;
         });
+        // Ctrl with + - 0 would scale the whole interface; Ctrl+0 to 5 rate.
+        ctx.options_mut(|options| options.zoom_with_keyboard = false);
         let renderer = creation.gl.as_ref().map_or("no OpenGL".into(), |gl| {
             use eframe::glow::{self, HasContext};
             unsafe { gl.get_parameter_string(glow::RENDERER) }
@@ -327,7 +359,9 @@ impl App {
                 .ok()
         });
         let (snap_sender, snap_receiver) = channel();
+        let (meta_sender, meta_receiver) = channel();
         let settings = Settings::load();
+        let check_updates = settings.check_updates;
         let mut app = Self {
             theme: Theme::new(ctx),
             loader,
@@ -353,6 +387,13 @@ impl App {
             trash_without_asking: false,
             page: None,
             rename: None,
+            listing: Vec::new(),
+            meta: HashMap::new(),
+            meta_written: Default::default(),
+            meta_sender,
+            meta_receiver,
+            filter: Filter::default(),
+            tag_input: String::new(),
             top_bar_wrap: false,
             top_bar_widths: (0.0, 0.0),
             quitting: false,
@@ -361,7 +402,7 @@ impl App {
             wave: None,
             wave_cache: None,
             gpu,
-            updater: Updater::new(ctx, settings.check_updates),
+            updater: Updater::new(ctx, check_updates),
             renderer,
             video_decoding,
         };
@@ -378,8 +419,140 @@ impl App {
         {
             self.images.insert(first.clone(), Slot::Loading);
         }
-        self.files = start.files;
-        self.go(ctx, start.index);
+        let focus = start.files.get(start.index).cloned();
+        self.set_listing(ctx, start.files, focus.as_deref());
+    }
+
+    /// Show the files of a folder, `focus` first, through the filter, and
+    /// read their sidecars in the background.
+    fn set_listing(&mut self, ctx: &egui::Context, listing: Vec<PathBuf>, focus: Option<&Path>) {
+        self.listing = listing;
+        self.load_meta(ctx);
+        self.apply_filter(ctx, focus.map(Path::to_path_buf));
+    }
+
+    /// Read the sidecars of every file in the listing on a background thread.
+    fn load_meta(&mut self, ctx: &egui::Context) {
+        let (files, sender, ctx) = (self.listing.clone(), self.meta_sender.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let read = files
+                .into_iter()
+                .map(|file| {
+                    let meta = sidecar::read(&file);
+                    (file, meta)
+                })
+                .collect();
+            // The receiver lives as long as the app; a closed one means exit.
+            let _ = sender.send(read);
+            ctx.request_repaint();
+        });
+    }
+
+    fn meta_of(&self, path: &Path) -> Meta {
+        self.meta.get(path).cloned().unwrap_or_default()
+    }
+
+    /// Every tag in the folder's sidecars.
+    fn folder_tags(&self) -> std::collections::BTreeSet<String> {
+        self.listing
+            .iter()
+            .filter_map(|path| self.meta.get(path))
+            .flat_map(|meta| meta.tags.iter().cloned())
+            .collect()
+    }
+
+    /// How many files the filter lets through, of how many.
+    fn filter_count(&self) -> (usize, usize) {
+        let matching = self
+            .listing
+            .iter()
+            .filter(|path| self.filter.matches(&self.meta_of(path)))
+            .count();
+        (matching, self.listing.len())
+    }
+
+    /// Narrow `files` to the listing's matches, staying on `keep` (or the
+    /// current file): it stays in the list even when it no longer matches,
+    /// so tagging a file never jumps away from it. With no match at all the
+    /// whole folder stays browsable.
+    fn apply_filter(&mut self, ctx: &egui::Context, keep: Option<PathBuf>) {
+        let keep = keep.or_else(|| self.current().cloned());
+        let (files, index) = tags::narrow(&self.listing, keep.as_deref(), &self.filter, |path| {
+            self.meta_of(path)
+        });
+        let same = files.get(index) == self.current() && !self.files.is_empty();
+        self.files = files;
+        if same {
+            self.index = index;
+        } else {
+            self.go(ctx, index);
+        }
+    }
+
+    /// Store new tags for `path` in its sidecar.
+    fn set_meta(&mut self, ctx: &egui::Context, path: &Path, meta: Meta) {
+        match sidecar::write(path, &meta) {
+            Ok(()) => {
+                self.meta_written.insert(path.to_path_buf());
+                self.meta.insert(path.to_path_buf(), meta);
+            }
+            Err(error) => self.notify(ctx, format!("Couldn't save tags: {error}")),
+        }
+    }
+
+    /// Change the current file's tags with `change`.
+    fn edit_meta(&mut self, ctx: &egui::Context, change: impl FnOnce(&mut Meta)) {
+        let Some(path) = self.current().cloned() else {
+            return;
+        };
+        let mut meta = self.meta_of(&path);
+        change(&mut meta);
+        self.set_meta(ctx, &path, meta);
+    }
+
+    /// Alt+1 to 9: add or remove quick tag `index`.
+    fn toggle_quick_tag(&mut self, ctx: &egui::Context, index: usize) {
+        let tag = tags::normalize(&self.settings.quick_tags[index]);
+        if tag.is_empty() {
+            self.notify(ctx, format!("Quick tag {} isn't set yet (Settings)", index + 1));
+            return;
+        }
+        let mut added = false;
+        self.edit_meta(ctx, |meta| {
+            added = meta.tags.insert(tag.clone());
+            if !added {
+                meta.tags.remove(&tag);
+            }
+        });
+        self.notify(ctx, if added { format!("Tagged {tag}") } else { format!("Removed {tag}") });
+    }
+
+    /// Ctrl+0 to 5: set the rating; the same rating again clears it.
+    fn rate(&mut self, ctx: &egui::Context, rating: i8) {
+        let mut now = 0;
+        self.edit_meta(ctx, |meta| {
+            meta.rating = if meta.rating == rating { 0 } else { rating };
+            now = meta.rating;
+        });
+        self.notify(ctx, match now {
+            -1 => "Rejected".to_string(),
+            0 => "No rating".to_string(),
+            stars => format!("{stars} star{}", if stars == 1 { "" } else { "s" }),
+        });
+    }
+
+    /// Ctrl+6 to 9: set a colour label; the same one again clears it.
+    fn set_label(&mut self, ctx: &egui::Context, label: &str) {
+        let mut now = None;
+        self.edit_meta(ctx, |meta| {
+            let same = meta.label.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(label));
+            meta.label = (!same).then(|| label.to_string());
+            now = meta.label.clone();
+        });
+        self.notify(ctx, match now {
+            Some(label) => format!("{label} label"),
+            None => "No label".to_string(),
+        });
     }
 
     fn current(&self) -> Option<&PathBuf> {
@@ -470,6 +643,10 @@ impl App {
     }
 
     fn step(&mut self, ctx: &egui::Context, delta: isize) {
+        // Tags may have changed since the filter last ran.
+        if self.filter.is_active() {
+            self.apply_filter(ctx, None);
+        }
         if self.files.len() > 1 {
             let count = self.files.len() as isize;
             self.go(
@@ -480,13 +657,7 @@ impl App {
     }
 
     fn reload_listing(&mut self, ctx: &egui::Context, focus: &Path) {
-        self.files = library::siblings(focus);
-        let index = self
-            .files
-            .iter()
-            .position(|file| file == focus)
-            .unwrap_or(0);
-        self.go(ctx, index);
+        self.set_listing(ctx, library::siblings(focus), Some(focus));
     }
 
     fn is_dirty(&self, path: &Path) -> bool {
@@ -516,6 +687,18 @@ impl App {
     // ---- background results -------------------------------------------------
 
     fn poll(&mut self, ctx: &egui::Context) {
+        let mut scanned = false;
+        while let Ok(read) = self.meta_receiver.try_recv() {
+            for (path, meta) in read {
+                if !self.meta_written.contains(&path) {
+                    self.meta.insert(path, meta);
+                }
+            }
+            scanned = true;
+        }
+        if scanned && self.filter.is_active() {
+            self.apply_filter(ctx, None);
+        }
         while let Ok((path, result)) = self.loader.receiver.try_recv() {
             if !self.images.contains_key(&path) {
                 continue;
@@ -556,6 +739,15 @@ impl App {
                 .unwrap_or_else(|_| Err("save crashed".into()))
             {
                 Ok((out, note)) => {
+                    // A RAW saved over as name.dng: its tags move to the DNG.
+                    if job.mode == SaveMode::Overwrite && out != job.src {
+                        if let Err(error) = sidecar::follow_rename(&job.src, &out) {
+                            eprintln!("omalens: tags of {}: {error}", job.src.display());
+                        }
+                        if let Some(meta) = self.meta.remove(&job.src) {
+                            self.meta.insert(out.clone(), meta);
+                        }
+                    }
                     self.edits.remove(&job.src);
                     self.trims.remove(&job.src);
                     self.images.remove(&job.src);
@@ -739,6 +931,12 @@ impl App {
             self.notify(ctx, format!("Couldn't rename: {error}"));
             return;
         }
+        if let Err(error) = sidecar::follow_rename(&old, &new) {
+            self.notify(ctx, format!("Renamed, but its tags stayed behind: {error}"));
+        }
+        if let Some(meta) = self.meta.remove(&old) {
+            self.meta.insert(new.clone(), meta);
+        }
         if let Some(slot) = self.images.remove(&old) {
             self.images.insert(new.clone(), slot);
         }
@@ -786,9 +984,17 @@ impl App {
         }
         match trash::delete(&path) {
             Ok(()) => {
+                // Its tags go to the trash with it, to come back together.
+                if let Some(sidecar) = sidecar::find(&path)
+                    && let Err(error) = trash::delete(&sidecar)
+                {
+                    eprintln!("omalens: trash {}: {error}", sidecar.display());
+                }
                 self.edits.remove(&path);
                 self.trims.remove(&path);
                 self.images.remove(&path);
+                self.meta.remove(&path);
+                self.listing.retain(|file| *file != path);
                 self.files.remove(self.index);
                 let name = path
                     .file_name()
@@ -1009,7 +1215,39 @@ impl App {
         });
         for key in pressed {
             let command = modifiers.command;
+            let digit = [
+                Key::Num0,
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+                Key::Num9,
+            ]
+            .iter()
+            .position(|number| *number == key);
+            let has_file = self.current().is_some();
             match key {
+                _ if has_file
+                    && modifiers.alt
+                    && !command
+                    && digit.is_some_and(|digit| digit > 0) =>
+                {
+                    self.toggle_quick_tag(ctx, digit.unwrap_or(1) - 1);
+                }
+                _ if has_file && command && digit.is_some_and(|digit| digit <= 5) => {
+                    self.rate(ctx, digit.unwrap_or(0) as i8);
+                }
+                _ if has_file && command && digit.is_some_and(|digit| digit >= 6) => {
+                    let label = tags::LABELS[digit.unwrap_or(6) - 6].0;
+                    self.set_label(ctx, label);
+                }
+                Key::X if has_file && !command => self.rate(ctx, -1),
+                Key::K if has_file && command => self.page = Some(Page::Tags),
+                Key::F if command => self.page = Some(Page::Filter),
                 Key::S if command && modifiers.shift => self.save(ctx, SaveMode::Copy),
                 Key::S if command => self.save(ctx, SaveMode::Overwrite),
                 Key::O if command => self.open_dialog(ctx),
@@ -1597,6 +1835,7 @@ impl App {
                 rect.center().y - galley.size().y / 2.0,
             );
             ui.painter().galley(text_pos, galley, palette.fg);
+            focus_ring(ui, &response);
             if hand(response).on_hover_text("Rename (F2)").clicked() {
                 self.start_rename();
             }
@@ -1617,6 +1856,23 @@ impl App {
                 ))
                 .color(palette.muted),
             );
+        }
+        if self.filter.is_active() {
+            let (matching, total) = self.filter_count();
+            let text =
+                egui::RichText::new(format!("Filter {matching}/{total}")).color(palette.accent);
+            if hand(ui.selectable_label(true, text))
+                .on_hover_text("Filter (Ctrl+F)")
+                .clicked()
+            {
+                self.page = Some(Page::Filter);
+            }
+        }
+        let meta = self.meta_of(path);
+        if let Some(summary) = tags::summary(ui, &meta, palette)
+            && summary.clicked()
+        {
+            self.page = Some(Page::Tags);
         }
     }
 
@@ -1666,6 +1922,9 @@ impl App {
                 }
             }
             None => {}
+        }
+        if icon(ui, Icon::Tag, "Tags and rating (Ctrl+K)").clicked() {
+            self.page = Some(Page::Tags);
         }
         if dirty || self.job.is_some() {
             ui.separator();
@@ -1760,7 +2019,7 @@ impl App {
         let timeline_width = (width - 24.0 - 256.0).max(40.0);
         let columns = ((timeline_width - 12.0) / WAVE_STEP).max(1.0) as usize;
         let wave = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
-        let settings = self.settings;
+        let settings = self.settings.clone();
         let Some((_, player)) = &mut self.player else {
             return;
         };
@@ -1947,14 +2206,33 @@ impl App {
             return;
         };
         let palette = self.theme.palette;
-        let settings = self.settings;
-        let mut new_settings = settings;
+        let settings = self.settings.clone();
+        let mut new_settings = settings.clone();
         let mut next = Some(page);
+        let current = self.current().cloned();
+        let known = self.folder_tags();
+        let mut meta = current.as_deref().map(|path| self.meta_of(path));
+        let mut meta_changed = false;
+        let mut filter = self.filter.clone();
+        let mut filter_changed = false;
+        let count = self.filter_count();
+        let mut tag_input = std::mem::take(&mut self.tag_input);
         let modal = modal("page", ctx, &palette).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
-                let title = if page == Page::Settings { "Settings" } else { "Help" };
+                let title = match page {
+                    Page::Settings => "Settings",
+                    Page::Help(_) => "Help",
+                    Page::Tags => "Tags",
+                    Page::Filter => "Filter",
+                };
                 ui.heading(title);
+                if page == Page::Tags
+                    && let Some(name) = current.as_deref().and_then(Path::file_name)
+                {
+                    let name = ellipsize(&name.to_string_lossy(), 40);
+                    ui.label(egui::RichText::new(name).color(palette.muted));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         next = None;
@@ -1964,6 +2242,24 @@ impl App {
             ui.add_space(4.0);
             match page {
                 Page::Settings => settings_ui(ui, &mut new_settings, &palette),
+                Page::Tags => match meta.as_mut() {
+                    Some(meta) => {
+                        meta_changed = tags::panel(
+                            ui,
+                            meta,
+                            &known,
+                            &settings.quick_tags,
+                            &mut tag_input,
+                            &palette,
+                        );
+                    }
+                    None => {
+                        ui.label("Open a photo or video to tag it.");
+                    }
+                },
+                Page::Filter => {
+                    filter_changed = tags::filter_panel(ui, &mut filter, &known, count, &palette);
+                }
                 Page::Help(tab) => {
                     ui.horizontal(|ui| {
                         for (label, option) in [
@@ -1986,6 +2282,14 @@ impl App {
             }
         });
         self.page = if modal.should_close() { None } else { next };
+        self.tag_input = tag_input;
+        if meta_changed && let (Some(path), Some(meta)) = (current, meta) {
+            self.set_meta(ctx, &path, meta);
+        }
+        if filter_changed {
+            self.filter = filter;
+            self.apply_filter(ctx, None);
+        }
         if new_settings != settings {
             let check_turned_on = new_settings.check_updates && !settings.check_updates;
             self.settings = new_settings.clamp();
@@ -2580,6 +2884,28 @@ fn hover_preview(
 fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::theme::Palette) {
     ui.spacing_mut().interact_size.y = 20.0;
     ui.spacing_mut().slider_width = 160.0;
+    ui.label(egui::RichText::new("Quick tags").strong());
+    ui.label(
+        egui::RichText::new("Alt and a number adds or removes the tag; / between levels.")
+            .color(palette.muted)
+            .size(12.0),
+    );
+    egui::Grid::new("quick-tags")
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (index, tag) in settings.quick_tags.iter_mut().enumerate() {
+                let key = egui::RichText::new(format!("Alt+{}", index + 1))
+                    .monospace()
+                    .color(palette.accent);
+                ui.label(key);
+                ui.add(egui::TextEdit::singleline(tag).desired_width(170.0));
+                if index % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.add_space(10.0);
     ui.label(egui::RichText::new("Updates").strong());
     hand(ui.checkbox(&mut settings.check_updates, "Check for updates once a day"));
     ui.label(
@@ -2624,8 +2950,8 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
 /// Every keyboard shortcut, in two compact columns that each line their
 /// groups up in one grid.
 fn shortcuts_ui(ui: &mut egui::Ui, palette: &crate::theme::Palette) {
-    // Browse and Video on the left; Photo, View and Save on the right.
-    let (left, right) = SHORTCUTS.split_at(2);
+    // Browse, Video and Tags on the left; Photo, View and Save on the right.
+    let (left, right) = SHORTCUTS.split_at(3);
     ui.columns(2, |columns| {
         for (column, groups) in columns.iter_mut().zip([left, right]) {
             column.spacing_mut().interact_size.y = 0.0;
@@ -2681,6 +3007,7 @@ fn icon_label_button(
     paint_icon(ui.painter(), icon, pos2(left + 8.0, rect.center().y), color);
     let text_pos = pos2(left + 24.0, rect.center().y - galley.size().y / 2.0);
     ui.painter().galley(text_pos, galley, color);
+    focus_ring(ui, &response);
     hand(response)
 }
 
@@ -2694,8 +3021,22 @@ fn modal(name: &str, ctx: &egui::Context, palette: &crate::theme::Palette) -> eg
 }
 
 /// Show the pointing hand over a clickable widget egui leaves at the arrow.
-fn hand(response: egui::Response) -> egui::Response {
+pub(crate) fn hand(response: egui::Response) -> egui::Response {
     response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Outline a hand-drawn widget while it has keyboard focus (Tab), as egui
+/// does for its own.
+pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response) {
+    if response.has_focus() {
+        let stroke = Stroke::new(1.5, ui.visuals().selection.stroke.color);
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            CornerRadius::same(8),
+            stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
 /// A button filled with `fill` (accent or danger). egui keeps a custom fill
@@ -2730,6 +3071,7 @@ fn filled_button(
     ui.painter().rect_filled(rect, radius, fill);
     let text_pos = rect.center() - galley.size() / 2.0;
     ui.painter().galley(text_pos, galley, palette.bg);
+    focus_ring(ui, &response);
     hand(response)
 }
 
@@ -2880,6 +3222,7 @@ enum Icon {
     Muted,
     Settings,
     Trim,
+    Tag,
     Help,
 }
 
@@ -2912,6 +3255,7 @@ fn icon_button(
     }
     let color = color.unwrap_or(visuals.fg_stroke.color);
     paint_icon(ui.painter(), icon, rect.center(), color);
+    focus_ring(ui, &response);
     hand(response).on_hover_text(tip)
 }
 
@@ -3037,6 +3381,18 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, color: Color32)
                 painter.line_segment([at(2.4 * side, 3.0), at(-4.5 * side, -7.5)], stroke);
             }
         }
+        Icon::Tag => {
+            // A luggage tag: pointed on the right, with its hole.
+            let outline = vec![
+                at(-7.0, -5.0),
+                at(2.0, -5.0),
+                at(7.5, 0.0),
+                at(2.0, 5.0),
+                at(-7.0, 5.0),
+            ];
+            painter.add(Shape::closed_line(outline, stroke));
+            painter.circle_stroke(at(2.0, 0.0), 1.4, stroke);
+        }
         Icon::Help => {
             painter.circle_stroke(center, 7.5, stroke);
             // A drawn "?" in the same stroke as the ring: a hook over the
@@ -3098,7 +3454,7 @@ fn toggle_fullscreen(ctx: &egui::Context) {
 }
 
 /// Shorten `text` to `max` characters by cutting out its middle.
-fn ellipsize(text: &str, max: usize) -> String {
+pub(crate) fn ellipsize(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
