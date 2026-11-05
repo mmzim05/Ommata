@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to omalens. Versions follow [Semantic Versioning](https://semver.org):
+All notable changes to Omalens. Versions follow [Semantic Versioning](https://semver.org):
 PATCH for fixes, MINOR for new features or changed behaviour, MAJOR for changes that
 break existing use once 1.0 is reached.
 
@@ -8,6 +8,17 @@ Add each change under **Unreleased** as it lands; `cargo release` turns that hea
 the new version.
 
 ## [Unreleased]
+
+### Changed
+
+- The name is written Omalens in the app, its menu entry and the docs; the GitHub
+  repository is now `mmzim05/Omalens` (old links redirect). The command, package and
+  config folder stay `omalens`.
+- Builds use pinned FFmpeg 9.0.2 and dav1d 1.5.4 release tarballs, checked by SHA-256;
+  `FFMPEG_SOURCE` and `DAV1D_SOURCE` build offline from unpacked sources, and
+  `scripts/install.sh` installs into `DESTDIR`, for distribution packages.
+- Installed as a system package, the Version page says so and leaves updates to the
+  system.
 
 ## [0.3.1] - 2026-11-05
 
@@ -87,8 +98,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/omalens/compare/v0.3.1...HEAD
-[0.3.1]: https://github.com/mmzim05/omalens/releases/tag/v0.3.1
-[0.3.0]: https://github.com/mmzim05/omalens/releases/tag/v0.3.0
-[0.2.0]: https://github.com/mmzim05/omalens/releases/tag/v0.2.0
-[0.1.0]: https://github.com/mmzim05/omalens/releases/tag/v0.1.0
+[Unreleased]: https://github.com/mmzim05/Omalens/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/mmzim05/Omalens/releases/tag/v0.3.1
+[0.3.0]: https://github.com/mmzim05/Omalens/releases/tag/v0.3.0
+[0.2.0]: https://github.com/mmzim05/Omalens/releases/tag/v0.2.0
+[0.1.0]: https://github.com/mmzim05/Omalens/releases/tag/v0.1.0

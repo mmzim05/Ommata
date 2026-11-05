@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPO: &str = "https://github.com/mmzim05/omalens";
+const REPO: &str = "https://github.com/mmzim05/Omalens";
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where the update stands.
@@ -148,9 +148,17 @@ pub fn open_url(url: &str) -> Result<(), String> {
 pub fn install_kind() -> &'static str {
     if appimage().is_some() {
         "AppImage"
+    } else if is_system_package() {
+        "system package"
     } else {
         "built from source"
     }
+}
+
+/// Whether this copy is a distribution package (installed under /usr by
+/// pacman), which updates with the rest of the system.
+pub fn is_system_package() -> bool {
+    std::env::current_exe().is_ok_and(|path| path.starts_with("/usr/bin"))
 }
 
 /// A new GitHub issue from the bug report form, with the version and the

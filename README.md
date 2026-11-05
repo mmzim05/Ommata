@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/omalens.svg" width="112" height="112" alt="omalens logo" />
+<img src="assets/omalens.svg" width="112" height="112" alt="Omalens logo" />
 
-# omalens
+# Omalens
 
 **One fast viewer for your photos, camera RAW files and videos on Linux.**
 
@@ -16,14 +16,14 @@ pictures and video.
 [Supported files](#supported-files) · [Report a problem](#reporting-problems) ·
 [Build from source](#build-from-source) · [Changelog](CHANGELOG.md)
 
-<img src="docs/screenshots/video.webp" alt="Stepping through photos and videos in a folder with omalens" width="900" />
+<img src="docs/screenshots/video.webp" alt="Stepping through photos and videos in a folder with Omalens" width="900" />
 
 </div>
 
-## Why omalens
+## Why Omalens
 
 Most Linux setups use one app for photos, another for video, and a third (or a terminal
-full of `ffmpeg` flags) to cut a clip. omalens does all three in one window that stays out of
+full of `ffmpeg` flags) to cut a clip. Omalens does all three in one window that stays out of
 your way.
 
 ## Features
@@ -76,7 +76,7 @@ everything else in it, like a darktable edit history.
 ### AppImage
 
 Download `omalens-<version>-x86_64.AppImage` from the
-[latest release](https://github.com/mmzim05/omalens/releases/latest), make it executable,
+[latest release](https://github.com/mmzim05/Omalens/releases/latest), make it executable,
 and open it:
 
 ```sh
@@ -86,7 +86,7 @@ chmod +x omalens-*-x86_64.AppImage
 
 To add it to your app menu, open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever).
 
-**Updates:** omalens checks for a new release once a day. When there is one, an
+**Updates:** Omalens checks for a new release once a day. When there is one, an
 **Update** button appears in the top bar: it downloads the new version, and
 **Restart to update** opens it on the same file. Gear Lever can update it too.
 
@@ -106,7 +106,7 @@ Install your graphics driver's video package, otherwise video decodes on the CPU
 
 ## Usage
 
-Open a photo or video from your file manager with omalens, or from a terminal:
+Open a photo or video from your file manager with Omalens, or from a terminal:
 
 ```sh
 omalens photo.jpg        # open a file, with its folder ready to browse
@@ -161,12 +161,12 @@ Saving over a RAW writes `name.dng` and moves the original to the trash.
 To rename a file, click its name in the top bar or press `F2`, type, and press Enter.
 
 `Del` asks before moving a file to the trash. To clear out a folder quickly, tick
-**Don't ask again until omalens closes**.
+**Don't ask again until Omalens closes**.
 
 ## Reporting problems
 
 Press `?`, open **Report an issue**, and click **Report an issue**. It opens a
-[bug report](https://github.com/mmzim05/omalens/issues/new/choose) with your omalens
+[bug report](https://github.com/mmzim05/Omalens/issues/new/choose) with your Omalens
 version, system and GPU already filled in; describe what happened and, if you can, which
 file it happened with. Ideas are welcome as feature requests.
 
@@ -186,8 +186,8 @@ On Arch:
 
 ```sh
 sudo pacman -S --needed git rust meson ninja nasm libva x264 x265
-git clone https://github.com/mmzim05/omalens
-cd omalens
+git clone https://github.com/mmzim05/Omalens
+cd Omalens
 ./scripts/build-ffmpeg.sh   # a minimal FFmpeg, linked into the binary
 cargo build --release
 sudo ./scripts/install.sh   # installs to /usr/local, with file-manager thumbnails

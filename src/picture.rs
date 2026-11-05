@@ -536,7 +536,7 @@ fn save_dng(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
         dng.xpacket(&xmp).map_err(text)?;
     }
     dng.root_ifd_mut()
-        .add_tag(TiffCommonTag::Software, format!("omalens {}", env!("CARGO_PKG_VERSION")));
+        .add_tag(TiffCommonTag::Software, format!("Omalens {}", env!("CARGO_PKG_VERSION")));
     // Maker notes are copied only when the camera marks them safe to move.
     let safe = decoder
         .ifd(WellKnownIFD::VirtualDngRootTags)

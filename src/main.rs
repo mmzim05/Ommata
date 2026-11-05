@@ -39,7 +39,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("omalens")
-            .with_title("omalens")
+            .with_title("Omalens")
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([360.0, 240.0])
             .with_drag_and_drop(true),

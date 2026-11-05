@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! The **Report a problem** button in omalens (press `?`) fills in
+        Thanks for reporting! The **Report a problem** button in Omalens (press `?`) fills in
         the version and system details for you.
   - type: textarea
     id: what-happened
@@ -32,7 +32,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: omalens version
+      label: Omalens version
       description: Shown at the bottom of the `?` popup.
       placeholder: 0.1.0 (AppImage)
     validations:

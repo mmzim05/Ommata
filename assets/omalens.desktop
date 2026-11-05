@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=omalens
+Name=Omalens
 GenericName=Image and Video Viewer
 Comment=View photos and videos; crop photos, trim videos
 Exec=omalens %f

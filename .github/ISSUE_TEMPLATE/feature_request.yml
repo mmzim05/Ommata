@@ -1,11 +1,11 @@
 name: Feature request
-description: Suggest something omalens should do.
+description: Suggest something Omalens should do.
 labels: [enhancement]
 body:
   - type: textarea
     id: idea
     attributes:
-      label: What would you like omalens to do?
+      label: What would you like Omalens to do?
       placeholder: Show the photo's EXIF details (camera, lens, exposure).
     validations:
       required: true

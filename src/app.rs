@@ -572,7 +572,7 @@ impl App {
     fn go(&mut self, ctx: &egui::Context, index: usize) {
         if self.files.is_empty() {
             self.player = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title("omalens".into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("Omalens".into()));
             return;
         }
         self.index = index.min(self.files.len() - 1);
@@ -607,7 +607,7 @@ impl App {
         }
         self.sync_waveform(ctx);
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — omalens")));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Omalens")));
     }
 
     /// Keep a waveform scan running for the current video while the setting is on.
@@ -1419,7 +1419,7 @@ impl App {
         ui.painter().text(
             center - vec2(0.0, 30.0),
             Align2::CENTER_CENTER,
-            "omalens",
+            "Omalens",
             FontId::proportional(28.0),
             palette.fg,
         );
@@ -2159,9 +2159,14 @@ impl App {
             }
             update::State::Available(version) => {
                 if update::appimage().is_none() {
+                    let hint = if update::is_system_package() {
+                        "Arrives with your next system update; click for the release notes"
+                    } else {
+                        "Open the release page"
+                    };
                     let available = ui
                         .button(format!("v{version} available"))
-                        .on_hover_text("Open the release page");
+                        .on_hover_text(hint);
                     if available.clicked()
                         && let Err(error) = update::open_url(&update::release_url(&version))
                     {
@@ -2180,7 +2185,7 @@ impl App {
             }
             update::State::Installed(version) => {
                 if accent(ui, "Restart to update".into())
-                    .on_hover_text(format!("omalens {version} is installed"))
+                    .on_hover_text(format!("Omalens {version} is installed"))
                     .clicked()
                 {
                     self.restart(ctx);
@@ -2310,7 +2315,7 @@ impl App {
         ui: &mut egui::Ui,
         palette: &crate::theme::Palette,
     ) {
-        let version = format!("omalens {}", update::VERSION);
+        let version = format!("Omalens {}", update::VERSION);
         ui.label(egui::RichText::new(version).size(18.0).strong());
         ui.label(egui::RichText::new(update::install_kind()).color(palette.muted));
         ui.add_space(8.0);
@@ -2342,7 +2347,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.label(
                     egui::RichText::new(format!(
-                        "omalens {} ({})\n{details}",
+                        "Omalens {} ({})\n{details}",
                         update::VERSION,
                         update::install_kind()
                     ))
@@ -2427,7 +2432,7 @@ impl App {
                 egui::RichText::new("You can restore it from the trash.").color(palette.muted),
             );
             ui.add_space(4.0);
-            hand(ui.checkbox(&mut skip, "Don't ask again until omalens closes"));
+            hand(ui.checkbox(&mut skip, "Don't ask again until Omalens closes"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {

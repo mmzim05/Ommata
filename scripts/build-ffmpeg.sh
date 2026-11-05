@@ -5,12 +5,17 @@ set -euo pipefail
 # runtime. It does link the system's libva (GPU decoding) and x264/x265
 # (re-encoding the frames before a frame-exact trim cut) dynamically:
 # pacman -S libva x264 x265. x264 and x265 make this FFmpeg build GPL.
+#
+# The sources are pinned release tarballs, downloaded and checked here. A
+# package build that has unpacked them already (PKGBUILD sources) passes
+# their directories in FFMPEG_SOURCE and DAV1D_SOURCE and builds offline.
 
-readonly VERSION="9.0"
+readonly VERSION="9.0.2"
+readonly SHA256="8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
 readonly DAV1D_VERSION="1.5.4"
+readonly DAV1D_SHA256="686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 readonly ROOT
-readonly SRC="$ROOT/target/ffmpeg-src"
 readonly PREFIX="$ROOT/target/ffmpeg"
 
 # MPEG-PS identifies its video streams by probing them with the raw-stream
@@ -48,16 +53,40 @@ check_tools() {
   done
 }
 
+# Print the source directory of a pinned tarball: `given` if set, else
+# `url` downloaded into target/, checked against `sha256` and unpacked.
+fetch() {
+  local given="$1" url="$2" sha256="$3"
+  local archive="$ROOT/target/${url##*/}"
+  local dir="${archive%.tar.xz}"
+  if [[ -n "$given" ]]; then
+    echo "$given"
+    return
+  fi
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$ROOT/target"
+    if [[ ! -f "$archive" ]]; then
+      curl -fL --retry 3 -o "$archive.part" "$url" >&2
+      mv "$archive.part" "$archive"
+    fi
+    if ! echo "$sha256  $archive" | sha256sum -c --quiet >&2; then
+      echo "Error: checksum mismatch for $archive" >&2
+      exit 1
+    fi
+    tar -xJf "$archive" -C "$ROOT/target"
+  fi
+  echo "$dir"
+}
+
 # dav1d: AV1 on the CPU, since FFmpeg's own AV1 decoder needs the GPU.
 build_dav1d() {
-  local dav1d_src="$ROOT/target/dav1d-src"
+  local dav1d_src
   if [[ -f "$PREFIX/lib/libdav1d.a" ]]; then
     return
   fi
-  if [[ ! -d "$dav1d_src" ]]; then
-    git clone --depth=1 -b "$DAV1D_VERSION" \
-      https://code.videolan.org/videolan/dav1d.git "$dav1d_src"
-  fi
+  dav1d_src="$(fetch "${DAV1D_SOURCE:-}" \
+    "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" \
+    "$DAV1D_SHA256")"
   meson setup "$dav1d_src/build" "$dav1d_src" --buildtype=release \
     --default-library=static --prefix="$PREFIX" --libdir=lib \
     -Denable_tools=false -Denable_tests=false -Denable_examples=false
@@ -65,17 +94,15 @@ build_dav1d() {
 }
 
 build_ffmpeg() {
-  local asm=()
-  if [[ ! -d "$SRC" ]]; then
-    git clone --depth=1 -b "release/$VERSION" \
-      https://github.com/FFmpeg/FFmpeg "$SRC"
-  fi
+  local asm=() src
+  src="$(fetch "${FFMPEG_SOURCE:-}" \
+    "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz" "$SHA256")"
   if ! command -v nasm > /dev/null; then
     echo "warning: nasm not found, building without SIMD" \
       "(much slower decoding)" >&2
     asm=(--disable-x86asm)
   fi
-  cd "$SRC"
+  cd "$src"
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
     --prefix="$PREFIX" \
     --enable-static --disable-shared --enable-pic --enable-pthreads \
