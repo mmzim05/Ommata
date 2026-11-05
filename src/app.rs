@@ -7,6 +7,7 @@ use crate::picture::{self, Decoded, Edit};
 use crate::settings::Settings;
 use crate::theme::{Theme, lerp};
 use crate::trim::{self, Progress};
+use crate::update::{self, Updater};
 use crate::video::Player;
 use crate::waveform::Waveform;
 use eframe::egui::{
@@ -24,29 +25,23 @@ use std::time::Duration;
 /// Idle time after which the bars fade out and the cursor hides.
 const CHROME_SECS: f64 = 3.0;
 
-/// A titled group of (keys, action) rows in the shortcuts popup, shown only
-/// for files of its kind when it has one.
-type ShortcutGroup = (
-    &'static str,
-    Option<Kind>,
-    &'static [(&'static str, &'static str)],
-);
+/// A titled group of (keys, action) rows in the Keybinds tab.
+type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
 
-/// The keyboard shortcuts listed in the help popup.
+/// The keyboard shortcuts listed in Help.
 const SHORTCUTS: [ShortcutGroup; 5] = [
     (
         "Browse",
-        None,
         &[
             ("← →", "Previous / next file"),
             ("Home  End", "First / last file"),
             ("Del", "Move to trash"),
+            ("F2", "Rename"),
             ("Ctrl+O", "Open a file"),
         ],
     ),
     (
         "Video",
-        Some(Kind::Video),
         &[
             ("Space", "Play / pause"),
             ("J  L", "Back / forward 5 seconds"),
@@ -60,7 +55,6 @@ const SHORTCUTS: [ShortcutGroup; 5] = [
     ),
     (
         "Photo",
-        Some(Kind::Image),
         &[
             ("C", "Crop"),
             ("1 – 5", "Crop shape, while cropping"),
@@ -72,17 +66,15 @@ const SHORTCUTS: [ShortcutGroup; 5] = [
     ),
     (
         "View",
-        None,
         &[
             ("Scroll  + -", "Zoom"),
             ("0  1", "Fit to window / actual size"),
             ("F", "Fullscreen"),
-            ("?", "Show these shortcuts"),
+            ("?", "Help"),
         ],
     ),
     (
         "Save",
-        None,
         &[
             ("Ctrl+S", "Save over the original"),
             ("Ctrl+Shift+S", "Save a copy"),
@@ -206,6 +198,35 @@ struct CropTool {
     drag: Option<(CropDrag, Rect, Pos2)>,
 }
 
+/// Zoom out stops a little past fitting the window; zoom in at 50x.
+fn clamp_zoom(zoom: f32, fit_scale: f32) -> f32 {
+    zoom.clamp(fit_scale * 0.85, 50.0)
+}
+
+/// Padding inside the file name box, shown or edited.
+const NAME_MARGIN: Vec2 = vec2(6.0, 4.0);
+
+/// Renaming the current file in the top bar.
+struct Rename {
+    name: String,
+    /// Focus the field and select the name without its extension.
+    fresh: bool,
+}
+
+/// A window over everything, the same from the start screen and a file.
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Settings,
+    Help(HelpTab),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HelpTab {
+    Keybinds,
+    Version,
+    Report,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SaveMode {
     Overwrite,
@@ -236,12 +257,26 @@ pub struct App {
     drag: Option<Handle>,
     zoom: Option<f32>,
     pan: Vec2,
+    /// The scale that fits the current image in the window, from the last frame.
+    fit_scale: f32,
     crop: Option<CropTool>,
     job: Option<Job>,
     toast: Option<(String, f64)>,
     chrome_until: f64,
     confirm_quit: bool,
-    show_shortcuts: bool,
+    /// The trash confirmation is open, with its "don't ask again" box.
+    confirm_trash: Option<bool>,
+    /// Trash without asking until omalens closes, for clearing out a folder.
+    trash_without_asking: bool,
+    /// Help or Settings, open over everything.
+    page: Option<Page>,
+    /// The new name being typed for the current file.
+    rename: Option<Rename>,
+    /// The top bar is too wide for the window, so its controls take a
+    /// second row.
+    top_bar_wrap: bool,
+    /// Natural widths of the top bar's name and controls, last frame.
+    top_bar_widths: (f32, f32),
     quitting: bool,
     settings: Settings,
     /// Set while the playhead is dragged: whether to resume playing after.
@@ -251,6 +286,11 @@ pub struct App {
     wave_cache: Option<((usize, u32, usize), Vec<f32>)>,
     /// Zero-copy video on the window's GL context, when available.
     gpu: Option<Gpu>,
+    updater: Updater,
+    /// The GPU, as GL names it, for problem reports.
+    renderer: String,
+    /// How video decodes, and why not on the GPU, for problem reports.
+    video_decoding: String,
 }
 
 impl App {
@@ -272,12 +312,22 @@ impl App {
             style.spacing.interact_size.y = 28.0;
             style.interaction.selectable_labels = false;
         });
+        let renderer = creation.gl.as_ref().map_or("no OpenGL".into(), |gl| {
+            use eframe::glow::{self, HasContext};
+            unsafe { gl.get_parameter_string(glow::RENDERER) }
+        });
+        let mut video_decoding = "CPU (no OpenGL)".to_string();
         let gpu = creation.gl.clone().and_then(|gl| {
             Gpu::new(gl)
-                .inspect_err(|error| eprintln!("omalens: video decodes on the CPU: {error}"))
+                .inspect(|_| video_decoding = "GPU (VA-API)".into())
+                .inspect_err(|error| {
+                    eprintln!("omalens: video decodes on the CPU: {error}");
+                    video_decoding = format!("CPU ({error})");
+                })
                 .ok()
         });
         let (snap_sender, snap_receiver) = channel();
+        let settings = Settings::load();
         let mut app = Self {
             theme: Theme::new(ctx),
             loader,
@@ -293,18 +343,27 @@ impl App {
             drag: None,
             zoom: None,
             pan: Vec2::ZERO,
+            fit_scale: 1.0,
             crop: None,
             job: None,
             toast: None,
             chrome_until: CHROME_SECS,
             confirm_quit: false,
-            show_shortcuts: false,
+            confirm_trash: None,
+            trash_without_asking: false,
+            page: None,
+            rename: None,
+            top_bar_wrap: false,
+            top_bar_widths: (0.0, 0.0),
             quitting: false,
-            settings: Settings::load(),
+            settings,
             resume_after_drag: None,
             wave: None,
             wave_cache: None,
             gpu,
+            updater: Updater::new(ctx, settings.check_updates),
+            renderer,
+            video_decoding,
         };
         if let Some(start) = start {
             app.open_start(ctx, start);
@@ -543,18 +602,19 @@ impl App {
             self.notify(ctx, "No changes to save");
             return;
         }
+        // Camera RAW saves as DNG: over the original, `name.dng` replaces it
+        // (the original goes to the trash).
         let raw = picture::is_raw(&src);
-        if raw && mode == SaveMode::Overwrite {
-            self.notify(
-                ctx,
-                "RAW originals are never overwritten. Use Save copy (saves a JPEG)",
-            );
+        let dst = match mode {
+            SaveMode::Overwrite if raw => src.with_extension("dng"),
+            SaveMode::Overwrite => src.clone(),
+            SaveMode::Copy => library::edit_copy_path(&src, raw.then_some("dng")),
+        };
+        if dst != src && mode == SaveMode::Overwrite && dst.exists() {
+            let name = dst.file_name().unwrap_or_default().to_string_lossy();
+            self.notify(ctx, format!("{name} already exists. Use Save copy"));
             return;
         }
-        let dst = match mode {
-            SaveMode::Overwrite => src.clone(),
-            SaveMode::Copy => library::edit_copy_path(&src, raw.then_some("jpg")),
-        };
         let progress = Arc::new(Progress::default());
         let handle = match library::kind(&src) {
             Some(Kind::Image) => {
@@ -565,7 +625,8 @@ impl App {
                 let edit = self.edits.get(&src).copied().unwrap_or_default();
                 let (source, thread_ctx) = (src.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let result = save_to(&dst, mode, |temp| picture::save(&source, temp, &edit));
+                    let result =
+                        save_to(&source, &dst, mode, |temp| picture::save(&source, temp, &edit));
                     thread_ctx.request_repaint();
                     result.map(|note| (dst, note))
                 })
@@ -577,7 +638,7 @@ impl App {
                 let (source, thread_ctx) = (src.clone(), ctx.clone());
                 let job_progress = progress.clone();
                 std::thread::spawn(move || {
-                    let result = save_to(&dst, mode, |temp| {
+                    let result = save_to(&source, &dst, mode, |temp| {
                         trim::export(&source, temp, trim.start, trim.end, job_progress)
                     });
                     thread_ctx.request_repaint();
@@ -604,6 +665,115 @@ impl App {
             if had {
                 self.notify(ctx, "Edits reverted");
             }
+        }
+    }
+
+    fn start_rename(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        if let Some(path) = self.current() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            self.rename = Some(Rename { name, fresh: true });
+        }
+    }
+
+    /// The name field that replaces the file name while renaming: Enter
+    /// renames, Esc or clicking away cancels.
+    fn rename_field(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, size: Vec2) {
+        let Some(rename) = &mut self.rename else {
+            return;
+        };
+        let id = Id::unique("rename");
+        let field = egui::TextEdit::singleline(&mut rename.name)
+            .id(id)
+            .margin(NAME_MARGIN)
+            .desired_width(size.x - 2.0 * NAME_MARGIN.x)
+            .min_size(size)
+            // Centred like the name it replaces, so the text doesn't move.
+            .align(Align2::LEFT_CENTER);
+        let response = ui.add(field);
+        if rename.fresh {
+            rename.fresh = false;
+            response.request_focus();
+            // Select the stem so typing replaces the name but keeps the extension.
+            let stem = Path::new(&rename.name)
+                .file_stem()
+                .map_or(0, |stem| stem.to_string_lossy().chars().count());
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                let range = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(stem),
+                );
+                state.cursor.set_char_range(Some(range));
+                state.store(ctx, id);
+            }
+        } else if response.lost_focus() {
+            let name = self.rename.take().map(|rename| rename.name);
+            if let Some(name) = name.filter(|_| ctx.input(|input| input.key_pressed(Key::Enter))) {
+                self.rename_current(ctx, &name);
+            }
+        }
+    }
+
+    /// Rename the current file within its folder, keeping its place, its
+    /// unsaved edits and, for a video, the playback position.
+    fn rename_current(&mut self, ctx: &egui::Context, name: &str) {
+        let Some(old) = self.current().cloned() else {
+            return;
+        };
+        let name = name.trim();
+        if name.is_empty() || Some(name) == old.file_name().and_then(|old| old.to_str()) {
+            return;
+        }
+        if name.contains('/') || name == "." || name == ".." {
+            self.notify(ctx, "A file name can't contain /");
+            return;
+        }
+        let new = old.with_file_name(name);
+        if new.exists() {
+            self.notify(ctx, format!("{name} already exists"));
+            return;
+        }
+        if let Err(error) = std::fs::rename(&old, &new) {
+            self.notify(ctx, format!("Couldn't rename: {error}"));
+            return;
+        }
+        if let Some(slot) = self.images.remove(&old) {
+            self.images.insert(new.clone(), slot);
+        }
+        if let Some(edit) = self.edits.remove(&old) {
+            self.edits.insert(new.clone(), edit);
+        }
+        if let Some(trim) = self.trims.remove(&old) {
+            self.trims.insert(new.clone(), trim);
+        }
+        // The player reads its file by path (previews, waveform), so it
+        // reopens on the new name where it was.
+        let resume = self
+            .player
+            .take()
+            .filter(|(open, _)| *open == old)
+            .map(|(_, player)| (player.position, player.paused));
+        self.wave = None;
+        self.reload_listing(ctx, &new);
+        if let (Some((position, paused)), Some((_, player))) = (resume, &mut self.player) {
+            player.seek(position, true);
+            player.set_paused(paused);
+        }
+        self.notify(ctx, format!("Renamed to {name}"));
+    }
+
+    /// Trash the current file, after asking unless the user chose not to be
+    /// asked again this session.
+    fn ask_trash(&mut self, ctx: &egui::Context) {
+        if self.current().is_none() {
+            return;
+        }
+        if self.trash_without_asking {
+            self.trash_current(ctx);
+        } else {
+            self.confirm_trash = Some(false);
         }
     }
 
@@ -817,7 +987,11 @@ impl App {
     // ---- input --------------------------------------------------------------
 
     fn keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.confirm_quit {
+        if ctx.egui_wants_keyboard_input()
+            || self.confirm_quit
+            || self.confirm_trash.is_some()
+            || self.page.is_some()
+        {
             return;
         }
         let (pressed, modifiers) = ctx.input(|input| {
@@ -865,11 +1039,9 @@ impl App {
                     }
                 }
                 Key::F | Key::F11 => toggle_fullscreen(ctx),
-                Key::Questionmark | Key::F1 => self.show_shortcuts = !self.show_shortcuts,
+                Key::Questionmark | Key::F1 => self.page = Some(Page::Help(HelpTab::Keybinds)),
                 Key::Escape => {
-                    if self.show_shortcuts {
-                        self.show_shortcuts = false;
-                    } else if self.crop.is_some() {
+                    if self.crop.is_some() {
                         self.crop = None;
                     } else if self.trim_mode {
                         self.toggle_trim();
@@ -887,7 +1059,8 @@ impl App {
                         .unwrap_or(0);
                     self.set_crop_aspect(ASPECTS[index].1);
                 }
-                Key::Delete => self.trash_current(ctx),
+                Key::Delete => self.ask_trash(ctx),
+                Key::F2 => self.start_rename(),
                 Key::C if self.crop.is_some() => self.apply_crop(),
                 Key::C => self.start_crop(),
                 Key::R => self.rotate(!modifiers.shift),
@@ -916,8 +1089,8 @@ impl App {
 
     fn zoom_by(&mut self, factor: f32) {
         if self.crop.is_none() {
-            let zoom = self.zoom.unwrap_or(1.0);
-            self.zoom = Some((zoom * factor).clamp(0.02, 50.0));
+            let zoom = self.zoom.unwrap_or(self.fit_scale);
+            self.zoom = Some(clamp_zoom(zoom * factor, self.fit_scale));
         }
     }
 
@@ -1023,6 +1196,14 @@ impl App {
         if ui.put(button, egui::Button::new("Open…")).clicked() {
             self.open_dialog(ui.ctx());
         }
+        let settings = Rect::from_center_size(center + vec2(-56.0, 92.0), vec2(104.0, 32.0));
+        if icon_label_button(ui, settings, Icon::Settings, "Settings", &palette).clicked() {
+            self.page = Some(Page::Settings);
+        }
+        let help = Rect::from_center_size(center + vec2(56.0, 92.0), vec2(104.0, 32.0));
+        if icon_label_button(ui, help, Icon::Help, "Help", &palette).clicked() {
+            self.page = Some(Page::Help(HelpTab::Keybinds));
+        }
     }
 
     fn image_canvas(
@@ -1058,9 +1239,17 @@ impl App {
         let area = rect.shrink(if self.crop.is_some() { 48.0 } else { 0.0 });
 
         let fit_scale = (area.width() / out.x).min(area.height() / out.y).min(1.0);
+        self.fit_scale = fit_scale;
+        // A window grown since the zoom was set may now need more.
+        self.zoom = self.zoom.map(|zoom| clamp_zoom(zoom, fit_scale));
         let scale = self.zoom.unwrap_or(fit_scale);
 
-        // Zoom at the cursor, pan by dragging.
+        // How far the image may move on each axis: only as far as it is larger
+        // than the view, so it can't be dragged off screen or away from the
+        // centre when it fits.
+        let overflow = |scale: f32| ((out * scale - area.size()) / 2.0).max(Vec2::ZERO);
+
+        // Zoom at the cursor, pan by dragging an image larger than the view.
         if self.crop.is_none() {
             let (scroll, pinch, hover) = ui.input(|input| {
                 (
@@ -1073,19 +1262,25 @@ impl App {
             if (factor - 1.0).abs() > 1e-4
                 && let Some(pointer) = hover.filter(|pointer| rect.contains(*pointer))
             {
-                let zoom = (scale * factor).clamp(0.02, 50.0);
+                let zoom = clamp_zoom(scale * factor, fit_scale);
                 let anchor = pointer - rect.center() - self.pan;
                 self.pan -= anchor * (zoom / scale - 1.0);
                 self.zoom = Some(zoom);
             }
-            if response.dragged() {
-                self.pan += response.drag_delta();
-                if self.zoom.is_none() {
-                    self.zoom = Some(scale);
+            let scale = self.zoom.unwrap_or(fit_scale);
+            if overflow(scale) != Vec2::ZERO {
+                if response.dragged() {
+                    self.pan += response.drag_delta();
+                    self.zoom.get_or_insert(scale);
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                } else if response.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
                 }
             }
         }
         let scale = self.zoom.unwrap_or(fit_scale);
+        let limit = overflow(scale);
+        self.pan = self.pan.clamp(-limit, limit);
         let image_rect = Rect::from_center_size(area.center() + self.pan, out * scale);
 
         let crop = shown
@@ -1302,138 +1497,245 @@ impl App {
         let kind = library::kind(&path);
         let dirty = self.is_dirty(&path);
         let palette = self.theme.palette;
+        let wrap = self.top_bar_wrap;
+        let last = self.top_bar_widths;
+        // Wrapped rows are centred on each other.
+        let pads = if wrap {
+            let widest = last.0.max(last.1);
+            ((widest - last.0) / 2.0, (widest - last.1) / 2.0)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut widths = (0.0, 0.0);
         egui::Area::new(Id::unique("top"))
             .anchor(Align2::CENTER_TOP, vec2(0.0, 12.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
                 bar_frame(&palette).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        let short = ellipsize(&name, 48);
-                        ui.label(egui::RichText::new(short).strong());
-                        if dirty {
-                            let (dot, response) =
-                                ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter()
-                                .circle_filled(dot.center(), 3.5, palette.accent);
-                            response.on_hover_text("Unsaved edits");
-                        }
-                        if self.files.len() > 1 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} / {}",
-                                    self.index + 1,
-                                    self.files.len()
-                                ))
-                                .color(palette.muted),
-                            );
-                        }
-                        ui.separator();
-                        if let Some(current) = self.crop.as_ref().map(|tool| tool.aspect) {
-                            for (label, aspect) in ASPECTS {
-                                if ui.selectable_label(current == aspect, label).clicked() {
-                                    self.set_crop_aspect(aspect);
-                                }
-                            }
+                    let mut name = |this: &mut Self, ui: &mut egui::Ui| {
+                        ui.add_space(pads.0);
+                        let row = ui.horizontal(|ui| {
+                            this.top_name(ctx, ui, &path, dirty, &palette);
+                        });
+                        widths.0 = row.response.rect.width();
+                    };
+                    let mut controls = |this: &mut Self, ui: &mut egui::Ui| {
+                        ui.add_space(pads.1);
+                        let row = ui.horizontal(|ui| {
+                            this.top_controls(ctx, ui, kind, dirty, &palette);
+                        });
+                        widths.1 = row.response.rect.width();
+                    };
+                    if wrap {
+                        // Too wide for the window: the controls go on a second row.
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| name(self, ui));
+                            ui.horizontal(|ui| controls(self, ui));
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            name(self, ui);
                             ui.separator();
-                            if ui.button("Cancel").clicked() {
-                                self.crop = None;
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Done").color(palette.bg),
-                                    )
-                                    .fill(palette.accent),
-                                )
-                                .clicked()
-                            {
-                                self.apply_crop();
-                            }
-                            return;
-                        }
-                        match kind {
-                            Some(Kind::Image) => {
-                                if icon(ui, Icon::RotateLeft, "Rotate left (Shift+R)").clicked() {
-                                    self.rotate(false);
-                                }
-                                if icon(ui, Icon::RotateRight, "Rotate right (R)").clicked() {
-                                    self.rotate(true);
-                                }
-                                if icon(ui, Icon::Flip, "Flip (H)").clicked() {
-                                    self.flip();
-                                }
-                                if icon(ui, Icon::Crop, "Crop (C)").clicked() {
-                                    self.start_crop();
-                                }
-                            }
-                            Some(Kind::Video) => {
-                                let tip = "Trim (T), set in/out with I / O";
-                                if icon_toggle(ui, Icon::Trim, self.trim_mode, tip).clicked() {
-                                    self.toggle_trim();
-                                }
-                            }
-                            None => {}
-                        }
-                        if dirty || self.job.is_some() {
-                            ui.separator();
-                            if let Some(job) = &self.job {
-                                ui.add(egui::Spinner::new());
-                                let fraction = job.progress.fraction();
-                                ui.label(if fraction > 0.0 {
-                                    format!("Saving {:.0}%", fraction * 100.0)
-                                } else {
-                                    "Saving…".into()
-                                });
-                                if kind == Some(Kind::Video) && ui.button("Cancel").clicked() {
-                                    job.progress.cancel.store(true, Relaxed);
-                                }
-                            } else {
-                                if ui
-                                    .button("Revert")
-                                    .on_hover_text("Discard edits (Ctrl+Z)")
-                                    .clicked()
-                                {
-                                    self.revert(ctx);
-                                }
-                                if ui
-                                    .button("Save copy")
-                                    .on_hover_text("Save as name-edit (Ctrl+Shift+S)")
-                                    .clicked()
-                                {
-                                    self.save(ctx, SaveMode::Copy);
-                                }
-                                let save = egui::Button::new(
-                                    egui::RichText::new("Save").color(palette.bg),
-                                )
-                                .fill(palette.accent);
-                                if ui
-                                    .add(save)
-                                    .on_hover_text("Overwrite the original (Ctrl+S)")
-                                    .clicked()
-                                {
-                                    self.save(ctx, SaveMode::Overwrite);
-                                }
-                            }
-                        }
-                        ui.separator();
-                        if icon(ui, Icon::Trash, "Move to trash (Del)").clicked() {
-                            self.trash_current(ctx);
-                        }
-                        if icon(ui, Icon::Fullscreen, "Fullscreen (F)").clicked() {
-                            toggle_fullscreen(ctx);
-                        }
-                        let help = icon(ui, Icon::Help, "Keyboard shortcuts (?)");
-                        if help.clicked() {
-                            self.show_shortcuts = !self.show_shortcuts;
-                        }
-                        egui::Popup::from_response(&help)
-                            .open_bool(&mut self.show_shortcuts)
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                            .show(|ui| shortcuts_ui(ui, kind, &palette));
-                    });
+                            controls(self, ui);
+                        });
+                    }
                 });
             });
+        // Each part is measured on its own, so the choice doesn't depend on
+        // the layout it made; redo the frame when it changes.
+        let spacing = ctx.global_style().spacing.item_spacing.x * 2.0 + 8.0;
+        let room = ctx.content_rect().width() - 24.0 - 2.0 * BAR_MARGIN;
+        let wrap_now = widths.0 + spacing + widths.1 > room;
+        let moved = (widths.0 - last.0).abs() > 0.5 || (widths.1 - last.1).abs() > 0.5;
+        self.top_bar_widths = widths;
+        if wrap_now != wrap || (wrap && moved) {
+            self.top_bar_wrap = wrap_now;
+            ctx.request_discard("top bar layout");
+        }
+    }
+
+    /// The file name (click to rename), the unsaved dot and the position.
+    fn top_name(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        path: &Path,
+        dirty: bool,
+        palette: &crate::theme::Palette,
+    ) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let short = ellipsize(&name, 48);
+        let text = egui::RichText::new(short).strong();
+        let galley = egui::WidgetText::from(text).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        );
+        // The name and the rename field share one box, so the
+        // whole box is the click target and nothing shifts.
+        let size = vec2(
+            (galley.size().x + 2.0 * NAME_MARGIN.x).max(120.0),
+            ui.spacing().interact_size.y,
+        );
+        if self.rename.is_some() {
+            self.rename_field(ctx, ui, size);
+        } else {
+            let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+            if response.hovered() {
+                let widget = &ui.visuals().widgets.hovered;
+                ui.painter().rect(
+                    rect,
+                    widget.corner_radius,
+                    ui.visuals().extreme_bg_color,
+                    widget.bg_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let text_pos = pos2(
+                rect.left() + NAME_MARGIN.x,
+                rect.center().y - galley.size().y / 2.0,
+            );
+            ui.painter().galley(text_pos, galley, palette.fg);
+            if hand(response).on_hover_text("Rename (F2)").clicked() {
+                self.start_rename();
+            }
+        }
+        if dirty {
+            let (dot, response) =
+                ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+            ui.painter()
+                .circle_filled(dot.center(), 3.5, palette.accent);
+            response.on_hover_text("Unsaved edits");
+        }
+        if self.files.len() > 1 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} / {}",
+                    self.index + 1,
+                    self.files.len()
+                ))
+                .color(palette.muted),
+            );
+        }
+    }
+
+    /// The tools for the current file, saving, and the window buttons.
+    fn top_controls(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        kind: Option<Kind>,
+        dirty: bool,
+        palette: &crate::theme::Palette,
+    ) {
+        if let Some(current) = self.crop.as_ref().map(|tool| tool.aspect) {
+            for (label, aspect) in ASPECTS {
+                if hand(ui.selectable_label(current == aspect, label)).clicked() {
+                    self.set_crop_aspect(aspect);
+                }
+            }
+            ui.separator();
+            if ui.button("Cancel").clicked() {
+                self.crop = None;
+            }
+            if filled_button(ui, "Done", palette.accent, &palette).clicked() {
+                self.apply_crop();
+            }
+            return;
+        }
+        match kind {
+            Some(Kind::Image) => {
+                if icon(ui, Icon::RotateLeft, "Rotate left (Shift+R)").clicked() {
+                    self.rotate(false);
+                }
+                if icon(ui, Icon::RotateRight, "Rotate right (R)").clicked() {
+                    self.rotate(true);
+                }
+                if icon(ui, Icon::Flip, "Flip (H)").clicked() {
+                    self.flip();
+                }
+                if icon(ui, Icon::Crop, "Crop (C)").clicked() {
+                    self.start_crop();
+                }
+            }
+            Some(Kind::Video) => {
+                let tip = "Trim (T), set in/out with I / O";
+                if icon_toggle(ui, Icon::Trim, self.trim_mode, tip).clicked() {
+                    self.toggle_trim();
+                }
+            }
+            None => {}
+        }
+        if dirty || self.job.is_some() {
+            ui.separator();
+            if let Some(job) = &self.job {
+                ui.add(egui::Spinner::new());
+                let fraction = job.progress.fraction();
+                ui.label(if fraction > 0.0 {
+                    format!("Saving {:.0}%", fraction * 100.0)
+                } else {
+                    "Saving…".into()
+                });
+                if kind == Some(Kind::Video) && ui.button("Cancel").clicked() {
+                    job.progress.cancel.store(true, Relaxed);
+                }
+            } else {
+                if ui
+                    .button("Revert")
+                    .on_hover_text("Discard edits (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.revert(ctx);
+                }
+                if ui
+                    .button("Save copy")
+                    .on_hover_text("Save as name-edit (Ctrl+Shift+S)")
+                    .clicked()
+                {
+                    self.save(ctx, SaveMode::Copy);
+                }
+                if filled_button(ui, "Save", palette.accent, &palette)
+                    .on_hover_text("Overwrite the original (Ctrl+S)")
+                    .clicked()
+                {
+                    self.save(ctx, SaveMode::Overwrite);
+                }
+            }
+        }
+        ui.separator();
+        if self.update_controls(ctx, ui, &palette, false) {
+            ui.separator();
+        }
+        let trash = if self.trash_without_asking {
+            icon_button(
+                ui,
+                Icon::Trash,
+                false,
+                Some(palette.danger),
+                "Move to trash without asking (Del)",
+            )
+        } else {
+            icon(ui, Icon::Trash, "Move to trash (Del)")
+        };
+        if trash.clicked() {
+            self.ask_trash(ctx);
+        }
+        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        let (screen_icon, screen_tip) = if fullscreen {
+            (Icon::ExitFullscreen, "Leave fullscreen (F)")
+        } else {
+            (Icon::Fullscreen, "Fullscreen (F)")
+        };
+        if icon(ui, screen_icon, screen_tip).clicked() {
+            toggle_fullscreen(ctx);
+        }
+        if icon(ui, Icon::Settings, "Settings").clicked() {
+            self.page = Some(Page::Settings);
+        }
+        if icon(ui, Icon::Help, "Help (?)").clicked() {
+            self.page = Some(Page::Help(HelpTab::Keybinds));
+        }
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context, opacity: f32) {
@@ -1454,12 +1756,11 @@ impl App {
             return;
         };
         let width = (ctx.content_rect().width() - 32.0).min(900.0);
-        // Fixed layout: play, time, settings, mute and volume take ~290 px.
-        let timeline_width = (width - 24.0 - 290.0).max(40.0);
+        // Fixed layout: play, time, mute and volume take ~256 px.
+        let timeline_width = (width - 24.0 - 256.0).max(40.0);
         let columns = ((timeline_width - 12.0) / WAVE_STEP).max(1.0) as usize;
         let wave = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
         let settings = self.settings;
-        let mut new_settings = settings;
         let Some((_, player)) = &mut self.player else {
             return;
         };
@@ -1514,10 +1815,6 @@ impl App {
                         if let Some((time, at)) = hover {
                             hover_preview(ctx, player, time, at, &palette);
                         }
-                        let gear = icon(ui, Icon::Settings, "Settings");
-                        egui::Popup::from_toggle_button_response(&gear)
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                            .show(|ui| settings_ui(ui, &mut new_settings));
                         let volume_icon = if player.muted || player.volume == 0.0 {
                             Icon::Muted
                         } else {
@@ -1534,13 +1831,6 @@ impl App {
                     });
                 });
             });
-        if new_settings != settings {
-            self.settings = new_settings.clamp();
-            if let Err(error) = self.settings.save() {
-                self.notify(ctx, format!("Couldn't save settings: {error}"));
-            }
-            self.sync_waveform(ctx);
-        }
         match action {
             Some(BarAction::TogglePlay) => self.toggle_play(),
             // Dragging the playhead pauses so each frame under the pointer
@@ -1571,6 +1861,223 @@ impl App {
         }
     }
 
+    /// Update status and its action. `full` (the Version tab) shows every
+    /// state; the top bar shows only an update on offer or in progress.
+    /// Returns whether anything was drawn.
+    fn update_controls(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        palette: &crate::theme::Palette,
+        full: bool,
+    ) -> bool {
+        let accent = |ui: &mut egui::Ui, text: String| {
+            filled_button(ui, text, palette.accent, palette)
+        };
+        let muted = |text: &str| egui::RichText::new(text).color(palette.muted);
+        match self.updater.state() {
+            update::State::Unknown if full => {
+                if ui.button("Check for updates").clicked() {
+                    self.updater.check();
+                }
+            }
+            update::State::Checking if full => {
+                ui.add(egui::Spinner::new());
+                ui.label(muted("Checking for updates…"));
+            }
+            update::State::UpToDate if full => {
+                ui.label(muted("You have the latest version."));
+                if ui.button("Check again").clicked() {
+                    self.updater.check();
+                }
+            }
+            update::State::CheckFailed(error) if full => {
+                ui.label(muted("Couldn't check for updates.")).on_hover_text(error);
+                if ui.button("Try again").clicked() {
+                    self.updater.check();
+                }
+            }
+            update::State::Available(version) => {
+                if update::appimage().is_none() {
+                    let available = ui
+                        .button(format!("v{version} available"))
+                        .on_hover_text("Open the release page");
+                    if available.clicked()
+                        && let Err(error) = update::open_url(&update::release_url(&version))
+                    {
+                        self.notify(ctx, error);
+                    }
+                } else if accent(ui, format!("Update to v{version}"))
+                    .on_hover_text("Download and install the new version")
+                    .clicked()
+                {
+                    self.updater.install(version);
+                }
+            }
+            update::State::Downloading(version) => {
+                ui.add(egui::Spinner::new());
+                ui.label(format!("Updating to v{version}…"));
+            }
+            update::State::Installed(version) => {
+                if accent(ui, "Restart to update".into())
+                    .on_hover_text(format!("omalens {version} is installed"))
+                    .clicked()
+                {
+                    self.restart(ctx);
+                }
+            }
+            update::State::Failed(version, error) => {
+                if ui
+                    .button("Update failed, retry")
+                    .on_hover_text(error)
+                    .clicked()
+                {
+                    self.updater.install(version);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Help or Settings: the same window from the start screen and from a
+    /// file. Esc or a click outside closes it.
+    fn page(&mut self, ctx: &egui::Context) {
+        let Some(page) = self.page else {
+            return;
+        };
+        let palette = self.theme.palette;
+        let settings = self.settings;
+        let mut new_settings = settings;
+        let mut next = Some(page);
+        let modal = modal("page", ctx, &palette).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                let title = if page == Page::Settings { "Settings" } else { "Help" };
+                ui.heading(title);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        next = None;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            match page {
+                Page::Settings => settings_ui(ui, &mut new_settings, &palette),
+                Page::Help(tab) => {
+                    ui.horizontal(|ui| {
+                        for (label, option) in [
+                            ("Keybinds", HelpTab::Keybinds),
+                            ("Version", HelpTab::Version),
+                            ("Report an issue", HelpTab::Report),
+                        ] {
+                            if hand(ui.selectable_label(tab == option, label)).clicked() {
+                                next = Some(Page::Help(option));
+                            }
+                        }
+                    });
+                    ui.separator();
+                    match tab {
+                        HelpTab::Keybinds => shortcuts_ui(ui, &palette),
+                        HelpTab::Version => self.version_ui(ctx, ui, &palette),
+                        HelpTab::Report => self.report_ui(ctx, ui, &palette),
+                    }
+                }
+            }
+        });
+        self.page = if modal.should_close() { None } else { next };
+        if new_settings != settings {
+            let check_turned_on = new_settings.check_updates && !settings.check_updates;
+            self.settings = new_settings.clamp();
+            if let Err(error) = self.settings.save() {
+                self.notify(ctx, format!("Couldn't save settings: {error}"));
+            }
+            if check_turned_on && self.updater.state() == update::State::Unknown {
+                self.updater.check();
+            }
+            self.sync_waveform(ctx);
+        }
+    }
+
+    fn version_ui(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        palette: &crate::theme::Palette,
+    ) {
+        let version = format!("omalens {}", update::VERSION);
+        ui.label(egui::RichText::new(version).size(18.0).strong());
+        ui.label(egui::RichText::new(update::install_kind()).color(palette.muted));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            self.update_controls(ctx, ui, palette, true);
+        });
+        ui.add_space(8.0);
+        if ui.link("What's new in each release").clicked()
+            && let Err(error) = update::open_url(&update::releases_url())
+        {
+            self.notify(ctx, error);
+        }
+    }
+
+    fn report_ui(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        palette: &crate::theme::Palette,
+    ) {
+        let details = update::system_details(&self.renderer, &self.video_decoding);
+        ui.label("Something not working? Report it on GitHub, with these details filled in:");
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(palette.surface)
+            .corner_radius(6.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "omalens {} ({})\n{details}",
+                        update::VERSION,
+                        update::install_kind()
+                    ))
+                    .monospace()
+                    .size(12.0)
+                    .color(palette.muted),
+                );
+            });
+        ui.add_space(8.0);
+        let mut url = None;
+        ui.horizontal(|ui| {
+            if filled_button(ui, "Report an issue", palette.accent, palette).clicked() {
+                url = Some(update::report_url(&details));
+            }
+            if ui.button("Suggest a feature").clicked() {
+                url = Some(update::feature_url());
+            }
+        });
+        if let Some(url) = url
+            && let Err(error) = update::open_url(&url)
+        {
+            self.notify(ctx, error);
+        }
+    }
+
+    /// Quit and start the newly installed version on the same file.
+    fn restart(&mut self, ctx: &egui::Context) {
+        if self.any_dirty() || self.job.is_some() {
+            self.notify(ctx, "Save or revert your edits first");
+            return;
+        }
+        match update::restart(self.current().map(PathBuf::as_path)) {
+            Ok(()) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => self.notify(ctx, format!("Couldn't restart: {error}")),
+        }
+    }
+
     fn toast(&mut self, ctx: &egui::Context) {
         let Some((message, until)) = &self.toast else {
             return;
@@ -1591,6 +2098,52 @@ impl App {
             });
     }
 
+    fn trash_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut skip) = self.confirm_trash else {
+            return;
+        };
+        let Some(path) = self.current() else {
+            self.confirm_trash = None;
+            return;
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = ellipsize(&name, 40);
+        let palette = self.theme.palette;
+        // Consumed here, so Enter confirms instead of also toggling a focused
+        // checkbox.
+        let enter = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter));
+        let escape = ctx.input(|input| input.key_pressed(Key::Escape));
+        let mut confirmed = enter;
+        let mut cancelled = escape;
+        modal("trash", ctx, &palette).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(format!("Move {name} to the trash?"));
+            ui.label(
+                egui::RichText::new("You can restore it from the trash.").color(palette.muted),
+            );
+            ui.add_space(4.0);
+            hand(ui.checkbox(&mut skip, "Don't ask again until omalens closes"));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+                if filled_button(ui, "Move to trash", palette.danger, &palette).clicked() {
+                    confirmed = true;
+                }
+            });
+        });
+        if cancelled {
+            self.confirm_trash = None;
+        } else if confirmed {
+            self.confirm_trash = None;
+            self.trash_without_asking = skip;
+            self.trash_current(ctx);
+        } else {
+            self.confirm_trash = Some(skip);
+        }
+    }
+
     fn quit_dialog(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.quitting && self.any_dirty() {
@@ -1601,7 +2154,7 @@ impl App {
             return;
         }
         let palette = self.theme.palette;
-        egui::Modal::new(Id::unique("quit")).show(ctx, |ui| {
+        modal("quit", ctx, &palette).show(ctx, |ui| {
             ui.set_width(300.0);
             ui.heading("Discard unsaved edits?");
             ui.label(
@@ -1613,9 +2166,7 @@ impl App {
                 if ui.button("Cancel").clicked() {
                     self.confirm_quit = false;
                 }
-                let discard = egui::Button::new(egui::RichText::new("Discard").color(palette.bg))
-                    .fill(palette.danger);
-                if ui.add(discard).clicked() {
+                if filled_button(ui, "Discard", palette.danger, &palette).clicked() {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1695,7 +2246,11 @@ impl eframe::App for App {
         if active {
             self.chrome_until = now + CHROME_SECS;
         }
-        let pinned = self.confirm_quit || self.show_shortcuts || ctx.is_pointer_over_egui();
+        let pinned = self.confirm_quit
+            || self.confirm_trash.is_some()
+            || self.page.is_some()
+            || self.rename.is_some()
+            || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
             ctx.set_cursor_icon(CursorIcon::None);
@@ -1710,6 +2265,8 @@ impl eframe::App for App {
         }
         self.toast(&ctx);
         self.quit_dialog(&ctx);
+        self.trash_dialog(&ctx);
+        self.page(&ctx);
 
         if let Some(wait) = next {
             ctx.request_repaint_after(wait);
@@ -1745,14 +2302,31 @@ fn remove_temp(temp: &Path) {
 
 /// Write a copy atomically, or overwrite while keeping the original in the trash.
 fn save_to(
+    src: &Path,
     dst: &Path,
     mode: SaveMode,
     write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
     match mode {
-        SaveMode::Overwrite => replace_trashing_original(dst, write),
+        SaveMode::Overwrite if dst == src => replace_trashing_original(dst, write),
+        SaveMode::Overwrite => replace_with_new(src, dst, write),
         SaveMode::Copy => write_atomic(dst, write).map(|_| None),
     }
+}
+
+/// Overwrite `src` with a file of another type at `dst` (a RAW saved as DNG):
+/// write `dst`, then send `src` to the trash so it can be restored.
+fn replace_with_new(
+    src: &Path,
+    dst: &Path,
+    write: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    write_atomic(dst, write)?;
+    let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    Ok(Some(match trash::delete(src) {
+        Ok(()) => format!("Saved. Original {name} is in the trash"),
+        Err(error) => format!("Saved, but couldn't trash {name}: {error}"),
+    }))
 }
 
 /// Overwrite `dst` without destroying the original: write the new file to a
@@ -2023,17 +2597,24 @@ fn hover_preview(
         });
 }
 
-fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings) {
-    ui.set_width(240.0);
+fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::theme::Palette) {
     ui.spacing_mut().interact_size.y = 20.0;
-    ui.spacing_mut().slider_width = 130.0;
-    ui.label(egui::RichText::new("Seek bar").strong());
-    ui.checkbox(&mut settings.waveform, "Show audio waveform");
+    ui.spacing_mut().slider_width = 160.0;
+    ui.label(egui::RichText::new("Updates").strong());
+    hand(ui.checkbox(&mut settings.check_updates, "Check for updates once a day"));
+    ui.label(
+        egui::RichText::new("Asks GitHub for the newest version number; nothing else is sent.")
+            .color(palette.muted)
+            .size(12.0),
+    );
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("Video seek bar").strong());
+    hand(ui.checkbox(&mut settings.waveform, "Show audio waveform"));
     ui.add_enabled_ui(settings.waveform, |ui| {
         ui.horizontal(|ui| {
             ui.label("Style");
-            ui.selectable_value(&mut settings.wave_filled, false, "Bars");
-            ui.selectable_value(&mut settings.wave_filled, true, "Filled");
+            hand(ui.selectable_value(&mut settings.wave_filled, false, "Bars"));
+            hand(ui.selectable_value(&mut settings.wave_filled, true, "Filled"));
         });
         egui::Grid::new("wave-settings")
             .num_columns(2)
@@ -2060,30 +2641,116 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings) {
     });
 }
 
-/// The shortcuts that apply to a file of `kind`, in two columns.
-fn shortcuts_ui(ui: &mut egui::Ui, kind: Option<Kind>, palette: &crate::theme::Palette) {
-    ui.set_width(500.0);
-    let groups = SHORTCUTS
-        .iter()
-        .filter(|(_, only, _)| only.is_none() || *only == kind);
+/// Every keyboard shortcut, in two compact columns that each line their
+/// groups up in one grid.
+fn shortcuts_ui(ui: &mut egui::Ui, palette: &crate::theme::Palette) {
+    // Browse and Video on the left; Photo, View and Save on the right.
+    let (left, right) = SHORTCUTS.split_at(2);
     ui.columns(2, |columns| {
-        for (index, (group, _, keys)) in groups.enumerate() {
-            // Browse and the file's own keys on the left; View and Save on the right.
-            let column = &mut columns[usize::from(index >= 2)];
-            column.label(egui::RichText::new(*group).strong());
-            egui::Grid::new(group)
+        for (column, groups) in columns.iter_mut().zip([left, right]) {
+            column.spacing_mut().interact_size.y = 0.0;
+            egui::Grid::new(groups[0].0)
                 .num_columns(2)
-                .spacing([16.0, 4.0])
+                .spacing([10.0, 3.0])
                 .show(column, |ui| {
-                    for (key, action) in *keys {
-                        ui.label(egui::RichText::new(*key).monospace().color(palette.accent));
-                        ui.label(*action);
+                    for (index, (group, keys)) in groups.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(8.0);
+                            ui.end_row();
+                        }
+                        // Headings in the text colour and larger, apart from
+                        // the accent-coloured keys under them.
+                        let heading = egui::RichText::new(*group).size(15.0).color(palette.fg);
+                        ui.label(heading);
                         ui.end_row();
+                        for (key, action) in *keys {
+                            let key = egui::RichText::new(*key).monospace().size(11.5);
+                            ui.label(key.color(palette.accent));
+                            ui.label(egui::RichText::new(*action).size(12.5));
+                            ui.end_row();
+                        }
                     }
                 });
-            column.add_space(10.0);
         }
     });
+}
+
+/// A quiet button at `rect`: an icon and a label, muted until hovered.
+fn icon_label_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    icon: Icon,
+    label: &str,
+    palette: &crate::theme::Palette,
+) -> egui::Response {
+    let response = ui.interact(rect, Id::unique(("icon-label", label)), Sense::click());
+    let color = if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), palette.surface);
+        palette.fg
+    } else {
+        palette.muted
+    };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(14.0),
+        color,
+    );
+    let width = 16.0 + 8.0 + galley.size().x;
+    let left = rect.center().x - width / 2.0;
+    paint_icon(ui.painter(), icon, pos2(left + 8.0, rect.center().y), color);
+    let text_pos = pos2(left + 24.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text_pos, galley, color);
+    hand(response)
+}
+
+/// A dialog over the dimmed window, in the start screen's background colour
+/// rather than egui's brighter window fill.
+fn modal(name: &str, ctx: &egui::Context, palette: &crate::theme::Palette) -> egui::Modal {
+    let frame = egui::Frame::popup(&ctx.global_style())
+        .fill(palette.bg)
+        .inner_margin(20.0);
+    egui::Modal::new(Id::unique(name)).frame(frame)
+}
+
+/// Show the pointing hand over a clickable widget egui leaves at the arrow.
+fn hand(response: egui::Response) -> egui::Response {
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A button filled with `fill` (accent or danger). egui keeps a custom fill
+/// the same on hover, so this one lightens on hover and darkens when pressed.
+fn filled_button(
+    ui: &mut egui::Ui,
+    text: impl Into<String>,
+    fill: Color32,
+    palette: &crate::theme::Palette,
+) -> egui::Response {
+    let text = egui::RichText::new(text.into()).color(palette.bg);
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let padding = ui.spacing().button_padding;
+    let size = vec2(
+        galley.size().x + 2.0 * padding.x,
+        (galley.size().y + 2.0 * padding.y).max(ui.spacing().interact_size.y),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if response.is_pointer_button_down_on() {
+        lerp(fill, Color32::BLACK, 0.15)
+    } else if response.hovered() {
+        lerp(fill, Color32::WHITE, 0.15)
+    } else {
+        fill
+    };
+    let radius = ui.visuals().widgets.inactive.corner_radius;
+    ui.painter().rect_filled(rect, radius, fill);
+    let text_pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(text_pos, galley, palette.bg);
+    hand(response)
 }
 
 fn volume_bar(
@@ -2201,12 +2868,15 @@ fn centered_text(ui: &egui::Ui, rect: Rect, text: &str, color: Color32) {
     );
 }
 
+/// Horizontal padding inside the bars.
+const BAR_MARGIN: f32 = 10.0;
+
 fn bar_frame(palette: &crate::theme::Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.surface.gamma_multiply(0.94))
         .stroke(Stroke::new(1.0, lerp(palette.surface, palette.fg, 0.10)))
         .corner_radius(CornerRadius::same(14))
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(egui::Margin::symmetric(BAR_MARGIN as i8, 6))
         .shadow(egui::Shadow {
             offset: [0, 4],
             blur: 16,
@@ -2225,6 +2895,7 @@ enum Icon {
     Crop,
     Trash,
     Fullscreen,
+    ExitFullscreen,
     Volume,
     Muted,
     Settings,
@@ -2239,6 +2910,17 @@ fn icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
 
 /// Icon button that stays highlighted while `selected` (a mode is on).
 fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui::Response {
+    icon_button(ui, icon, selected, None, tip)
+}
+
+/// Icon button drawn in `color` instead of the text colour, when given.
+fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    selected: bool,
+    color: Option<Color32>,
+    tip: &str,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
     let visuals = ui.style().interact(&response);
     if selected {
@@ -2248,10 +2930,14 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
         ui.painter()
             .rect_filled(rect, CornerRadius::same(8), visuals.weak_bg_fill);
     }
-    let color = visuals.fg_stroke.color;
+    let color = color.unwrap_or(visuals.fg_stroke.color);
+    paint_icon(ui.painter(), icon, rect.center(), color);
+    hand(response).on_hover_text(tip)
+}
+
+/// Draw `icon` centred on `center`, about 16 px across.
+fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.6, color);
-    let painter = ui.painter();
-    let center = rect.center();
     let at = |x: f32, y: f32| center + vec2(x, y);
     let arc = |clockwise: bool| {
         // 270° arc with an arrowhead at its open end.
@@ -2337,6 +3023,20 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
                 painter.line_segment([at(x, -1.5), at(x, 4.0)], Stroke::new(1.2, color));
             }
         }
+        Icon::ExitFullscreen => {
+            // The corners turned inward.
+            for (x_sign, y_sign) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let corner = at(3.0 * x_sign, 3.0 * y_sign);
+                painter.add(Shape::line(
+                    vec![
+                        corner + vec2(0.0, 4.0 * y_sign),
+                        corner,
+                        corner + vec2(4.0 * x_sign, 0.0),
+                    ],
+                    stroke,
+                ));
+            }
+        }
         Icon::Fullscreen => {
             for (x_sign, y_sign) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
                 let corner = at(7.0 * x_sign, 7.0 * y_sign);
@@ -2359,13 +3059,17 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
         }
         Icon::Help => {
             painter.circle_stroke(center, 7.5, stroke);
-            painter.text(
-                center + vec2(0.0, 0.5),
-                Align2::CENTER_CENTER,
-                "?",
-                egui::FontId::proportional(12.0),
-                color,
-            );
+            // A drawn "?" in the same stroke as the ring: a hook over the
+            // top, a short stem, and a dot.
+            let hook: Vec<Pos2> = (0..=10)
+                .map(|step| {
+                    let angle = -std::f32::consts::PI * (1.0 - 1.25 * step as f32 / 10.0);
+                    at(2.6 * angle.cos(), -2.0 + 2.6 * angle.sin())
+                })
+                .chain([at(0.0, 1.4), at(0.0, 2.0)])
+                .collect();
+            painter.add(Shape::line(hook, stroke));
+            painter.circle_filled(at(0.0, 4.4), 1.1, color);
         }
         Icon::Settings => {
             painter.circle_stroke(center, 3.0, stroke);
@@ -2406,7 +3110,6 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
             }
         }
     }
-    response.on_hover_text(tip)
 }
 
 fn toggle_fullscreen(ctx: &egui::Context) {
@@ -2433,12 +3136,11 @@ fn ellipsize(text: &str, max: usize) -> String {
 
 /// `m:ss.t`, or `h:mm:ss` from an hour up.
 fn fmt_time(time: f64) -> String {
-    let time = time.max(0.0);
-    let total = time as u64;
+    let total = time.max(0.0) as u64;
     let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
     if hours > 0 {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
-        format!("{minutes}:{seconds:02}.{}", (time.fract() * 10.0) as u32)
+        format!("{minutes}:{seconds:02}")
     }
 }

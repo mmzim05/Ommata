@@ -35,11 +35,15 @@ fn read_raw(path: &Path, full: bool) -> Result<Read, String> {
     let decoder = rawler::get_decoder(&src).map_err(to_text)?;
     let params = RawDecodeParams::default();
     let embedded = || {
-        decoder
+        let image = decoder
             .full_image(&src, &params)
             .ok()
             .flatten()
-            .or_else(|| decoder.preview_image(&src, &params).ok().flatten())
+            .or_else(|| decoder.preview_image(&src, &params).ok().flatten())?;
+        // DNGs carry at most a 1024 px preview (omalens' own saves among
+        // them): too soft to view, so those develop instead.
+        let long = image.width().max(image.height());
+        (ext(path) != "dng" || long > 1024).then_some(image)
     };
     let develop = |half: bool| -> Result<DynamicImage, String> {
         let raw = decoder.raw_image(&src, &params, false).map_err(to_text)?;
@@ -338,10 +342,222 @@ fn ext(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// A quarter-turn rotation then an optional horizontal flip: how both EXIF
+/// orientation and an `Edit` turn an image.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Turn {
+    /// Quarter turns clockwise, 0 to 3.
+    turns: u8,
+    flip: bool,
+}
+
+impl Turn {
+    /// From an EXIF orientation (1 to 8; anything else is upright).
+    fn from_exif(code: u16) -> Self {
+        let (turns, flip) = match code {
+            2 => (0, true),
+            3 => (2, false),
+            4 => (2, true),
+            5 => (1, true),
+            6 => (1, false),
+            7 => (3, true),
+            8 => (3, false),
+            _ => (0, false),
+        };
+        Self { turns, flip }
+    }
+
+    fn exif(self) -> u16 {
+        match (self.turns % 4, self.flip) {
+            (0, false) => 1,
+            (0, true) => 2,
+            (2, false) => 3,
+            (2, true) => 4,
+            (1, true) => 5,
+            (1, false) => 6,
+            (3, true) => 7,
+            _ => 8,
+        }
+    }
+
+    /// `self`, then `next`. A flip reverses the direction of the turns that
+    /// follow it: F·Rⁿ = R⁻ⁿ·F.
+    fn then(self, next: Self) -> Self {
+        let next_turns = if self.flip {
+            (4 - next.turns % 4) % 4
+        } else {
+            next.turns % 4
+        };
+        Self {
+            turns: (self.turns + next_turns) % 4,
+            flip: self.flip != next.flip,
+        }
+    }
+
+    /// Where a normalized point of the turned image lies in the original.
+    fn unmap(self, point: Pos2) -> Pos2 {
+        let mut point = if self.flip {
+            pos2(1.0 - point.x, point.y)
+        } else {
+            point
+        };
+        for _ in 0..self.turns % 4 {
+            // Undo a clockwise quarter turn.
+            point = pos2(point.y, 1.0 - point.x);
+        }
+        point
+    }
+}
+
+/// Save a camera RAW as a DNG: the sensor data untouched, the crop written
+/// as the DNG default crop and the rotation as its orientation, which RAW
+/// editors apply. Its preview is developed from the cropped RAW.
+fn save_dng(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
+    use rawler::decoders::{RawDecodeParams, WellKnownIFD};
+    use rawler::dng::writer::DngWriter;
+    use rawler::dng::{CropMode, DNG_VERSION_V1_4, DngCompression, DngPhotometricConversion};
+    use rawler::formats::tiff::{
+        CompressionMethod, PhotometricInterpretation, PreviewColorSpace, Value,
+    };
+    use rawler::imgop::{Dim2, Point, Rect as RawRect};
+    use rawler::tags::{DngTag, ExifTag, TiffCommonTag};
+    fn text(error: impl std::fmt::Display) -> String {
+        error.to_string()
+    }
+    let source = rawler::rawsource::RawSource::new(src).map_err(text)?;
+    let decoder = rawler::get_decoder(&source).map_err(text)?;
+    let params = RawDecodeParams::default();
+    let mut raw = decoder.raw_image(&source, &params, false).map_err(text)?;
+    if raw.fuji_rotation_width.is_some() {
+        return Err("RAW files from this camera can't be saved as DNG yet".into());
+    }
+    let metadata = decoder.raw_metadata(&source, &params).map_err(text)?;
+    let camera = Turn::from_exif(metadata.exif.orientation.unwrap_or(raw.orientation.to_u16()));
+    let turn = camera.then(Turn {
+        turns: edit.turns,
+        flip: edit.flip,
+    });
+    // The crop is normalized to the image as shown (turned); map its corners
+    // back to the sensor, normalized to the camera's default crop.
+    let sensor_crop = edit.crop.map(|crop| {
+        let (a, b) = (turn.unmap(crop.min), turn.unmap(crop.max));
+        (a.min(b), a.max(b))
+    });
+    if let Some((min, max)) = sensor_crop {
+        let full = RawRect::new(Point::new(0, 0), Dim2::new(raw.width, raw.height));
+        let area = raw.crop_area.or(raw.active_area).unwrap_or(full);
+        let scale = |at: f32, size: usize| (at.clamp(0.0, 1.0) * size as f32).round() as usize;
+        let x = scale(min.x, area.d.w).min(area.d.w - 1);
+        let y = scale(min.y, area.d.h).min(area.d.h - 1);
+        let width = (scale(max.x, area.d.w) - x).clamp(1, area.d.w - x);
+        let height = (scale(max.y, area.d.h) - y).clamp(1, area.d.h - y);
+        raw.crop_area = Some(RawRect::new(
+            Point::new(area.p.x + x, area.p.y + y),
+            Dim2::new(width, height),
+        ));
+    }
+    // The preview is the camera's own full-size JPEG, cropped like the RAW,
+    // so viewers that show it (omalens among them) keep the camera's colour
+    // and tone; a plain develop only when the camera embedded none.
+    let camera = decoder
+        .full_image(&source, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.preview_image(&source, &params).ok().flatten())
+        .filter(|image| image.width().max(image.height()) > 1024);
+    let preview = match camera {
+        Some(image) => match sensor_crop {
+            Some((min, max)) => {
+                let (width, height) = (image.width() as f32, image.height() as f32);
+                let x = (min.x * width).round().clamp(0.0, width - 1.0) as u32;
+                let y = (min.y * height).round().clamp(0.0, height - 1.0) as u32;
+                let crop_width =
+                    (((max.x - min.x) * width).round() as u32).clamp(1, image.width() - x);
+                let crop_height =
+                    (((max.y - min.y) * height).round() as u32).clamp(1, image.height() - y);
+                image.crop_imm(x, y, crop_width, crop_height)
+            }
+            None => image,
+        },
+        None => rawler::imgop::develop::RawDevelop::default()
+            .develop_intermediate(&raw)
+            .map_err(text)?
+            .to_dynamic_image()
+            .ok_or("unsupported RAW layout")?,
+    };
+    let preview = DynamicImage::ImageRgb8(preview.into_rgb8());
+    let mut jpeg = Vec::new();
+    preview
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92))
+        .map_err(text)?;
+
+    let file = std::fs::File::create(dst).map_err(text)?;
+    let mut dng = DngWriter::new(std::io::BufWriter::new(file), DNG_VERSION_V1_4).map_err(text)?;
+    let mut image = dng.subframe(0);
+    image
+        .raw_image(
+            &raw,
+            CropMode::Best,
+            DngCompression::Lossless,
+            DngPhotometricConversion::Original,
+            1,
+        )
+        .map_err(text)?;
+    // A DNG source's own raw tags, except those just written (the crop).
+    if let Some(tags) = decoder.ifd(WellKnownIFD::VirtualDngRawTags).map_err(text)? {
+        image.ifd_mut().copy(tags.value_iter());
+    }
+    image.finalize().map_err(text)?;
+    // rawler's own preview writer shrinks to 1024 px; this one keeps the
+    // full size, written as the DNG spec's JPEG preview IFD.
+    let offset = dng.dng.write_data(&jpeg).map_err(text)?;
+    let mut full = dng.subframe(1);
+    let ifd = full.ifd_mut();
+    ifd.add_tag(TiffCommonTag::ImageWidth, Value::long(preview.width()));
+    ifd.add_tag(TiffCommonTag::ImageLength, Value::long(preview.height()));
+    ifd.add_tag(TiffCommonTag::Compression, CompressionMethod::ModernJPEG);
+    ifd.add_tag(TiffCommonTag::BitsPerSample, [8_u16, 8, 8]);
+    ifd.add_tag(TiffCommonTag::SampleFormat, [1_u16, 1, 1]);
+    ifd.add_tag(TiffCommonTag::PhotometricInt, PhotometricInterpretation::YCbCr);
+    ifd.add_tag(TiffCommonTag::RowsPerStrip, Value::long(preview.height()));
+    ifd.add_tag(TiffCommonTag::SamplesPerPixel, 3_u16);
+    ifd.add_tag(DngTag::PreviewColorSpace, PreviewColorSpace::SRgb);
+    ifd.add_value(TiffCommonTag::StripOffsets, Value::Long(vec![offset]));
+    ifd.add_tag(TiffCommonTag::StripByteCounts, Value::Long(vec![jpeg.len() as u32]));
+    full.finalize().map_err(text)?;
+    dng.thumbnail(&shrink(preview, 512)).map_err(text)?;
+    dng.load_base_tags(&raw).map_err(text)?;
+    dng.load_metadata(&metadata).map_err(text)?;
+    dng.root_ifd_mut().add_tag(ExifTag::Orientation, turn.exif());
+    if let Some(tags) = decoder.ifd(WellKnownIFD::VirtualDngRootTags).map_err(text)? {
+        dng.root_ifd_mut().copy(tags.value_iter());
+    }
+    if let Some(xmp) = decoder.xpacket(&source, &params).map_err(text)? {
+        dng.xpacket(&xmp).map_err(text)?;
+    }
+    dng.root_ifd_mut()
+        .add_tag(TiffCommonTag::Software, format!("omalens {}", env!("CARGO_PKG_VERSION")));
+    // Maker notes are copied only when the camera marks them safe to move.
+    let safe = decoder
+        .ifd(WellKnownIFD::VirtualDngRootTags)
+        .map_err(text)?
+        .and_then(|tags| tags.get_entry(DngTag::MakerNoteSafety).cloned())
+        .is_some_and(|entry| {
+            matches!(entry.value, rawler::formats::tiff::Value::Short(v) if v.first() == Some(&1))
+        });
+    if !safe {
+        dng.exif_ifd_mut().remove_tag(ExifTag::MakerNotes);
+    }
+    dng.close().map_err(text)
+}
+
 /// Re-decode the full-resolution original, apply `edit`, and encode to `dst`
-/// in the source's format (RAW develops to JPEG), keeping EXIF (orientation
-/// reset, since it is baked into the pixels now) and the ICC profile.
+/// in the source's format, keeping EXIF (orientation reset, since it is baked
+/// into the pixels now) and the ICC profile. Camera RAW saves as DNG.
 pub fn save(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
+    if is_raw(src) {
+        return save_dng(src, dst, edit);
+    }
     let (picture, mut exif, icc) = read(src, true)?;
     let picture = edit.apply(picture);
     if let Some(chunk) = &mut exif {
@@ -350,7 +566,7 @@ pub fn save(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
     }
     let file = std::fs::File::create(dst).map_err(|error| error.to_string())?;
     let mut writer = std::io::BufWriter::new(file);
-    let format = if is_raw(src) { "jpg".into() } else { ext(src) };
+    let format = ext(src);
     let result = match format.as_str() {
         "jpg" | "jpeg" | "jpe" => {
             let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 95);
@@ -463,7 +679,123 @@ mod tests {
 }
 
 #[cfg(test)]
+mod turn_tests {
+    use super::*;
+
+    /// A small image whose pixels are all different.
+    fn grid() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(3, 2, |x, y| {
+            image::Rgb([x as u8 * 40, y as u8 * 90, 7])
+        }))
+    }
+
+    fn turned(picture: DynamicImage, turn: Turn) -> DynamicImage {
+        Edit {
+            turns: turn.turns,
+            flip: turn.flip,
+            crop: None,
+        }
+        .apply(picture)
+    }
+
+    #[test]
+    fn exif_codes_match_image_orientation() {
+        for code in 1..=8 {
+            let mut expect = grid();
+            expect.apply_orientation(image::metadata::Orientation::from_exif(code as u8).unwrap());
+            assert_eq!(turned(grid(), Turn::from_exif(code)), expect, "code {code}");
+            assert_eq!(Turn::from_exif(code).exif(), code);
+        }
+    }
+
+    #[test]
+    fn composing_matches_applying_in_turn() {
+        for code in 1..=8 {
+            for turns in 0..4 {
+                for flip in [false, true] {
+                    let (first, next) = (Turn::from_exif(code), Turn { turns, flip });
+                    let expect = turned(turned(grid(), first), next);
+                    assert_eq!(turned(grid(), first.then(next)), expect, "{code} {turns} {flip}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmap_finds_the_same_pixel() {
+        let source = grid().into_rgb8();
+        for code in 1..=8 {
+            let turn = Turn::from_exif(code);
+            let shown = turned(grid(), turn).into_rgb8();
+            for (x, y, pixel) in shown.enumerate_pixels() {
+                let at = pos2(
+                    (x as f32 + 0.5) / shown.width() as f32,
+                    (y as f32 + 0.5) / shown.height() as f32,
+                );
+                let back = turn.unmap(at);
+                let sx = (back.x * source.width() as f32) as u32;
+                let sy = (back.y * source.height() as f32) as u32;
+                assert_eq!(source.get_pixel(sx, sy), pixel, "code {code} at {x},{y}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod raw_tests {
+    /// A cropped, turned DNG develops to the same picture as the edit applied
+    /// to the original: OMALENS_TEST_RAW=photo.rw2 cargo test --release dng -- --ignored
+    /// (OMALENS_TEST_DNG_OUT=out.dng keeps the DNG to look at.)
+    #[test]
+    #[ignore]
+    fn dng_keeps_crop_and_turn() {
+        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
+        let edit = super::Edit {
+            turns: 1,
+            flip: true,
+            crop: Some(eframe::egui::Rect::from_min_max(
+                eframe::egui::pos2(0.1, 0.2),
+                eframe::egui::pos2(0.7, 0.9),
+            )),
+        };
+        let dst = std::env::var("OMALENS_TEST_DNG_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("omalens-test.dng"));
+        let started = std::time::Instant::now();
+        super::save(&path, &dst, &edit).unwrap();
+        eprintln!("saved DNG in {:?}", started.elapsed());
+        let (saved, _, _) = super::read(&dst, true).unwrap();
+        let (original, _, _) = super::read(&path, true).unwrap();
+        let expect = edit.apply(original);
+        eprintln!(
+            "DNG {}x{}, expected {}x{}",
+            saved.width(),
+            saved.height(),
+            expect.width(),
+            expect.height()
+        );
+        assert!(saved.width().abs_diff(expect.width()) <= 2);
+        assert!(saved.height().abs_diff(expect.height()) <= 2);
+        let width = saved.width().min(expect.width());
+        let height = saved.height().min(expect.height());
+        let (a, b) = (saved.into_rgb8(), expect.into_rgb8());
+        let mut difference = 0u64;
+        for y in 0..height {
+            for x in 0..width {
+                let (p, q) = (a.get_pixel(x, y), b.get_pixel(x, y));
+                difference += (0..3).map(|c| u64::from(p[c].abs_diff(q[c]))).sum::<u64>();
+            }
+        }
+        let mean = difference as f64 / f64::from(width * height * 3);
+        eprintln!("mean difference {mean:.2}");
+        assert!(mean < 6.0, "DNG differs by {mean:.2} on average");
+        let (preview, _, _) = super::read(&dst, false).unwrap();
+        eprintln!("display {}x{}", preview.width(), preview.height());
+        if std::env::var_os("OMALENS_TEST_DNG_OUT").is_none() {
+            let _ = std::fs::remove_file(&dst);
+        }
+    }
+
     /// Display decode time for any image: OMALENS_TEST_IMAGE=x.jpg cargo test image_decode -- --ignored
     #[test]
     #[ignore]

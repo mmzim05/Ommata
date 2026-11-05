@@ -9,6 +9,33 @@ the new version.
 
 ## [Unreleased]
 
+### Added
+
+- In-app updates for the AppImage: omalens checks for a new release once a day and
+  installs it with one click. Releases also carry `.zsync` update data for Gear Lever and
+  AppImageUpdate.
+- Help (`?`) with Keybinds, Version (updates) and Report an issue, which opens a GitHub
+  bug report with the version and system details filled in.
+- Settings in one place for photos and videos, also reachable from the start screen.
+- Rename the open file by clicking its name or pressing `F2`.
+- Cropped or rotated camera RAW files save as DNG, keeping the full sensor data, instead
+  of a JPEG; saving over the original is allowed (it goes to the trash).
+- Moving a file to the trash asks first, with an option to stop asking until omalens closes.
+- `omalens --version`.
+
+### Changed
+
+- Trimming MP4 and MOV videos is frame-exact in every codec and no longer re-encodes
+  anything: saving takes well under half a second instead of several seconds.
+
+### Fixed
+
+- Large photos (100 MP and up) open several times faster, and photos preloaded in the
+  background are no longer limited to 2048 pixels.
+- Save progress no longer jumps backwards while trimming.
+- Trimming MOV files with 24-bit PCM audio (Blackmagic, Resolve exports) failed.
+- The AppImage now carries its icon, so AppImage installers and menus show it.
+
 ## [0.1.0] - 2026-11-05
 
 First release.

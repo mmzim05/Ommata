@@ -31,7 +31,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             nasm meson ninja-build pkg-config clang libclang-dev \
-            libva-dev libdrm-dev libx264-dev libx265-dev libasound2-dev file
+            libva-dev libdrm-dev libx264-dev libx265-dev libasound2-dev file \
+            librsvg2-bin
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -41,10 +42,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: omalens-appimage
-          path: target/appimage/*.AppImage
+          path: |
+            target/appimage/omalens-*.AppImage
+            target/appimage/omalens-*.AppImage.zsync
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/appimage/*.AppImage
+          files: |
+            target/appimage/omalens-*.AppImage
+            target/appimage/omalens-*.AppImage.zsync

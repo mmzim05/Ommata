@@ -1,0 +1,54 @@
+name: Bug report
+description: Something doesn't work, looks wrong, or is slow.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The **Report a problem** button in omalens (press `?`) fills in
+        the version and system details for you.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: I trimmed a video and the saved file starts two seconds early.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a video
+        2. Press T and set the start with I
+        3. Save a copy
+  - type: input
+    id: file
+    attributes:
+      label: File type
+      description: The kind of file involved, and the camera or app it came from if you know it.
+      placeholder: MOV from a Panasonic S5, H.264 4K
+  - type: input
+    id: version
+    attributes:
+      label: omalens version
+      description: Shown at the bottom of the `?` popup.
+      placeholder: 0.1.0 (AppImage)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: System
+      description: Your distro, desktop, GPU, and whether video decodes on the GPU.
+      placeholder: |
+        - System: Arch Linux
+        - Desktop: Hyprland wayland
+        - GPU: Mesa Intel(R) Arc(tm) B390 (PTL)
+        - Video decoding: GPU (VA-API)
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, a short clip, or the output of running `omalens <file>` in a terminal.

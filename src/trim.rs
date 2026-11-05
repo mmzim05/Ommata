@@ -1,9 +1,12 @@
-//! Video trim. The start is frame-exact for H.264 and HEVC: the frames from
-//! the cut to the next keyframe are re-encoded at the bitrate the source
-//! spent on them, and everything after is copied packet for packet, so the
-//! quality is kept and the size stays proportional to the length kept. Other
-//! codecs are copied from the keyframe at or before the in point (the UI
-//! shows that snapped point).
+//! Video trim. MP4 and MOV are cut frame-exactly in any codec without
+//! re-encoding: packets are copied from the keyframe at or before the in
+//! point, and an edit list hides the frames before it. In other containers
+//! the start is frame-exact for H.264 and HEVC: the frames from the cut to
+//! the next keyframe are re-encoded at the bitrate the source spent on them,
+//! and everything after is copied packet for packet, so the quality is kept
+//! and the size stays proportional to the length kept. Other codecs there
+//! are copied from the keyframe at or before the in point (the UI shows that
+//! snapped point).
 
 use crate::video::start_time;
 use ffmpeg_next as ff;
@@ -50,10 +53,11 @@ fn seek_keyframe(
 /// can be frame-exact, else the keyframe at or before it.
 pub fn cut_point(path: &Path, time: f64) -> Option<f64> {
     let mut input = ff::format::input(path).ok()?;
-    let exact = input
-        .streams()
-        .best(ff::media::Type::Video)
-        .is_some_and(|stream| Codec::of(stream.parameters().id()).is_some());
+    let exact = has_edit_list(&guess_muxer(path, ""))
+        || input
+            .streams()
+            .best(ff::media::Type::Video)
+            .is_some_and(|stream| Codec::of(stream.parameters().id()).is_some());
     if exact {
         return Some(time.max(0.0));
     }
@@ -76,9 +80,12 @@ impl Progress {
         f32::from_bits(self.done.load(Relaxed))
     }
 
+    /// Raise the fraction done. Packets arrive in decode order, so their
+    /// display times step back now and then; progress never does.
     fn set(&self, fraction: f64) {
         let fraction = fraction.clamp(0.0, 1.0) as f32;
-        self.done.store(fraction.to_bits(), Relaxed);
+        // Bit patterns of non-negative floats order like the floats.
+        self.done.fetch_max(fraction.to_bits(), Relaxed);
     }
 }
 
@@ -521,15 +528,24 @@ fn export_inner(
     let video = input.stream(video_index).ok_or("no video stream")?;
     let video_time_base = video.time_base();
     let codec = Codec::of(video.parameters().id());
+    let demuxer = input
+        .format()
+        .name()
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let muxer = guess_muxer(src, &demuxer);
+    let edit_list = has_edit_list(&muxer);
     let half_frame = 0.5 * f64::from(frame_rate(&video).invert());
-    let exact = codec.is_some() && start - keyframe > half_frame;
+    let exact = (edit_list || codec.is_some()) && start - keyframe > half_frame;
     let (framing, sets) = match codec {
         Some(codec) => parameter_sets(codec, &extradata(&video.parameters())),
         None => (Framing::AnnexB, Vec::new()),
     };
     let first = if exact { start } else { keyframe };
     let ticks = |time: f64| ((time + start_offset) / f64::from(video_time_base)).round() as i64;
-    let mut head = match codec.filter(|_| exact) {
+    let mut head = match codec.filter(|_| exact && !edit_list) {
         Some(codec) => {
             let bit_rate = gop_bit_rate(&mut input, video_index, seek_target).map_err(to_text)?;
             let video = input.stream(video_index).ok_or("no video stream")?;
@@ -540,19 +556,14 @@ fn export_inner(
     // Re-seek so the keyframe packet itself is read again below.
     input.seek(seek_target, ..seek_target).map_err(to_text)?;
 
-    let demuxer = input
-        .format()
-        .name()
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let mut output = ff::format::output_as(dst, &guess_muxer(src, &demuxer)).map_err(to_text)?;
+    let mut output = ff::format::output_as(dst, &muxer).map_err(to_text)?;
 
     let stream_count = input.nb_streams() as usize;
     let mut output_index = vec![None; stream_count];
     let mut input_time_base = vec![ff::Rational(0, 1); stream_count];
     let mut output_time_base = vec![ff::Rational(0, 1); stream_count];
+    // SAFETY: a muxer's codec tag table is static data.
+    let tags = unsafe { (*output.format().as_ptr()).codec_tag };
     for in_stream in input.streams() {
         let medium = in_stream.parameters().medium();
         if !matches!(
@@ -565,6 +576,7 @@ fn export_inner(
             .add_stream(ff::encoder::find(ff::codec::Id::None))
             .map_err(to_text)?;
         out_stream.set_parameters(in_stream.parameters());
+        keep_codec_tag_if_valid(tags, &mut out_stream);
         out_stream.set_time_base(in_stream.time_base());
         out_stream.set_metadata(in_stream.metadata().to_owned());
         output_index[in_stream.index()] = Some(out_stream.index());
@@ -572,7 +584,11 @@ fn export_inner(
     }
     output.set_metadata(input.metadata().to_owned());
     let mut options = ff::Dictionary::new();
-    options.set("avoid_negative_ts", "make_zero");
+    // With an edit list, the frames before the cut keep their negative times
+    // and the muxer hides them; elsewhere everything shifts to start at zero.
+    if !edit_list {
+        options.set("avoid_negative_ts", "make_zero");
+    }
     output.write_header_with(options).map_err(to_text)?;
     // The muxer may change stream time bases while writing the header.
     for (index, out_stream) in output.streams().enumerate() {
@@ -722,6 +738,35 @@ fn export_inner(
     output.write_trailer().map_err(to_text)?;
     progress.set(1.0);
     Ok(())
+}
+
+/// Drop the source's codec tag when the output format doesn't pair it with
+/// this codec (MOV's `lpcm` for 24-bit PCM, which it writes as `in24`), and
+/// let the muxer pick one, as the ffmpeg tool does. A valid tag, such as
+/// `hvc1` that Apple players need for HEVC, is kept.
+fn keep_codec_tag_if_valid(
+    tags: *const *const ff::ffi::AVCodecTag,
+    stream: &mut ff::format::stream::StreamMut,
+) {
+    // SAFETY: `tags` is the muxer's table, the stream's parameters are
+    // valid, and the header isn't written yet, so the tag may still change.
+    unsafe {
+        let parameters = (*stream.as_mut_ptr()).codecpar;
+        let (id, tag) = ((*parameters).codec_id, (*parameters).codec_tag);
+        let mut muxer_tag = 0;
+        let valid = tags.is_null()
+            || ff::ffi::av_codec_get_id(tags, tag) == id
+            || ff::ffi::av_codec_get_tag2(tags, id, &mut muxer_tag) == 0;
+        if !valid {
+            (*parameters).codec_tag = 0;
+        }
+    }
+}
+
+/// Whether `muxer` writes edit lists, which let a stream copy start
+/// between keyframes.
+fn has_edit_list(muxer: &str) -> bool {
+    matches!(muxer, "mp4" | "mov")
 }
 
 /// The demuxer reports e.g. "mov,mp4,m4a,..."; pick the muxer for the file's own

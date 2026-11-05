@@ -1,43 +1,85 @@
-<p align="center">
-  <img src="assets/omalens.svg" width="96" height="96" alt="omalens" />
-</p>
+<div align="center">
 
-<h1 align="center">omalens</h1>
+<img src="assets/omalens.svg" width="112" height="112" alt="omalens logo" />
 
-<p align="center">
-  <strong>One fast viewer for your photos, camera RAW files and videos on Linux.</strong>
-</p>
+# omalens
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/mmzim05/omalens" alt="Licence" /></a>
-  <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux" />
-</p>
+**One fast viewer for your photos, camera RAW files and videos on Linux.**
 
-![omalens playing a motorbike race video, paused, with the file bar on top and the seek bar at the bottom](docs/screenshots/video.webp)
+Open it, look, trim or crop, move on. No library to import into, no separate apps for
+pictures and video.
 
-<table>
-  <tr>
-    <td><img src="docs/screenshots/hover.webp" alt="Hovering the seek bar shows a thumbnail of that point" /></td>
-    <td><img src="docs/screenshots/trim.webp" alt="Trim mode with in and out handles on the seek bar" /></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/photo.webp" alt="A black and white race car photo" /></td>
-    <td><img src="docs/screenshots/crop.webp" alt="Cropping a photo to 16:9" /></td>
-  </tr>
-</table>
+[![Latest release](https://img.shields.io/github/v/release/mmzim05/omalens?label=release)](https://github.com/mmzim05/omalens/releases/latest)
+[![Licence](https://img.shields.io/github/license/mmzim05/omalens)](LICENSE)
+![Linux](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
+
+[Install](#install) · [Features](#features) · [Usage](#usage) ·
+[Supported files](#supported-files) · [Report a problem](#reporting-problems) ·
+[Build from source](#build-from-source) · [Changelog](CHANGELOG.md)
+
+<img src="docs/screenshots/video.webp" alt="Stepping through photos and videos in a folder with omalens" width="900" />
+
+</div>
+
+## Why omalens
+
+Most Linux setups use one app for photos, another for video, and a third (or a terminal
+full of `ffmpeg` flags) to cut a clip. omalens does all three in one window that stays out of
+your way:
+
+- **It opens instantly.** A 100-megapixel JPEG is on screen in about 0.2 seconds, RAW files
+  show the camera's own preview right away, and the next and previous files load in the
+  background before you ask for them.
+- **Video plays on your GPU.** 4K H.264, HEVC, VP9 and AV1 decode on the graphics card and go
+  straight to the screen, so playback stays smooth and your CPU stays quiet.
+- **Edits never cost quality.** Trims copy the original video stream, so saving a trimmed
+  MP4 or MOV takes a fraction of a second and the cut lands on exactly the frame you chose.
+  Photo edits are only applied when you save.
+- **It looks like your desktop.** On [Omarchy](https://omarchy.org) it follows your theme.
 
 ## Features
 
-- **Photos and camera RAW:** open JPEG, PNG, WebP and RAW files from most cameras.
-- **Smooth video:** play and scrub even 4K video without slowing your computer down.
-- **Trim clips:** cut a video to the exact frame you choose, with no loss in quality.
-- **Quick edits:** crop, rotate and flip photos, then save or keep a copy.
+### Photos and camera RAW
+
+Open JPEG, PNG, WebP and RAW files from most cameras. Zoom to actual pixels, fit to the
+window, or go fullscreen. EXIF rotation is applied for you.
+
+<img src="docs/screenshots/photo.webp" alt="Zooming into a photo and stepping to a RAW file" width="800" />
+
+### Smooth video
+
+Play and scrub even 4K video. Hover the seek bar to preview any moment, and step frame by
+frame with `,` and `.`.
+
+<img src="docs/screenshots/hover.webp" alt="Scrubbing a video with seek-bar thumbnails" width="800" />
+
+### Trim clips to the exact frame
+
+Press `T`, drag the handles or press `I` and `O`, then save. The video is copied, not
+re-encoded, so it saves in a fraction of a second with no loss in quality. MP4 and MOV
+clips start on exactly the frame you chose, in any codec.
+
+<img src="docs/screenshots/trim.webp" alt="Trimming a video and saving a copy" width="800" />
+
+### Crop, rotate and flip
+
+Press `C` to crop freely or to a fixed shape such as 16:9, `R` to rotate and `H` to flip.
+Save over the original (it goes to the trash, not away) or keep a copy.
+
+<img src="docs/screenshots/crop.webp" alt="Cropping a photo to 16:9 and saving a copy" width="800" />
+
+### And also
+
 - **Browse a folder:** step through every photo and video with the arrow keys.
-- **Fits your desktop:** follows your Omarchy theme.
+- **Thumbnails in your file manager,** including RAW files, when installed system-wide.
+- **Controls that get out of the way:** they fade when you stop moving the mouse.
 
 ## Install
 
-Download the `.AppImage` file from the
+### AppImage
+
+Download `omalens-<version>-x86_64.AppImage` from the
 [latest release](https://github.com/mmzim05/omalens/releases/latest), make it executable,
 and open it:
 
@@ -48,27 +90,89 @@ chmod +x omalens-*-x86_64.AppImage
 
 To add it to your app menu, open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever).
 
-For smooth video, install your graphics driver's video package: `intel-media-driver` for
-Intel, `libva-mesa-driver` for AMD.
+**Updates:** omalens checks for a new release once a day. When there is one, an
+**Update** button appears in the top bar: it downloads the new version, and
+**Restart to update** opens it on the same file. Gear Lever can update it too.
+
+### From source
+
+See [Build from source](#build-from-source). Installing this way also gives you RAW
+thumbnails in your file manager.
+
+### For smooth video
+
+Install your graphics driver's video package, otherwise video decodes on the CPU:
+
+| GPU   | Package              |
+| ----- | -------------------- |
+| Intel | `intel-media-driver` |
+| AMD   | `libva-mesa-driver`  |
 
 ## Usage
 
-Open a photo or video from your file manager with omalens, or run `omalens <file-or-folder>`.
-The controls fade away when you are not using them, and come back when you move the mouse.
+Open a photo or video from your file manager with omalens, or from a terminal:
 
-Press `?` or click the **?** button to see the keyboard shortcuts.
+```sh
+omalens photo.jpg        # open a file, with its folder ready to browse
+omalens ~/Pictures/trip  # open a folder
+```
 
-**Saving edits:** `Ctrl+S` saves over the file and moves the original to the trash.
-`Ctrl+Shift+S` saves a copy next to it. `Ctrl+Z` undoes your edits. RAW files are never
-overwritten; they save as a JPEG copy.
+Press `?` for Help: the keyboard shortcuts, your version and updates, and reporting a
+problem. Settings are behind the gear in the top bar, or on the start screen.
+
+### Keyboard shortcuts
+
+| Browse        |                    | View            |                              |
+| ------------- | ------------------ | --------------- | ---------------------------- |
+| `←` `→`       | Previous / next    | Scroll, `+` `-` | Zoom                         |
+| `Home` `End`  | First / last       | `0` / `1`       | Fit to window / actual size  |
+| `Del`         | Move to trash      | `F`             | Fullscreen                   |
+| `Ctrl+O`      | Open a file        | `?`             | Help                         |
+| `F2`          | Rename             |                 |                              |
+
+| Video        |                           | Photo         |                            |
+| ------------ | ------------------------- | ------------- | -------------------------- |
+| `Space`      | Play / pause              | `C`           | Crop                       |
+| `J` `L`      | Back / forward 5 seconds  | `1` – `5`     | Crop shape, while cropping |
+| `,` `.`      | Back / forward one frame  | `Enter`       | Apply crop                 |
+| `M`          | Mute                      | `R` `Shift+R` | Rotate right / left        |
+| `↑` `↓`      | Volume                    | `H`           | Flip                       |
+| `T`          | Trim                      | `Esc`         | Cancel crop                |
+| `I` `O`      | Set trim start / end      |               |                            |
+| `Esc`        | Leave trim                |               |                            |
+
+| Save           |                                                     |
+| -------------- | --------------------------------------------------- |
+| `Ctrl+S`       | Save over the original (the original goes to trash) |
+| `Ctrl+Shift+S` | Save a copy next to it                              |
+| `Ctrl+Z`       | Undo all edits                                      |
+| `Ctrl+Q`       | Quit                                                |
+
+Edits to a camera RAW save as a DNG: all the original sensor data, with the crop and
+rotation stored in the file for RAW editors (Lightroom, darktable, RawTherapee) to apply.
+Saving over a RAW writes `name.dng` and moves the original to the trash.
+
+To rename a file, click its name in the top bar or press `F2`, type, and press Enter.
+
+`Del` asks before moving a file to the trash. To clear out a folder quickly, tick
+**Don't ask again until omalens closes**.
+
+## Reporting problems
+
+Press `?`, open **Report an issue**, and click **Report an issue**. It opens a
+[bug report](https://github.com/mmzim05/omalens/issues/new/choose) with your omalens
+version, system and GPU already filled in; describe what happened and, if you can, which
+file it happened with. Ideas are welcome as feature requests.
 
 ## Supported files
 
-- **Photos:** JPEG, PNG, WebP, GIF, TIFF, BMP
-- **Camera RAW:** Canon, Nikon, Sony, Fujifilm, Olympus, Panasonic, Pentax, Samsung, Leica
-  and other DNG, Phase One, Kodak, Epson, Minolta. Hasselblad (`.3fr`) and Leaf (`.mos`) do
-  not open yet.
-- **Video:** MP4, MOV, MKV, WebM, AVI, MPEG-TS, MPG, FLV, OGV, WMV, 3GP
+| Kind       | Formats                                                                                                                           |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Photos     | JPEG, PNG, WebP, GIF, TIFF, BMP                                                                                                   |
+| Camera RAW | Canon, Nikon, Sony, Fujifilm, Olympus, Panasonic, Pentax, Samsung, Leica and other DNG, Phase One, Kodak, Epson, Minolta          |
+| Video      | MP4, MOV, MKV, WebM, AVI, MPEG-TS, MPG, FLV, OGV, WMV, 3GP                                                                        |
+
+Hasselblad (`.3fr`) and Leaf (`.mos`) RAW files do not open yet.
 
 ## Build from source
 
@@ -78,17 +182,17 @@ On Arch:
 sudo pacman -S --needed git rust meson ninja nasm libva x264 x265
 git clone https://github.com/mmzim05/omalens
 cd omalens
-./scripts/build-ffmpeg.sh
+./scripts/build-ffmpeg.sh   # a minimal FFmpeg, linked into the binary
 cargo build --release
-sudo ./scripts/install.sh
+sudo ./scripts/install.sh   # installs to /usr/local, with file-manager thumbnails
 ```
 
-Installing this way also shows RAW thumbnails in your file manager.
-`./scripts/build-appimage.sh` packages an AppImage.
+`./scripts/build-appimage.sh` packages an AppImage, and `cargo release patch --execute`
+publishes a new version (see [CHANGELOG.md](CHANGELOG.md)).
 
-## License
+## Licence
 
 [GPL-3.0-or-later](LICENSE)
 
-Screenshot media from [Pexels](https://www.pexels.com/): photos by Philipp Fahlbusch and Telmo
+Demo media from [Pexels](https://www.pexels.com/): photos by Philipp Fahlbusch and Telmo
 Antunes, and a motorbike race video.

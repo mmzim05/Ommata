@@ -38,14 +38,26 @@ main() {
   rm -rf "$APPDIR"
   local linuxdeploy
   linuxdeploy="$(find_linuxdeploy)"
+  # appimagetool makes .DirIcon, the icon AppImage installers and file
+  # managers show, only from a PNG at the top of the AppDir.
+  local icon_png="$OUT/omalens.png"
+  rsvg-convert -w 256 -h 256 -o "$icon_png" "$ROOT/assets/omalens.svg"
+  mkdir -p "$APPDIR"
+  cp "$icon_png" "$APPDIR/omalens.png"
   # Extract-and-run: works without FUSE, as in containers and CI.
+  # appimagetool writes the .zsync file to the working directory.
+  cd "$OUT"
+  # Update information lets Gear Lever and AppImageUpdate fetch new releases
+  # (only the changed blocks, through the .zsync file published alongside).
   APPIMAGE_EXTRACT_AND_RUN=1 \
     LDAI_OUTPUT="$OUT/omalens-$(version)-x86_64.AppImage" \
+    LDAI_UPDATE_INFORMATION="gh-releases-zsync|mmzim05|omalens|latest|omalens-*-x86_64.AppImage.zsync" \
     "$linuxdeploy" \
     --appdir "$APPDIR" \
     --executable "$ROOT/target/release/omalens" \
     --desktop-file "$ROOT/assets/omalens.desktop" \
     --icon-file "$ROOT/assets/omalens.svg" \
+    --icon-file "$icon_png" \
     --exclude-library 'libva*' \
     --exclude-library 'libdrm*' \
     --output appimage

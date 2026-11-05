@@ -33,7 +33,11 @@ impl Palette {
             muted: visuals.weak_text_color(),
             accent: visuals.selection.stroke.color,
             selection: visuals.selection.bg_fill,
-            danger: visuals.error_fg_color,
+            danger: if dark {
+                Color32::from_rgb(0xe0, 0x6c, 0x75)
+            } else {
+                Color32::from_rgb(0xc6, 0x28, 0x28)
+            },
         }
     }
 }
@@ -64,7 +68,10 @@ fn parse_hex(text: &str) -> Option<Color32> {
 
 /// Reads the flat `key = "value"` lines of Omarchy's colors.toml.
 fn load_omarchy() -> Option<Palette> {
-    let text = std::fs::read_to_string(state_dir()?.join("theme/colors.toml")).ok()?;
+    parse_omarchy(&std::fs::read_to_string(state_dir()?.join("theme/colors.toml")).ok()?)
+}
+
+fn parse_omarchy(text: &str) -> Option<Palette> {
     let get = |key: &str| {
         text.lines().find_map(|line| {
             let (name, value) = line.split_once('=')?;
@@ -89,8 +96,60 @@ fn load_omarchy() -> Option<Palette> {
             .unwrap_or(base.muted),
         accent: color("accent").unwrap_or(base.accent),
         selection: color("selection").unwrap_or(base.selection),
-        danger: color("red").unwrap_or(base.danger),
+        // Some themes recolour their "red" slot (blue in a few), and danger
+        // must read as red: take the theme's own red only if it is one.
+        danger: readable(
+            [color("red"), color("bright_red")]
+                .into_iter()
+                .flatten()
+                .find(|red| is_red(*red))
+                .unwrap_or(base.danger),
+            bg,
+            surface,
+            dark,
+        ),
     })
+}
+
+/// `color`, lightened on a dark theme or darkened on a light one just enough
+/// to carry button text in the background colour (4.5:1) and stand out as an
+/// icon on the bars (3:1). Most themes' reds already do and stay as they are.
+fn readable(color: Color32, bg: Color32, surface: Color32, dark: bool) -> Color32 {
+    let target = if dark { Color32::WHITE } else { Color32::BLACK };
+    (0..=50)
+        .map(|step| lerp(color, target, step as f32 / 50.0))
+        .find(|shade| contrast(*shade, bg) >= 4.5 && contrast(*shade, surface) >= 3.0)
+        .unwrap_or(target)
+}
+
+/// WCAG contrast ratio, from 1 (same) to 21 (black on white).
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let luminance = |color: Color32| {
+        let channel = |c: u8| {
+            let c = f32::from(c) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Whether `color` is recognisably red: a hue within 25° of red, and
+/// saturated enough not to pass for grey.
+fn is_red(color: Color32) -> bool {
+    let [r, g, b] = [color.r(), color.g(), color.b()].map(|c| f32::from(c) / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max == 0.0 || (max - min) / max < 0.3 || max != r {
+        return false;
+    }
+    // Hue in degrees from red, towards yellow (g > b) or magenta (b > g).
+    let hue = 60.0 * (g - b).abs() / (max - min);
+    hue <= 25.0
 }
 
 /// Blend from `a` (t = 0) to `b` (t = 1).
@@ -167,6 +226,9 @@ fn apply(ctx: &egui::Context, palette: &Palette) {
     visuals.selection.bg_fill = palette.selection;
     visuals.selection.stroke = egui::Stroke::new(1.0, palette.accent);
     visuals.hyperlink_color = palette.accent;
+    // egui applies this to plain buttons only; app.rs gives the other
+    // clickable widgets the hand itself.
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
     visuals.error_fg_color = palette.danger;
     let radius = egui::CornerRadius::same(8);
     visuals.window_corner_radius = egui::CornerRadius::same(12);
@@ -188,4 +250,36 @@ fn apply(ctx: &egui::Context, palette: &Palette) {
     widgets.noninteractive.weak_bg_fill = palette.surface;
     widgets.active.fg_stroke.color = palette.accent;
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn red_is_readable_in_every_omarchy_theme() {
+        let themes = std::fs::read_dir("/usr/share/omarchy/themes");
+        let Ok(themes) = themes else {
+            return;
+        };
+        for theme in themes.flatten() {
+            let text = std::fs::read_to_string(theme.path().join("colors.toml"));
+            let Some(palette) = text.ok().and_then(|text| parse_omarchy(&text)) else {
+                continue;
+            };
+            let name = theme.file_name();
+            assert!(contrast(palette.danger, palette.bg) >= 4.5, "{name:?}");
+            assert!(contrast(palette.danger, palette.surface) >= 3.0, "{name:?}");
+            assert!(is_red(palette.danger), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn recognises_red() {
+        assert!(is_red(Color32::from_rgb(0xd3, 0x5f, 0x5f)));
+        assert!(is_red(Color32::from_rgb(0xb9, 0x1c, 0x1c)));
+        assert!(!is_red(Color32::from_rgb(0x4d, 0x86, 0xb0)));
+        assert!(!is_red(Color32::from_rgb(0xe0, 0xa0, 0x40)));
+        assert!(!is_red(Color32::from_rgb(0x80, 0x70, 0x70)));
+    }
 }

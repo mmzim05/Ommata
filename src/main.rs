@@ -6,6 +6,7 @@ mod preview;
 mod settings;
 mod theme;
 mod trim;
+mod update;
 mod video;
 mod waveform;
 
@@ -16,6 +17,11 @@ fn main() -> eframe::Result {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--thumbnail") {
         std::process::exit(thumbnail(&args[1..]));
+    }
+    // The updater runs a downloaded AppImage with this to check it works.
+    if args.first().is_some_and(|arg| arg == "--version") {
+        println!("omalens {}", update::VERSION);
+        return Ok(());
     }
     let start_path = args.first().map(std::path::PathBuf::from);
     if let Err(error) = ffmpeg_next::init() {

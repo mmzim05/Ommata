@@ -3,9 +3,11 @@
 
 use std::path::PathBuf;
 
-/// User preferences for the video seek bar.
+/// User preferences.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
+    /// Look for a new release once a day.
+    pub check_updates: bool,
     /// Draw the seek bar as the audio waveform (falls back to a plain bar
     /// when off or when the video has no audio).
     pub waveform: bool,
@@ -22,6 +24,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            check_updates: true,
             waveform: true,
             wave_filled: false,
             wave_min: 3.0,
@@ -52,6 +55,7 @@ impl Settings {
             };
             let value = value.trim();
             match key.trim() {
+                "check_updates" => settings.check_updates = value != "false",
                 "waveform" => settings.waveform = value != "false",
                 "wave_style" => settings.wave_filled = value == "filled",
                 "wave_min" => settings.wave_min = value.parse().unwrap_or(settings.wave_min),
@@ -82,7 +86,9 @@ impl Settings {
         std::fs::write(
             file,
             format!(
-                "waveform = {}\nwave_style = {}\nwave_min = {}\nwave_max = {}\nwave_smooth = {}\n",
+                "check_updates = {}\nwaveform = {}\nwave_style = {}\nwave_min = {}\n\
+                 wave_max = {}\nwave_smooth = {}\n",
+                self.check_updates,
                 self.waveform,
                 if self.wave_filled { "filled" } else { "bars" },
                 self.wave_min,
