@@ -259,9 +259,13 @@ impl App {
         let ctx = &creation.egui_ctx;
         // Set only here, once per loader.
         let _ = loader.ctx.set(ctx.clone());
-        loader
-            .max_side
-            .store(ctx.input(|input| input.max_texture_side) as u32, Relaxed);
+        // egui reports the GPU's texture limit only from the first frame on
+        // (2048 until then), so ask GL directly.
+        if let Some(gl) = &creation.gl {
+            use eframe::glow::{self, HasContext};
+            let side = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) };
+            loader.max_side.store(side.max(2048) as u32, Relaxed);
+        }
         ctx.all_styles_mut(|style| {
             style.spacing.button_padding = vec2(10.0, 6.0);
             style.spacing.item_spacing = vec2(6.0, 6.0);

@@ -147,17 +147,35 @@ fn read(path: &Path, full: bool) -> Result<Read, String> {
 pub fn decode(path: &Path, max_side: u32) -> Result<Decoded, String> {
     let (picture, _, _) = read(path, false)?;
     let size = [picture.width() as usize, picture.height() as usize];
-    // Over the GPU's texture limit: box-filter down, which on 50+ MP images
-    // is many times faster than a Triangle resize and as good on screen.
-    let picture = if picture.width() > max_side || picture.height() > max_side {
-        picture.thumbnail(max_side, max_side)
-    } else {
-        picture
-    };
+    // Over the GPU's texture limit: scale down to fit.
+    let picture = shrink(picture, max_side);
     Ok(Decoded {
         image: to_color_image(picture),
         size,
     })
+}
+
+/// Scale `picture` down to fit `max_side` on its long side, unchanged if it
+/// already fits. Box filter (area average): as good as Triangle on screen,
+/// and SIMD over all cores keeps 100 MP images well under a second.
+fn shrink(picture: DynamicImage, max_side: u32) -> DynamicImage {
+    use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+    let (width, height) = (picture.width(), picture.height());
+    let long = width.max(height);
+    if long <= max_side {
+        return picture;
+    }
+    let fit = |side: u32| {
+        let side = (u64::from(side) * u64::from(max_side)).div_ceil(u64::from(long));
+        (side as u32).max(1)
+    };
+    let mut small = DynamicImage::new(fit(width), fit(height), picture.color());
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Box));
+    match Resizer::new().resize(&picture, &mut small, &options) {
+        Ok(()) => small,
+        // Pixel layouts the resizer lacks.
+        Err(_) => picture.thumbnail(max_side, max_side),
+    }
 }
 
 /// Convert for upload in one pass spread over all cores (opaque RGB, the JPEG
@@ -190,7 +208,7 @@ fn to_color_image(picture: DynamicImage) -> ColorImage {
 /// files use the camera's embedded preview, so this stays fast.
 pub fn thumbnail(path: &Path, out: &Path, size: u32) -> Result<(), String> {
     let (picture, _, _) = read(path, false)?;
-    let picture = picture.thumbnail(size, size);
+    let picture = shrink(picture, size);
     let picture = if picture.color().has_alpha() {
         DynamicImage::ImageRgba8(picture.into_rgba8())
     } else {
