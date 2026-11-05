@@ -1,0 +1,47 @@
+<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:MP="http://ns.microsoft.com/photo/1.2/"
+    xmlns:MPRI="http://ns.microsoft.com/photo/1.2/t/RegionInfo#"
+    xmlns:MPReg="http://ns.microsoft.com/photo/1.2/t/Region#"
+   digiKam:ColorLabel="1"
+   digiKam:PickLabel="2"
+   xmp:Rating="3">
+   <digiKam:TagsList>
+    <rdf:Seq>
+     <rdf:li>Shot/Action</rdf:li>
+    </rdf:Seq>
+   </digiKam:TagsList>
+   <lr:hierarchicalSubject>
+    <rdf:Bag>
+     <rdf:li>Shot|Action</rdf:li>
+    </rdf:Bag>
+   </lr:hierarchicalSubject>
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>Action</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+   <dc:creator>
+    <rdf:Seq>
+     <rdf:li>Michael</rdf:li>
+    </rdf:Seq>
+   </dc:creator>
+   <MP:RegionInfo rdf:parseType="Resource">
+    <MPRI:Regions>
+     <rdf:Bag>
+      <rdf:li
+       MPReg:Rectangle="0.1, 0.2, 0.3, 0.4"
+       MPReg:PersonDisplayName="Alex"/>
+     </rdf:Bag>
+    </MPRI:Regions>
+   </MP:RegionInfo>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

@@ -135,6 +135,31 @@ pub fn temp_path(target: &Path) -> PathBuf {
     target.with_file_name(format!(".{name}.omalens-tmp"))
 }
 
+/// Write via a temp file in the target's directory, then rename over the target,
+/// so a failed or cancelled save never leaves a half-written file behind.
+pub fn write_atomic(
+    dst: &Path,
+    write: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let temp = temp_path(dst);
+    let result =
+        write(&temp).and_then(|()| std::fs::rename(&temp, dst).map_err(|error| error.to_string()));
+    if result.is_err() {
+        remove_temp(&temp);
+    }
+    result
+}
+
+/// Clean up a temp file after a failed save. The save error is what the user
+/// needs to see; a leftover temp file is only clutter, so it is just logged.
+pub fn remove_temp(temp: &Path) {
+    if let Err(error) = std::fs::remove_file(temp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("omalens: remove {}: {error}", temp.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

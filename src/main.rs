@@ -4,6 +4,7 @@ mod library;
 mod picture;
 mod preview;
 mod settings;
+mod sidecar;
 mod theme;
 mod trim;
 mod update;

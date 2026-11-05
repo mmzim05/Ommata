@@ -2278,27 +2278,7 @@ impl eframe::App for App {
     }
 }
 
-/// Write via a temp file in the target's directory, then rename over the target,
-/// so a failed or cancelled save never leaves a half-written file behind.
-fn write_atomic(dst: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
-    let temp = library::temp_path(dst);
-    let result =
-        write(&temp).and_then(|()| std::fs::rename(&temp, dst).map_err(|error| error.to_string()));
-    if result.is_err() {
-        remove_temp(&temp);
-    }
-    result
-}
 
-/// Clean up a temp file after a failed save. The save error is what the user
-/// needs to see; a leftover temp file is only clutter, so it is just logged.
-fn remove_temp(temp: &Path) {
-    if let Err(error) = std::fs::remove_file(temp)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!("omalens: remove {}: {error}", temp.display());
-    }
-}
 
 /// Write a copy atomically, or overwrite while keeping the original in the trash.
 fn save_to(
@@ -2310,7 +2290,7 @@ fn save_to(
     match mode {
         SaveMode::Overwrite if dst == src => replace_trashing_original(dst, write),
         SaveMode::Overwrite => replace_with_new(src, dst, write),
-        SaveMode::Copy => write_atomic(dst, write).map(|_| None),
+        SaveMode::Copy => library::write_atomic(dst, write).map(|_| None),
     }
 }
 
@@ -2321,7 +2301,7 @@ fn replace_with_new(
     dst: &Path,
     write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
-    write_atomic(dst, write)?;
+    library::write_atomic(dst, write)?;
     let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
     Ok(Some(match trash::delete(src) {
         Ok(()) => format!("Saved. Original {name} is in the trash"),
@@ -2339,24 +2319,24 @@ fn replace_trashing_original(
 ) -> Result<Option<String>, String> {
     let temp = library::temp_path(dst);
     if let Err(error) = write(&temp) {
-        remove_temp(&temp);
+        library::remove_temp(&temp);
         return Err(error);
     }
     let original = library::original_path(dst);
     if let Err(error) = std::fs::rename(dst, &original) {
-        remove_temp(&temp);
+        library::remove_temp(&temp);
         return Err(format!("couldn't move the original aside: {error}"));
     }
     if let Err(error) = std::fs::rename(&temp, dst) {
         // Put the original back; nothing has changed for the user.
         if let Err(restore) = std::fs::rename(&original, dst) {
-            remove_temp(&temp);
+            library::remove_temp(&temp);
             return Err(format!(
                 "{error}; the original is kept as {}: {restore}",
                 original.display()
             ));
         }
-        remove_temp(&temp);
+        library::remove_temp(&temp);
         return Err(error.to_string());
     }
     let name = original

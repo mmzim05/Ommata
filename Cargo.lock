@@ -2951,6 +2951,7 @@ dependencies = [
  "ffmpeg-next",
  "image",
  "libloading",
+ "quick-xml",
  "rawler",
  "rfd",
  "trash",

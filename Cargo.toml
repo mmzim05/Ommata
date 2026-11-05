@@ -28,6 +28,7 @@ rawler = "0.8.0"
 # Loads libEGL at runtime for zero-copy video (src/gpu.rs); already used by glutin.
 libloading = "0.8"
 fast_image_resize = { version = "6.1.0", features = ["image", "rayon"] }
+quick-xml = "0.41"
 
 [features]
 # Link the minimal FFmpeg from scripts/build-ffmpeg.sh statically (single binary).
