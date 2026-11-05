@@ -794,13 +794,13 @@ fn guess_muxer(src: &Path, demuxer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Needs a real clip: OMALENS_TEST_VIDEO=clip.mp4 cargo test -- --ignored
-    /// Optional OMALENS_TRIM=start,end and OMALENS_TRIM_OUT=path.
+    /// Needs a real clip: OMMATA_TEST_VIDEO=clip.mp4 cargo test -- --ignored
+    /// Optional OMMATA_TRIM=start,end and OMMATA_TRIM_OUT=path.
     #[test]
     #[ignore]
     fn export_real_clip() {
-        let src = std::path::PathBuf::from(std::env::var("OMALENS_TEST_VIDEO").unwrap());
-        let (start, end) = std::env::var("OMALENS_TRIM")
+        let src = std::path::PathBuf::from(std::env::var("OMMATA_TEST_VIDEO").unwrap());
+        let (start, end) = std::env::var("OMMATA_TRIM")
             .ok()
             .and_then(|range| {
                 let (from, to) = range.split_once(',')?;
@@ -810,7 +810,7 @@ mod tests {
         ffmpeg_next::init().unwrap();
         let first = super::cut_point(&src, start).unwrap();
         let ext = src.extension().unwrap().to_string_lossy().to_string();
-        let dst = std::env::var("OMALENS_TRIM_OUT")
+        let dst = std::env::var("OMMATA_TRIM_OUT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| src.with_file_name(format!("trim-test-out.{ext}")));
         super::export(&src, &dst, start, end, Default::default()).unwrap();

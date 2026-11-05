@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Install omalens. Default is system-wide under /usr/local (run with sudo),
+# Install ommata. Default is system-wide under /usr/local (run with sudo),
 # which is also what file-manager RAW thumbnails need: Nautilus runs
 # thumbnailers in a sandbox that only sees /usr. PREFIX=~/.local installs for
 # the current user without thumbnails. Builds the release binary if missing.
@@ -12,7 +12,7 @@ readonly ROOT
 readonly PREFIX="${PREFIX:-/usr/local}"
 readonly DESTDIR="${DESTDIR:-}"
 readonly DEST="$DESTDIR$PREFIX"
-readonly BIN="$ROOT/target/release/omalens"
+readonly BIN="$ROOT/target/release/ommata"
 
 build_if_missing() {
   if [[ -x "$BIN" ]]; then
@@ -39,9 +39,9 @@ install_thumbnailer() {
     return
   fi
   mkdir -p "$thumbnailers"
-  sed "s|@BINDIR@|$PREFIX/bin|g" "$ROOT/assets/omalens.thumbnailer" \
-    > "$thumbnailers/omalens.thumbnailer"
-  chmod 644 "$thumbnailers/omalens.thumbnailer"
+  sed "s|@BINDIR@|$PREFIX/bin|g" "$ROOT/assets/ommata.thumbnailer" \
+    > "$thumbnailers/ommata.thumbnailer"
+  chmod 644 "$thumbnailers/ommata.thumbnailer"
 }
 
 # Desktop caches are optional: a missing tool or a failed refresh only delays
@@ -61,14 +61,14 @@ refresh_caches() {
 
 main() {
   build_if_missing
-  install -Dm755 "$BIN" "$DEST/bin/omalens"
-  install -Dm644 "$ROOT/assets/omalens.desktop" \
-    "$DEST/share/applications/omalens.desktop"
-  install -Dm644 "$ROOT/assets/omalens.svg" \
-    "$DEST/share/icons/hicolor/scalable/apps/omalens.svg"
+  install -Dm755 "$BIN" "$DEST/bin/ommata"
+  install -Dm644 "$ROOT/assets/ommata.desktop" \
+    "$DEST/share/applications/ommata.desktop"
+  install -Dm644 "$ROOT/assets/ommata.svg" \
+    "$DEST/share/icons/hicolor/scalable/apps/ommata.svg"
   install_thumbnailer
   refresh_caches
-  echo "Installed Omalens to $DEST/bin/omalens"
+  echo "Installed Ommata to $DEST/bin/ommata"
 }
 
 main "$@"

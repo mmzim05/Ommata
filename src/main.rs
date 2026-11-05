@@ -23,12 +23,12 @@ fn main() -> eframe::Result {
     }
     // The updater runs a downloaded AppImage with this to check it works.
     if args.first().is_some_and(|arg| arg == "--version") {
-        println!("omalens {}", update::VERSION);
+        println!("ommata {}", update::VERSION);
         return Ok(());
     }
     let start_path = args.first().map(std::path::PathBuf::from);
     if let Err(error) = ffmpeg_next::init() {
-        eprintln!("omalens: ffmpeg init failed: {error}");
+        eprintln!("ommata: ffmpeg init failed: {error}");
     }
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
 
@@ -38,8 +38,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_app_id("omalens")
-            .with_title("Omalens")
+            .with_app_id("ommata")
+            .with_title("Ommata")
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([360.0, 240.0])
             .with_drag_and_drop(true),
@@ -49,17 +49,17 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "omalens",
+        "ommata",
         options,
         Box::new(move |creation| Ok(Box::new(app::App::new(creation, loader, start)))),
     )
 }
 
-/// `omalens --thumbnail INPUT OUTPUT SIZE`, called by file managers through
-/// the freedesktop thumbnailer spec (see assets/omalens.thumbnailer).
+/// `ommata --thumbnail INPUT OUTPUT SIZE`, called by file managers through
+/// the freedesktop thumbnailer spec (see assets/ommata.thumbnailer).
 fn thumbnail(args: &[std::ffi::OsString]) -> i32 {
     let [input, output, size] = args else {
-        eprintln!("usage: omalens --thumbnail INPUT OUTPUT SIZE");
+        eprintln!("usage: ommata --thumbnail INPUT OUTPUT SIZE");
         return 2;
     };
     let size = size
@@ -69,7 +69,7 @@ fn thumbnail(args: &[std::ffi::OsString]) -> i32 {
     match picture::thumbnail(input.as_ref(), output.as_ref(), size) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("omalens: thumbnail: {error}");
+            eprintln!("ommata: thumbnail: {error}");
             1
         }
     }

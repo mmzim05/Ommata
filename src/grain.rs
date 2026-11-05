@@ -1,4 +1,4 @@
-//! AV1 film grain synthesis (AV1 specification 7.18.3), done by omalens
+//! AV1 film grain synthesis (AV1 specification 7.18.3), done by ommata
 //! instead of the decoder.
 //!
 //! VA-API drivers don't apply film grain reliably (NVIDIA's leaves the

@@ -1,7 +1,7 @@
 //! Tags, rating and colour label for photos and videos, kept in XMP sidecar
 //! files next to them so the media itself is never rewritten. The fields are
 //! the ones digiKam, darktable, Lightroom and exiftool share, so the tags
-//! work without omalens too. Everything else in a sidecar (a darktable edit
+//! work without ommata too. Everything else in a sidecar (a darktable edit
 //! history, digiKam face regions) is copied through byte for byte: only the
 //! five fields below are ever removed or written.
 
@@ -19,9 +19,9 @@ const DIGIKAM: &[u8] = b"http://www.digikam.org/ns/1.0/";
 const XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/";
 const XMLNS: &[u8] = b"http://www.w3.org/2000/xmlns/";
 
-/// What a new sidecar starts as; `x:xmptk` marks it as omalens' own.
+/// What a new sidecar starts as; `x:xmptk` marks it as Ommata's own.
 const TEMPLATE: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="omalens">
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="ommata">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about="">
   </rdf:Description>
@@ -30,7 +30,7 @@ const TEMPLATE: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <?xpacket end="w"?>
 "#;
 
-/// The XMP properties omalens owns.
+/// The XMP properties ommata owns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Field {
     /// `dc:subject`: flat keywords, the tags' last parts.
@@ -90,7 +90,7 @@ pub fn is_internal(tag: &str) -> bool {
     tag.starts_with("darktable/")
 }
 
-/// The sidecar omalens writes for `media`: `name.ext.xmp`, the name digiKam
+/// The sidecar ommata writes for `media`: `name.ext.xmp`, the name digiKam
 /// and darktable use, which keeps a RAW and a JPEG of one shot apart.
 pub fn path_for(media: &Path) -> PathBuf {
     let mut name = media.as_os_str().to_owned();
@@ -122,14 +122,14 @@ pub fn read(media: &Path) -> Meta {
     {
         Ok(meta) => meta,
         Err(error) => {
-            eprintln!("omalens: {}: {error}", sidecar.display());
+            eprintln!("ommata: {}: {error}", sidecar.display());
             Meta::default()
         }
     }
 }
 
 /// Store `meta` for `media`, in its existing sidecar if it has one. A
-/// sidecar omalens created is deleted again once it holds nothing.
+/// sidecar ommata created is deleted again once it holds nothing.
 pub fn write(media: &Path, meta: &Meta) -> Result<(), String> {
     let existing = find(media);
     let text = match &existing {
@@ -309,9 +309,10 @@ fn leaf(tag: &str) -> &str {
 /// A sidecar's text after `update`.
 struct Updated {
     text: String,
-    /// The sidecar is omalens' own (`x:xmptk="omalens"`).
+    /// The sidecar is Ommata's own (`x:xmptk="ommata"`, or `"omalens"`
+    /// from before the rename).
     own: bool,
-    /// It holds properties besides omalens' five.
+    /// It holds properties besides Ommata's five.
     foreign: bool,
 }
 
@@ -368,7 +369,8 @@ fn update(text: &str, meta: &Meta) -> Result<Updated, String> {
                 if local == b"xmpmeta" {
                     own = start.attributes().flatten().any(|attribute| {
                         attribute.key.local_name().into_inner() == b"xmptk"
-                            && attribute.value.starts_with(b"omalens")
+                            && (attribute.value.starts_with(b"ommata")
+                                || attribute.value.starts_with(b"omalens"))
                     });
                 }
                 let is_description = namespace.as_deref() == Some(RDF) && local == b"Description";
@@ -491,7 +493,7 @@ fn update(text: &str, meta: &Meta) -> Result<Updated, String> {
     })
 }
 
-/// Prefixes for the namespaces omalens writes, as usable inside the target
+/// Prefixes for the namespaces ommata writes, as usable inside the target
 /// Description.
 struct Prefixes {
     rdf: String,
@@ -724,7 +726,7 @@ mod tests {
         }
     }
 
-    /// Everything in a sidecar except omalens' five fields, namespace
+    /// Everything in a sidecar except Ommata's five fields, namespace
     /// declarations and indentation: what other apps own.
     fn foreign(text: &str) -> Vec<String> {
         let mut reader = NsReader::from_str(text);
@@ -934,7 +936,7 @@ mod tests {
     /// A scratch folder holding one fake media file.
     fn scratch(name: &str, file: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("omalens-sidecar-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ommata-sidecar-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let media = dir.join(file);
@@ -952,7 +954,7 @@ mod tests {
         assert!(sidecar.is_file());
         assert_eq!(read(&media), tagged);
         write(&media, &Meta::default()).unwrap();
-        assert!(!sidecar.exists(), "an emptied omalens sidecar is removed");
+        assert!(!sidecar.exists(), "an emptied ommata sidecar is removed");
         assert_eq!(std::fs::read(&media).unwrap(), b"media bytes");
         assert_eq!(
             std::fs::metadata(&media).unwrap().modified().unwrap(),
@@ -1037,7 +1039,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// exiv2 (the library digiKam writes with) reads what omalens writes.
+    /// exiv2 (the library digiKam writes with) reads what ommata writes.
     #[test]
     fn exiv2_reads_the_fields() {
         let Ok(output) = std::process::Command::new("exiv2")

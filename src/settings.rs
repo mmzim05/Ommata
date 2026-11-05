@@ -1,5 +1,5 @@
 //! User settings, stored as `key = value` lines in
-//! `$XDG_CONFIG_HOME/omalens/settings.conf`.
+//! `$XDG_CONFIG_HOME/ommata/settings.conf`.
 
 use std::path::PathBuf;
 
@@ -37,19 +37,29 @@ impl Default for Settings {
     }
 }
 
-fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("omalens/settings.conf"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+}
+
+fn path() -> Option<PathBuf> {
+    Some(config_dir()?.join("ommata/settings.conf"))
+}
+
+/// Where versions before the rename to Ommata kept the settings.
+fn old_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("omalens/settings.conf"))
 }
 
 impl Settings {
     /// Read the settings file; missing files and bad values fall back to
     /// the defaults.
     pub fn load() -> Self {
-        path()
-            .and_then(|file| std::fs::read_to_string(file).ok())
+        [path(), old_path()]
+            .into_iter()
+            .flatten()
+            .find_map(|file| std::fs::read_to_string(file).ok())
             .map_or_else(Self::default, |text| Self::parse(&text))
     }
 

@@ -1,5 +1,5 @@
 [package]
-name = "omalens"
+name = "ommata"
 version = "0.3.1"
 edition = "2024"
 description = "Fast unified image and video viewer with crop and trim"
@@ -11,10 +11,10 @@ license = "GPL-3.0-or-later"
 publish = false
 allow-branch = ["main"]
 pre-release-commit-message = "Release {{version}}"
-tag-message = "Omalens {{version}}"
+tag-message = "Ommata {{version}}"
 pre-release-replacements = [
   { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
-  { file = "CHANGELOG.md", search = "\\[Unreleased\\]: .*", replace = "[Unreleased]: https://github.com/mmzim05/Omalens/compare/{{tag_name}}...HEAD\n[{{version}}]: https://github.com/mmzim05/Omalens/releases/tag/{{tag_name}}", exactly = 1 },
+  { file = "CHANGELOG.md", search = "\\[Unreleased\\]: .*", replace = "[Unreleased]: https://github.com/mmzim05/Ommata/compare/{{tag_name}}...HEAD\n[{{version}}]: https://github.com/mmzim05/Ommata/releases/tag/{{tag_name}}", exactly = 1 },
 ]
 
 [dependencies]

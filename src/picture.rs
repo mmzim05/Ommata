@@ -40,7 +40,7 @@ fn read_raw(path: &Path, full: bool) -> Result<Read, String> {
             .ok()
             .flatten()
             .or_else(|| decoder.preview_image(&src, &params).ok().flatten())?;
-        // DNGs carry at most a 1024 px preview (omalens' own saves among
+        // DNGs carry at most a 1024 px preview (Ommata's own saves among
         // them): too soft to view, so those develop instead.
         let long = image.width().max(image.height());
         (ext(path) != "dng" || long > 1024).then_some(image)
@@ -457,7 +457,7 @@ fn save_dng(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
         ));
     }
     // The preview is the camera's own full-size JPEG, cropped like the RAW,
-    // so viewers that show it (omalens among them) keep the camera's colour
+    // so viewers that show it (ommata among them) keep the camera's colour
     // and tone; a plain develop only when the camera embedded none.
     let camera = decoder
         .full_image(&source, &params)
@@ -536,7 +536,7 @@ fn save_dng(src: &Path, dst: &Path, edit: &Edit) -> Result<(), String> {
         dng.xpacket(&xmp).map_err(text)?;
     }
     dng.root_ifd_mut()
-        .add_tag(TiffCommonTag::Software, format!("Omalens {}", env!("CARGO_PKG_VERSION")));
+        .add_tag(TiffCommonTag::Software, format!("Ommata {}", env!("CARGO_PKG_VERSION")));
     // Maker notes are copied only when the camera marks them safe to move.
     let safe = decoder
         .ifd(WellKnownIFD::VirtualDngRootTags)
@@ -744,12 +744,12 @@ mod turn_tests {
 #[cfg(test)]
 mod raw_tests {
     /// A cropped, turned DNG develops to the same picture as the edit applied
-    /// to the original: OMALENS_TEST_RAW=photo.rw2 cargo test --release dng -- --ignored
-    /// (OMALENS_TEST_DNG_OUT=out.dng keeps the DNG to look at.)
+    /// to the original: OMMATA_TEST_RAW=photo.rw2 cargo test --release dng -- --ignored
+    /// (OMMATA_TEST_DNG_OUT=out.dng keeps the DNG to look at.)
     #[test]
     #[ignore]
     fn dng_keeps_crop_and_turn() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_RAW").unwrap());
         let edit = super::Edit {
             turns: 1,
             flip: true,
@@ -758,9 +758,9 @@ mod raw_tests {
                 eframe::egui::pos2(0.7, 0.9),
             )),
         };
-        let dst = std::env::var("OMALENS_TEST_DNG_OUT")
+        let dst = std::env::var("OMMATA_TEST_DNG_OUT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("omalens-test.dng"));
+            .unwrap_or_else(|_| std::env::temp_dir().join("ommata-test.dng"));
         let started = std::time::Instant::now();
         super::save(&path, &dst, &edit).unwrap();
         eprintln!("saved DNG in {:?}", started.elapsed());
@@ -791,16 +791,16 @@ mod raw_tests {
         assert!(mean < 6.0, "DNG differs by {mean:.2} on average");
         let (preview, _, _) = super::read(&dst, false).unwrap();
         eprintln!("display {}x{}", preview.width(), preview.height());
-        if std::env::var_os("OMALENS_TEST_DNG_OUT").is_none() {
+        if std::env::var_os("OMMATA_TEST_DNG_OUT").is_none() {
             let _ = std::fs::remove_file(&dst);
         }
     }
 
-    /// Display decode time for any image: OMALENS_TEST_IMAGE=x.jpg cargo test image_decode -- --ignored
+    /// Display decode time for any image: OMMATA_TEST_IMAGE=x.jpg cargo test image_decode -- --ignored
     #[test]
     #[ignore]
     fn image_decode_time() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_IMAGE").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_IMAGE").unwrap());
         for _ in 0..3 {
             let started = std::time::Instant::now();
             let decoded = super::decode(&path, 8192).unwrap();
@@ -810,11 +810,11 @@ mod raw_tests {
 
     /// The half-size display develop matches the full develop, scaled down.
     /// Needs a large RAW without an embedded preview (Olympus, Samsung...):
-    /// OMALENS_TEST_RAW=photo.orf cargo test --release half_develop -- --ignored
+    /// OMMATA_TEST_RAW=photo.orf cargo test --release half_develop -- --ignored
     #[test]
     #[ignore]
     fn half_develop_matches_full() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_RAW").unwrap());
         let started = std::time::Instant::now();
         let (half, _, _) = super::read(&path, false).unwrap();
         let half_time = started.elapsed();
@@ -841,11 +841,11 @@ mod raw_tests {
         assert!(mean < 4.0, "half develop differs by {mean:.2} on average");
     }
 
-    /// Needs a real RAW file: OMALENS_TEST_RAW=photo.rw2 cargo test -- --ignored
+    /// Needs a real RAW file: OMMATA_TEST_RAW=photo.rw2 cargo test -- --ignored
     #[test]
     #[ignore]
     fn raw_preview_and_develop() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_RAW").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_RAW").unwrap());
         let started = std::time::Instant::now();
         let decoded = super::decode(&path, 8192).unwrap();
         eprintln!("preview {:?} in {:?}", decoded.size, started.elapsed());

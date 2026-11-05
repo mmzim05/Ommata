@@ -40,11 +40,11 @@ impl Preview {
             .name("preview".into())
             .spawn(move || {
                 if let Err(error) = run(&path, &thread_request, &sender, &ctx) {
-                    eprintln!("omalens: preview {}: {error}", path.display());
+                    eprintln!("ommata: preview {}: {error}", path.display());
                 }
             });
         if let Err(error) = spawned {
-            eprintln!("omalens: preview thread: {error}");
+            eprintln!("ommata: preview thread: {error}");
         }
         Self {
             request,
@@ -177,11 +177,11 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    /// OMALENS_TEST_VIDEO=clip.mp4 cargo test hover_ -- --ignored
+    /// OMMATA_TEST_VIDEO=clip.mp4 cargo test hover_ -- --ignored
     #[test]
     #[ignore]
     fn hover_thumbnails() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_VIDEO").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_VIDEO").unwrap());
         ffmpeg_next::init().unwrap();
         let ctx = eframe::egui::Context::default();
         let mut preview = super::Preview::spawn(path, ctx.clone());

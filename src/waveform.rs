@@ -35,7 +35,7 @@ impl Waveform {
                 ctx.request_repaint();
             });
         if let Err(error) = spawned {
-            eprintln!("omalens: waveform thread: {error}");
+            eprintln!("ommata: waveform thread: {error}");
             waveform.none.store(true, Relaxed);
             waveform.done.store(true, Relaxed);
         }

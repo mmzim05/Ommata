@@ -1,4 +1,4 @@
-# omalens: plan
+# ommata: plan
 
 ## Goal
 

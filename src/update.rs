@@ -1,5 +1,5 @@
 //! Updates from GitHub releases and problem reports to GitHub issues. Both go
-//! through `curl` and `xdg-open`, which every desktop Linux has, so omalens
+//! through `curl` and `xdg-open`, which every desktop Linux has, so ommata
 //! carries no HTTP or TLS code of its own.
 //!
 //! The newest version comes from where `releases/latest` redirects to, at
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPO: &str = "https://github.com/mmzim05/Omalens";
+const REPO: &str = "https://github.com/mmzim05/Ommata";
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where the update stands.
@@ -219,7 +219,7 @@ fn check_mark() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
-    Some(dir.join("omalens/update-check"))
+    Some(dir.join("ommata/update-check"))
 }
 
 /// Whether a day has passed since the last successful check.
@@ -270,7 +270,7 @@ fn is_newer(version: &str, than: &str) -> bool {
 /// Download `version` next to `appimage`, check it starts, then rename it
 /// over `appimage`. The running instance keeps its open copy until it quits.
 fn replace_appimage(appimage: &Path, version: &str) -> Result<(), String> {
-    let url = format!("{REPO}/releases/download/v{version}/omalens-{version}-x86_64.AppImage");
+    let url = format!("{REPO}/releases/download/v{version}/ommata-{version}-x86_64.AppImage");
     let mut download = appimage.as_os_str().to_owned();
     download.push(".new");
     let download = PathBuf::from(download);
@@ -292,9 +292,9 @@ fn replace_appimage(appimage: &Path, version: &str) -> Result<(), String> {
             .output()
             .map_err(|error| format!("the new version doesn't start: {error}"))?;
         let reported = String::from_utf8_lossy(&output.stdout);
-        if reported.trim() != format!("omalens {version}") {
+        if reported.trim() != format!("ommata {version}") {
             return Err(format!(
-                "the download reports {:?}, not omalens {version}",
+                "the download reports {:?}, not ommata {version}",
                 reported.trim()
             ));
         }
@@ -331,11 +331,11 @@ mod tests {
 #[cfg(test)]
 mod network_tests {
     /// Downloads a real release over a scratch file:
-    /// OMALENS_TEST_UPDATE=/tmp/x.AppImage cargo test -- --ignored replaces
+    /// OMMATA_TEST_UPDATE=/tmp/x.AppImage cargo test -- --ignored replaces
     #[test]
     #[ignore]
     fn replaces_appimage_with_release() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_UPDATE").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_UPDATE").unwrap());
         std::fs::write(&path, "old").unwrap();
         let latest = super::latest_version().unwrap();
         super::replace_appimage(&path, &latest).unwrap();

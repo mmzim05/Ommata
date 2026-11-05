@@ -443,7 +443,7 @@ impl Player {
             .name("decode".into())
             .spawn(move || {
                 if let Err(error) = decode(&path, &thread_shared, &thread_ctx, use_gpu) {
-                    eprintln!("omalens: decode {}: {error}", path.display());
+                    eprintln!("ommata: decode {}: {error}", path.display());
                     let mut state = lock(&thread_shared.state);
                     if state.info.is_none() {
                         state.info = Some(Err(error.to_string()));
@@ -775,7 +775,7 @@ impl Player {
     /// Give up on the GPU path for this file: the decoder switches to copying
     /// frames into system memory and the current position is decoded again.
     fn gpu_failed(&mut self, gpu: Option<&mut Gpu>, error: &str) {
-        eprintln!("omalens: GPU video path failed, using the CPU: {error}");
+        eprintln!("ommata: GPU video path failed, using the CPU: {error}");
         if let Some(gpu) = gpu {
             gpu.failed = true;
         }
@@ -835,7 +835,7 @@ impl Drop for Player {
 /// silently, clocked by the wall clock.
 fn start_audio(shared: &Arc<Shared>, rate: u32) -> Option<cpal::Stream> {
     let Some(device) = cpal::default_host().default_output_device() else {
-        eprintln!("omalens: audio: no output device");
+        eprintln!("ommata: audio: no output device");
         return None;
     };
     let config = cpal::StreamConfig {
@@ -848,14 +848,14 @@ fn start_audio(shared: &Arc<Shared>, rate: u32) -> Option<cpal::Stream> {
         .build_output_stream(
             config,
             move |out: &mut [f32], _| shared.audio.fill(out),
-            |error| eprintln!("omalens: audio: {error}"),
+            |error| eprintln!("ommata: audio: {error}"),
             None,
         )
-        .inspect_err(|error| eprintln!("omalens: audio: {error}"))
+        .inspect_err(|error| eprintln!("ommata: audio: {error}"))
         .ok()?;
     stream
         .play()
-        .inspect_err(|error| eprintln!("omalens: audio: {error}"))
+        .inspect_err(|error| eprintln!("ommata: audio: {error}"))
         .ok()?;
     Some(stream)
 }
@@ -921,7 +921,7 @@ impl Drop for Scaler {
 fn seek_to(input: &mut ff::format::context::Input, time: f64, start_offset: f64) {
     let target = ((time + start_offset) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
     if let Err(error) = input.seek(target, ..target) {
-        eprintln!("omalens: seek to {time:.3}: {error}");
+        eprintln!("ommata: seek to {time:.3}: {error}");
     }
 }
 
@@ -1552,7 +1552,7 @@ mod tests {
     use std::cell::RefCell;
 
     thread_local! {
-        /// GPU path for this test thread, with OMALENS_TEST_GPU=1.
+        /// GPU path for this test thread, with OMMATA_TEST_GPU=1.
         static GPU: RefCell<Option<(headless::Context, Gpu)>> = const { RefCell::new(None) };
     }
 
@@ -1560,11 +1560,11 @@ mod tests {
         GPU.with_borrow_mut(|gpu| player.update(ctx, gpu.as_mut().map(|(_, gpu)| gpu)));
     }
 
-    /// Decodes a first frame headlessly: OMALENS_TEST_VIDEO=a.webm cargo test first_frame -- --ignored
+    /// Decodes a first frame headlessly: OMMATA_TEST_VIDEO=a.webm cargo test first_frame -- --ignored
     #[test]
     #[ignore]
     fn first_frame() {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_VIDEO").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_VIDEO").unwrap());
         ffmpeg_next::init().unwrap();
         let ctx = eframe::egui::Context::default();
         let mut player = super::Player::open(path, &ctx, None);
@@ -1588,10 +1588,10 @@ mod tests {
     }
 
     fn open_test_player() -> (eframe::egui::Context, super::Player) {
-        let path = std::path::PathBuf::from(std::env::var("OMALENS_TEST_VIDEO").unwrap());
+        let path = std::path::PathBuf::from(std::env::var("OMMATA_TEST_VIDEO").unwrap());
         ffmpeg_next::init().unwrap();
         let ctx = eframe::egui::Context::default();
-        if std::env::var_os("OMALENS_TEST_GPU").is_some() {
+        if std::env::var_os("OMMATA_TEST_GPU").is_some() {
             let (context, gl) = headless::context();
             let mut gpu = Gpu::new(gl).expect("GPU video path");
             gpu.register(|_| eframe::egui::TextureId::User(0));
@@ -1613,8 +1613,8 @@ mod tests {
     }
 
     /// The frame shown after an exact seek is the one FFmpeg decodes for that
-    /// time, with matching colours (GPU path with OMALENS_TEST_GPU=1).
-    /// OMALENS_TEST_VIDEO=clip.mp4 cargo test --release seek_frame -- --ignored --nocapture
+    /// time, with matching colours (GPU path with OMMATA_TEST_GPU=1).
+    /// OMMATA_TEST_VIDEO=clip.mp4 cargo test --release seek_frame -- --ignored --nocapture
     #[test]
     #[ignore]
     fn seek_frame_matches_ffmpeg() {
@@ -1640,7 +1640,7 @@ mod tests {
                 (image.as_raw().to_vec(), size)
             }
         };
-        let path = std::env::var("OMALENS_TEST_VIDEO").unwrap();
+        let path = std::env::var("OMMATA_TEST_VIDEO").unwrap();
         let reference = std::process::Command::new("ffmpeg")
             .args([
                 "-v",
@@ -1655,7 +1655,7 @@ mod tests {
             .unwrap()
             .stdout;
         assert_eq!(reference.len(), pixels.len(), "reference frame size");
-        if let Some(dir) = std::env::var_os("OMALENS_TEST_DUMP") {
+        if let Some(dir) = std::env::var_os("OMMATA_TEST_DUMP") {
             let dir = std::path::PathBuf::from(dir);
             std::fs::write(dir.join("gpu.rgba"), &pixels).unwrap();
             std::fs::write(dir.join("cpu.rgba"), &reference).unwrap();
@@ -1775,7 +1775,7 @@ mod tests {
 
     /// Active-drag benchmark: a 60 Hz UI pointer moving like a real trim
     /// session; reports how far the frame on screen trails the pointer.
-    /// OMALENS_TEST_VIDEO=clip.mkv cargo test --release bench_drag -- --ignored --nocapture
+    /// OMMATA_TEST_VIDEO=clip.mkv cargo test --release bench_drag -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bench_drag() {

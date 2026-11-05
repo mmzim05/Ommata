@@ -259,7 +259,7 @@ struct Job {
     handle: JoinHandle<Result<(PathBuf, Option<String>), String>>,
 }
 
-/// The omalens window.
+/// The ommata window.
 pub struct App {
     theme: Theme,
     loader: Loader,
@@ -284,7 +284,7 @@ pub struct App {
     confirm_quit: bool,
     /// The trash confirmation is open, with its "don't ask again" box.
     confirm_trash: Option<bool>,
-    /// Trash without asking until omalens closes, for clearing out a folder.
+    /// Trash without asking until ommata closes, for clearing out a folder.
     trash_without_asking: bool,
     /// Help or Settings, open over everything.
     page: Option<Page>,
@@ -353,7 +353,7 @@ impl App {
             Gpu::new(gl)
                 .inspect(|_| video_decoding = "GPU (VA-API)".into())
                 .inspect_err(|error| {
-                    eprintln!("omalens: video decodes on the CPU: {error}");
+                    eprintln!("ommata: video decodes on the CPU: {error}");
                     video_decoding = format!("CPU ({error})");
                 })
                 .ok()
@@ -572,7 +572,7 @@ impl App {
     fn go(&mut self, ctx: &egui::Context, index: usize) {
         if self.files.is_empty() {
             self.player = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title("Omalens".into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("Ommata".into()));
             return;
         }
         self.index = index.min(self.files.len() - 1);
@@ -607,7 +607,7 @@ impl App {
         }
         self.sync_waveform(ctx);
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Omalens")));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Ommata")));
     }
 
     /// Keep a waveform scan running for the current video while the setting is on.
@@ -742,7 +742,7 @@ impl App {
                     // A RAW saved over as name.dng: its tags move to the DNG.
                     if job.mode == SaveMode::Overwrite && out != job.src {
                         if let Err(error) = sidecar::follow_rename(&job.src, &out) {
-                            eprintln!("omalens: tags of {}: {error}", job.src.display());
+                            eprintln!("ommata: tags of {}: {error}", job.src.display());
                         }
                         if let Some(meta) = self.meta.remove(&job.src) {
                             self.meta.insert(out.clone(), meta);
@@ -988,7 +988,7 @@ impl App {
                 if let Some(sidecar) = sidecar::find(&path)
                     && let Err(error) = trash::delete(&sidecar)
                 {
-                    eprintln!("omalens: trash {}: {error}", sidecar.display());
+                    eprintln!("ommata: trash {}: {error}", sidecar.display());
                 }
                 self.edits.remove(&path);
                 self.trims.remove(&path);
@@ -1419,7 +1419,7 @@ impl App {
         ui.painter().text(
             center - vec2(0.0, 30.0),
             Align2::CENTER_CENTER,
-            "Omalens",
+            "Ommata",
             FontId::proportional(28.0),
             palette.fg,
         );
@@ -2185,7 +2185,7 @@ impl App {
             }
             update::State::Installed(version) => {
                 if accent(ui, "Restart to update".into())
-                    .on_hover_text(format!("Omalens {version} is installed"))
+                    .on_hover_text(format!("Ommata {version} is installed"))
                     .clicked()
                 {
                     self.restart(ctx);
@@ -2315,7 +2315,7 @@ impl App {
         ui: &mut egui::Ui,
         palette: &crate::theme::Palette,
     ) {
-        let version = format!("Omalens {}", update::VERSION);
+        let version = format!("Ommata {}", update::VERSION);
         ui.label(egui::RichText::new(version).size(18.0).strong());
         ui.label(egui::RichText::new(update::install_kind()).color(palette.muted));
         ui.add_space(8.0);
@@ -2347,7 +2347,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.label(
                     egui::RichText::new(format!(
-                        "Omalens {} ({})\n{details}",
+                        "Ommata {} ({})\n{details}",
                         update::VERSION,
                         update::install_kind()
                     ))
@@ -2432,7 +2432,7 @@ impl App {
                 egui::RichText::new("You can restore it from the trash.").color(palette.muted),
             );
             ui.add_space(4.0);
-            hand(ui.checkbox(&mut skip, "Don't ask again until Omalens closes"));
+            hand(ui.checkbox(&mut skip, "Don't ask again until Ommata closes"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {

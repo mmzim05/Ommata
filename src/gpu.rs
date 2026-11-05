@@ -738,7 +738,7 @@ impl Gpu {
         let program = program(&gl, version, FRAGMENT_SHADER)?;
         // Without the grain passes, frames with film grain go to the CPU.
         let grain = GrainPasses::new(&gl, version)
-            .inspect_err(|error| eprintln!("omalens: film grain shader unavailable: {error}"))
+            .inspect_err(|error| eprintln!("ommata: film grain shader unavailable: {error}"))
             .ok();
         // SAFETY: GL calls on the current context with valid arguments.
         unsafe {
