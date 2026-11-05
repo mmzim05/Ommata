@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-05
+
 ### Added
 
 - In-app updates for the AppImage: omalens checks for a new release once a day and
@@ -53,5 +55,6 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/omalens/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mmzim05/omalens/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mmzim05/omalens/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mmzim05/omalens/releases/tag/v0.1.0
