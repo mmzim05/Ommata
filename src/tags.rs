@@ -311,6 +311,7 @@ pub fn panel(
         let field = ui.add(
             egui::TextEdit::singleline(input)
                 .hint_text("New tag, / between levels")
+                .background_color(ui.visuals().widgets.inactive.bg_fill)
                 .desired_width(260.0),
         );
         let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));

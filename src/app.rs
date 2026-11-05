@@ -2892,14 +2892,16 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
     );
     egui::Grid::new("quick-tags")
         .num_columns(4)
-        .spacing([8.0, 4.0])
+        .spacing([8.0, 6.0])
         .show(ui, |ui| {
             for (index, tag) in settings.quick_tags.iter_mut().enumerate() {
                 let key = egui::RichText::new(format!("Alt+{}", index + 1))
                     .monospace()
                     .color(palette.accent);
-                ui.label(key);
-                ui.add(egui::TextEdit::singleline(tag).desired_width(170.0));
+                ui.add_sized([48.0, 24.0], egui::Label::new(key));
+                let fill = ui.visuals().widgets.inactive.bg_fill;
+                let field = egui::TextEdit::singleline(tag).background_color(fill);
+                ui.add_sized([170.0, 24.0], field);
                 if index % 2 == 1 {
                     ui.end_row();
                 }
@@ -2991,8 +2993,8 @@ fn icon_label_button(
 ) -> egui::Response {
     let response = ui.interact(rect, Id::unique(("icon-label", label)), Sense::click());
     let color = if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(8), palette.surface);
+        let fill = ui.visuals().widgets.hovered.weak_bg_fill;
+        ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
         palette.fg
     } else {
         palette.muted
