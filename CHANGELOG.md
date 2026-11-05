@@ -29,6 +29,10 @@ the new version.
 
 - Trimming MP4 and MOV videos is frame-exact in every codec and no longer re-encodes
   anything: saving takes well under half a second instead of several seconds.
+- Interface polish: buttons show hover and the pointing hand, the top bar wraps onto two
+  rows in a narrow window, dragging a photo stops at its edges, zooming out stops just past
+  the window size, the fullscreen button shows its state, and video times show as `m:ss`.
+- The red used for trash and discard is readable in every Omarchy theme.
 
 ### Fixed
 
