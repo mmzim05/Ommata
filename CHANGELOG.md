@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-05
+
 First release.
 
 ### Added
@@ -24,4 +26,5 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/omalens/commits/main
+[Unreleased]: https://github.com/mmzim05/omalens/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/mmzim05/omalens/releases/tag/v0.1.0
