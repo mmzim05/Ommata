@@ -9,8 +9,6 @@
 Open it, look, trim or crop, move on. No library to import into, no separate apps for
 pictures and video.
 
-[![Latest release](https://img.shields.io/github/v/release/mmzim05/omalens?label=release)](https://github.com/mmzim05/omalens/releases/latest)
-[![Licence](https://img.shields.io/github/license/mmzim05/omalens)](LICENSE)
 ![Linux](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
@@ -26,17 +24,7 @@ pictures and video.
 
 Most Linux setups use one app for photos, another for video, and a third (or a terminal
 full of `ffmpeg` flags) to cut a clip. omalens does all three in one window that stays out of
-your way:
-
-- **It opens instantly.** A 100-megapixel JPEG is on screen in about 0.2 seconds, RAW files
-  show the camera's own preview right away, and the next and previous files load in the
-  background before you ask for them.
-- **Video plays on your GPU.** 4K H.264, HEVC, VP9 and AV1 decode on the graphics card and go
-  straight to the screen, so playback stays smooth and your CPU stays quiet.
-- **Edits never cost quality.** Trims copy the original video stream, so saving a trimmed
-  MP4 or MOV takes a fraction of a second and the cut lands on exactly the frame you chose.
-  Photo edits are only applied when you save.
-- **It looks like your desktop.** On [Omarchy](https://omarchy.org) it follows your theme.
+your way.
 
 ## Features
 
