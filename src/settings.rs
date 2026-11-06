@@ -1,14 +1,18 @@
 //! User settings, stored as `key = value` lines in
 //! `$XDG_CONFIG_HOME/ommata/settings.conf`.
 
+use crate::keys::Keymap;
 use std::path::PathBuf;
 
 /// User preferences.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
-    /// Tags toggled with Alt+1 to Alt+9, `/` between levels; empty when unset.
+    /// Tags toggled with 1 to 9 (by default), `/` between levels; empty
+    /// when unset.
     pub quick_tags: [String; 9],
-    /// Look for a new release once a day.
+    /// Keyboard shortcuts.
+    pub keys: Keymap,
+    /// Look for a new release each time ommata starts.
     pub check_updates: bool,
     /// Draw the seek bar as the audio waveform (falls back to a plain bar
     /// when off or when the video has no audio).
@@ -27,6 +31,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             quick_tags: Default::default(),
+            keys: Keymap::default(),
             check_updates: true,
             waveform: true,
             wave_filled: false,
@@ -43,8 +48,13 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
 }
 
+/// `name` in Ommata's config folder.
+pub fn config_file(name: &str) -> Option<PathBuf> {
+    Some(config_dir()?.join("ommata").join(name))
+}
+
 fn path() -> Option<PathBuf> {
-    Some(config_dir()?.join("ommata/settings.conf"))
+    config_file("settings.conf")
 }
 
 /// Where versions before the rename to Ommata kept the settings.
@@ -72,6 +82,9 @@ impl Settings {
             };
             let value = value.trim();
             let key = key.trim();
+            if settings.keys.read_setting(key, value) {
+                continue;
+            }
             if let Some(slot) = key
                 .strip_prefix("quick_tag_")
                 .and_then(|number| number.parse::<usize>().ok())
@@ -132,6 +145,7 @@ impl Settings {
                 self.wave_max,
                 self.wave_smooth
             )
+            + &self.keys.to_settings()
     }
 }
 
@@ -146,6 +160,7 @@ mod tests {
         settings.quick_tags[4] = "Shot/Motion".into();
         settings.check_updates = false;
         settings.wave_filled = true;
+        settings.keys.set(crate::keys::Action::Mute, Vec::new());
         assert_eq!(Settings::parse(&settings.to_text()), settings);
     }
 

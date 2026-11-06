@@ -7,5 +7,5 @@ Exec=ommata %f
 Icon=ommata
 Terminal=false
 Categories=Graphics;Viewer;
-MimeType=image/jpeg;image/png;image/webp;image/gif;image/tiff;image/bmp;image/x-panasonic-rw2;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-fuji-raf;image/x-olympus-orf;image/x-adobe-dng;image/x-pentax-pef;image/x-samsung-srw;video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mp2t;video/x-flv;video/ogg;video/x-ms-wmv;video/mpeg;video/3gpp;video/x-ivf;
+MimeType=image/jpeg;image/png;image/webp;image/gif;image/tiff;image/bmp;image/x-panasonic-rw2;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-fuji-raf;image/x-olympus-orf;image/x-adobe-dng;image/x-pentax-pef;image/x-samsung-srw;image/x-nikon-nrw;image/x-sony-sr2;image/x-sony-srf;image/x-epson-erf;image/x-phaseone-iiq;image/x-kodak-kdc;image/x-kodak-dcr;image/x-minolta-mrw;video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mp2t;video/x-flv;video/ogg;video/x-ms-wmv;video/mpeg;video/3gpp;video/x-ivf;video/matroska;video/x-m4v;
 StartupWMClass=ommata

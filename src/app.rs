@@ -2,7 +2,9 @@
 //! saves (overwrite in place) or saves a copy (`name-edit.ext`).
 
 use crate::gpu::Gpu;
+use crate::keys::{self, Action, Chord, Keymap};
 use crate::library::{self, Kind};
+use crate::media::{self, MediaKeys};
 use crate::picture::{self, Decoded, Edit};
 use crate::settings::Settings;
 use crate::sidecar::{self, Meta};
@@ -26,77 +28,6 @@ use std::time::Duration;
 
 /// Idle time after which the bars fade out and the cursor hides.
 const CHROME_SECS: f64 = 3.0;
-
-/// A titled group of (keys, action) rows in the Keybinds tab.
-type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
-
-/// The keyboard shortcuts listed in Help.
-const SHORTCUTS: [ShortcutGroup; 6] = [
-    (
-        "Browse",
-        &[
-            ("← →", "Previous / next file"),
-            ("Home  End", "First / last file"),
-            ("Del", "Move to trash"),
-            ("F2", "Rename"),
-            ("Ctrl+O", "Open a file"),
-        ],
-    ),
-    (
-        "Video",
-        &[
-            ("Space", "Play / pause"),
-            ("J  L", "Back / forward 5 seconds"),
-            (",  .", "Back / forward one frame"),
-            ("M", "Mute"),
-            ("↑ ↓", "Volume"),
-            ("T", "Trim"),
-            ("I  O", "Set trim start / end"),
-            ("Esc", "Leave trim"),
-        ],
-    ),
-    (
-        "Tags",
-        &[
-            ("Alt+1 – 9", "Quick tag on / off"),
-            ("Ctrl+1 – 5", "Rating (again: clear)"),
-            ("Ctrl+0", "Clear rating"),
-            ("X", "Reject"),
-            ("Ctrl+6 – 9", "Red, yellow, green, blue label"),
-            ("Ctrl+K", "Tag bar"),
-            ("Ctrl+F", "Filter"),
-        ],
-    ),
-    (
-        "Photo",
-        &[
-            ("C", "Crop"),
-            ("1 – 5", "Crop shape, while cropping"),
-            ("Enter", "Apply crop"),
-            ("R  Shift+R", "Rotate right / left"),
-            ("H", "Flip"),
-            ("Esc", "Cancel crop"),
-        ],
-    ),
-    (
-        "View",
-        &[
-            ("Scroll  + -", "Zoom"),
-            ("0  1", "Fit to window / actual size"),
-            ("F", "Fullscreen"),
-            ("?", "Help"),
-        ],
-    ),
-    (
-        "Save",
-        &[
-            ("Ctrl+S", "Save over the original"),
-            ("Ctrl+Shift+S", "Save a copy"),
-            ("Ctrl+Z", "Undo all edits"),
-            ("Ctrl+Q", "Quit"),
-        ],
-    ),
-];
 
 type LoadResult = (PathBuf, Result<Decoded, String>);
 
@@ -238,6 +169,14 @@ enum Page {
     Filter,
 }
 
+/// A key of the Keybinds list waiting for its new key.
+#[derive(Clone, Copy, PartialEq)]
+struct Rebind {
+    action: Action,
+    /// Which of the action's keys to replace; `None` adds one.
+    slot: Option<usize>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum HelpTab {
     Keybinds,
@@ -288,6 +227,8 @@ pub struct App {
     trash_without_asking: bool,
     /// Help or Settings, open over everything.
     page: Option<Page>,
+    /// The Keybinds list is waiting for a key.
+    rebinding: Option<Rebind>,
     /// The new name being typed for the current file.
     rename: Option<Rename>,
     /// Every file in the folder; `files` is the part the filter lets through.
@@ -300,6 +241,8 @@ pub struct App {
     meta_sender: Sender<Vec<(PathBuf, Meta)>>,
     meta_receiver: Receiver<Vec<(PathBuf, Meta)>>,
     filter: Filter,
+    /// Every tag used before, in any folder (see `tags::load_list`).
+    tag_list: std::collections::BTreeSet<String>,
     /// The new tag being typed in the tag bar or Edit tags.
     tag_input: String,
     /// The tag bar under the top bar is shown.
@@ -321,6 +264,12 @@ pub struct App {
     /// Zero-copy video on the window's GL context, when available.
     gpu: Option<Gpu>,
     updater: Updater,
+    /// Media keys over MPRIS, registered when the first video opens.
+    media: Option<MediaKeys>,
+    /// Registering media keys was tried (it fails without a session bus).
+    media_tried: bool,
+    /// The update card was closed with Later.
+    update_card_closed: bool,
     /// The GPU, as GL names it, for problem reports.
     renderer: String,
     /// How video decodes, and why not on the GPU, for problem reports.
@@ -390,6 +339,7 @@ impl App {
             confirm_trash: None,
             trash_without_asking: false,
             page: None,
+            rebinding: None,
             rename: None,
             listing: Vec::new(),
             meta: HashMap::new(),
@@ -397,6 +347,7 @@ impl App {
             meta_sender,
             meta_receiver,
             filter: Filter::default(),
+            tag_list: tags::load_list(),
             tag_input: String::new(),
             tag_bar: false,
             focus_tag_input: false,
@@ -409,6 +360,9 @@ impl App {
             wave_cache: None,
             gpu,
             updater: Updater::new(ctx, check_updates),
+            update_card_closed: false,
+            media: None,
+            media_tried: false,
             renderer,
             video_decoding,
         };
@@ -495,10 +449,33 @@ impl App {
         }
     }
 
+    /// Add `tags` to the tag list, saving it when it grew.
+    fn remember_tags(&mut self, tags: impl IntoIterator<Item = String>) {
+        let before = self.tag_list.len();
+        self.tag_list
+            .extend(tags.into_iter().filter(|tag| !sidecar::is_internal(tag)));
+        if self.tag_list.len() != before
+            && let Err(error) = tags::save_list(&self.tag_list)
+        {
+            eprintln!("ommata: couldn't save the tag list: {error}");
+        }
+    }
+
+    /// The tags to suggest while typing one: the tag list, the folder's
+    /// tags and the quick tags.
+    fn known_tags(&self) -> std::collections::BTreeSet<String> {
+        let quick = self.settings.quick_tags.iter().map(|tag| tags::normalize(tag));
+        let mut known = self.folder_tags();
+        known.extend(self.tag_list.iter().cloned());
+        known.extend(quick.filter(|tag| !tag.is_empty()));
+        known
+    }
+
     /// Store new tags for `path` in its sidecar.
     fn set_meta(&mut self, ctx: &egui::Context, path: &Path, meta: Meta) {
         match sidecar::write(path, &meta) {
             Ok(()) => {
+                self.remember_tags(meta.tags.iter().cloned());
                 self.meta_written.insert(path.to_path_buf());
                 self.meta.insert(path.to_path_buf(), meta);
             }
@@ -516,7 +493,7 @@ impl App {
         self.set_meta(ctx, &path, meta);
     }
 
-    /// Alt+1 to 9: add or remove quick tag `index`.
+    /// Add or remove quick tag `index` (keys 1 to 9 by default).
     fn toggle_quick_tag(&mut self, ctx: &egui::Context, index: usize) {
         let tag = tags::normalize(&self.settings.quick_tags[index]);
         if tag.is_empty() {
@@ -701,6 +678,9 @@ impl App {
                 }
             }
             scanned = true;
+        }
+        if scanned {
+            self.remember_tags(self.folder_tags());
         }
         if scanned && self.filter.is_active() {
             self.apply_filter(ctx, None);
@@ -1199,13 +1179,18 @@ impl App {
     // ---- input --------------------------------------------------------------
 
     fn keys(&mut self, ctx: &egui::Context) {
-        // Ctrl+K closes the tag bar even while its field has the cursor.
-        if self.tag_bar
-            && self.page.is_none()
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, Key::K))
-        {
-            self.tag_bar = false;
-            return;
+        // The tag bar's keys close it even while its field has the cursor.
+        if self.tag_bar && self.page.is_none() {
+            let toggle = self.settings.keys.keys(Action::TagBar);
+            let closed = ctx.input_mut(|input| {
+                toggle
+                    .iter()
+                    .any(|chord| input.consume_key(chord.modifiers(), chord.key))
+            });
+            if closed {
+                self.tag_bar = false;
+                return;
+            }
         }
         if ctx.egui_wants_keyboard_input()
             || self.confirm_quit
@@ -1214,130 +1199,167 @@ impl App {
         {
             return;
         }
-        let (pressed, modifiers) = ctx.input(|input| {
-            let keys: Vec<Key> = input
+        let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|input| {
+            input
                 .events
                 .iter()
                 .filter_map(|event| match event {
                     egui::Event::Key {
-                        key, pressed: true, ..
-                    } => Some(*key),
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
                     _ => None,
                 })
-                .collect();
-            (keys, input.modifiers)
+                .collect()
         });
-        for key in pressed {
-            let command = modifiers.command;
-            let digit = [
-                Key::Num0,
-                Key::Num1,
-                Key::Num2,
-                Key::Num3,
-                Key::Num4,
-                Key::Num5,
-                Key::Num6,
-                Key::Num7,
-                Key::Num8,
-                Key::Num9,
-            ]
-            .iter()
-            .position(|number| *number == key);
-            let has_file = self.current().is_some();
-            match key {
-                _ if has_file
-                    && modifiers.alt
-                    && !command
-                    && digit.is_some_and(|digit| digit > 0) =>
-                {
-                    self.toggle_quick_tag(ctx, digit.unwrap_or(1) - 1);
-                }
-                _ if has_file && command && digit.is_some_and(|digit| digit <= 5) => {
-                    self.rate(ctx, digit.unwrap_or(0) as i8);
-                }
-                _ if has_file && command && digit.is_some_and(|digit| digit >= 6) => {
-                    let label = tags::LABELS[digit.unwrap_or(6) - 6].0;
-                    self.set_label(ctx, label);
-                }
-                Key::X if has_file && !command => self.rate(ctx, -1),
-                Key::K if has_file && command => self.toggle_tag_bar(),
-                Key::F if command => self.page = Some(Page::Filter),
-                Key::S if command && modifiers.shift => self.save(ctx, SaveMode::Copy),
-                Key::S if command => self.save(ctx, SaveMode::Overwrite),
-                Key::O if command => self.open_dialog(ctx),
-                Key::Z if command => self.revert(ctx),
-                Key::Q if command => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Key::ArrowLeft if modifiers.shift => self.seek_by(-5.0),
-                Key::ArrowRight if modifiers.shift => self.seek_by(5.0),
-                Key::ArrowLeft | Key::PageUp => self.step(ctx, -1),
-                Key::ArrowRight | Key::PageDown => self.step(ctx, 1),
-                Key::Home => self.go(ctx, 0),
-                Key::End => self.go(ctx, usize::MAX),
-                Key::Space => self.toggle_play(),
-                Key::Period => self.frame_step(1),
-                Key::Comma => self.frame_step(-1),
-                Key::J => self.seek_by(-5.0),
-                Key::L => self.seek_by(5.0),
-                Key::M => {
-                    if let Some((_, player)) = &mut self.player {
-                        player.muted = !player.muted;
-                    }
-                }
-                Key::ArrowUp | Key::ArrowDown => {
-                    if let Some((_, player)) = &mut self.player {
-                        let change = if key == Key::ArrowUp { 0.05 } else { -0.05 };
-                        player.volume = (player.volume + change).clamp(0.0, 1.0);
-                        player.muted = false;
-                    }
-                }
-                Key::F | Key::F11 => toggle_fullscreen(ctx),
-                Key::Questionmark | Key::F1 => self.page = Some(Page::Help(HelpTab::Keybinds)),
-                Key::Escape => {
-                    if self.crop.is_some() {
-                        self.crop = None;
-                    } else if self.trim_mode {
-                        self.toggle_trim();
-                    } else if self.tag_bar {
-                        self.tag_bar = false;
-                    } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
-                        toggle_fullscreen(ctx);
-                    }
-                }
-                Key::Enter if self.crop.is_some() => self.apply_crop(),
-                Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5
-                    if self.crop.is_some() =>
-                {
-                    let index = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
-                        .iter()
-                        .position(|number| *number == key)
-                        .unwrap_or(0);
-                    self.set_crop_aspect(ASPECTS[index].1);
-                }
-                Key::Delete => self.ask_trash(ctx),
-                Key::F2 => self.start_rename(),
-                Key::C if self.crop.is_some() => self.apply_crop(),
-                Key::C => self.start_crop(),
-                Key::R => self.rotate(!modifiers.shift),
-                Key::H => self.flip(),
-                Key::T => self.toggle_trim(),
-                Key::I | Key::O => {
-                    if let Some((_, player)) = &self.player {
-                        let position = player.position;
-                        self.set_trim_point(key == Key::I, position, true);
-                    }
-                }
-                Key::Num0 => {
-                    self.zoom = None;
-                    self.pan = Vec2::ZERO;
-                }
-                Key::Num1 => {
-                    self.zoom = Some(1.0);
-                    self.pan = Vec2::ZERO;
-                }
-                Key::Plus | Key::Equals => self.zoom_by(1.25),
-                Key::Minus => self.zoom_by(0.8),
-                _ => {}
+        for (key, modifiers) in pressed {
+            if self.mode_key(ctx, key, modifiers) {
+                continue;
             }
+            if let Some(action) = self.settings.keys.action(Chord::pressed(key, modifiers)) {
+                self.run(ctx, action);
+            }
+        }
+    }
+
+    /// The keys that depend on what is going on rather than on the keymap:
+    /// Esc, and Enter and 1 to 5 while cropping. Returns whether `key` was one.
+    fn mode_key(&mut self, ctx: &egui::Context, key: Key, modifiers: egui::Modifiers) -> bool {
+        let plain = modifiers.is_none();
+        match key {
+            Key::Escape => {
+                if self.crop.is_some() {
+                    self.crop = None;
+                } else if self.trim_mode {
+                    self.toggle_trim();
+                } else if self.tag_bar {
+                    self.tag_bar = false;
+                } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
+                    toggle_fullscreen(ctx);
+                }
+            }
+            Key::Enter if plain && self.crop.is_some() => self.apply_crop(),
+            _ if plain && self.crop.is_some() && keys::DIGITS[1..=5].contains(&key) => {
+                let index = keys::DIGITS[1..=5]
+                    .iter()
+                    .position(|number| *number == key)
+                    .unwrap_or(0);
+                self.set_crop_aspect(ASPECTS[index].1);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Do what `action`'s key does.
+    fn run(&mut self, ctx: &egui::Context, action: Action) {
+        let has_file = self.current().is_some();
+        match action {
+            Action::QuickTag(index) if has_file => self.toggle_quick_tag(ctx, usize::from(index)),
+            Action::Rate(stars) if has_file => self.rate(ctx, stars as i8),
+            Action::Reject if has_file => self.rate(ctx, -1),
+            Action::Label(index) if has_file => {
+                let label = tags::LABELS[usize::from(index)].0;
+                self.set_label(ctx, label);
+            }
+            Action::TagBar if has_file => self.toggle_tag_bar(),
+            Action::QuickTag(_)
+            | Action::Rate(_)
+            | Action::Reject
+            | Action::Label(_)
+            | Action::TagBar => {}
+            Action::Filter => self.page = Some(Page::Filter),
+            Action::Save => self.save(ctx, SaveMode::Overwrite),
+            Action::SaveCopy => self.save(ctx, SaveMode::Copy),
+            Action::Open => self.open_dialog(ctx),
+            Action::Revert => self.revert(ctx),
+            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Back => self.seek_by(-5.0),
+            Action::Forward => self.seek_by(5.0),
+            Action::Previous => self.step(ctx, -1),
+            Action::Next => self.step(ctx, 1),
+            Action::First => self.go(ctx, 0),
+            Action::Last => self.go(ctx, usize::MAX),
+            Action::PlayPause => self.toggle_play(),
+            Action::FrameForward => self.frame_step(1),
+            Action::FrameBack => self.frame_step(-1),
+            Action::Mute => {
+                if let Some((_, player)) = &mut self.player {
+                    player.muted = !player.muted;
+                }
+            }
+            Action::VolumeUp | Action::VolumeDown => {
+                if let Some((_, player)) = &mut self.player {
+                    let change = if action == Action::VolumeUp { 0.05 } else { -0.05 };
+                    player.volume = (player.volume + change).clamp(0.0, 1.0);
+                    player.muted = false;
+                }
+            }
+            Action::Fullscreen => toggle_fullscreen(ctx),
+            Action::Help => self.page = Some(Page::Help(HelpTab::Keybinds)),
+            Action::Trash => self.ask_trash(ctx),
+            Action::Rename => self.start_rename(),
+            Action::Crop if self.crop.is_some() => self.apply_crop(),
+            Action::Crop => self.start_crop(),
+            Action::RotateRight => self.rotate(true),
+            Action::RotateLeft => self.rotate(false),
+            Action::Flip => self.flip(),
+            Action::Trim => self.toggle_trim(),
+            Action::TrimStart | Action::TrimEnd => {
+                if let Some((_, player)) = &self.player {
+                    let position = player.position;
+                    self.set_trim_point(action == Action::TrimStart, position, true);
+                }
+            }
+            Action::Fit => {
+                self.zoom = None;
+                self.pan = Vec2::ZERO;
+            }
+            Action::ActualSize => {
+                self.zoom = Some(1.0);
+                self.pan = Vec2::ZERO;
+            }
+            Action::ZoomIn => self.zoom_by(1.25),
+            Action::ZoomOut => self.zoom_by(0.8),
+        }
+    }
+
+    /// Act on media keys, and show the desktop what is playing.
+    fn media_keys(&mut self, ctx: &egui::Context) {
+        if self.media.is_none() && self.player.is_some() && !self.media_tried {
+            self.media_tried = true;
+            self.media = MediaKeys::new(ctx);
+        }
+        let Some(keys) = &self.media else {
+            return;
+        };
+        for request in keys.requests() {
+            let paused = self.player.as_ref().map(|(_, player)| player.paused);
+            match request {
+                media::Request::Play if paused == Some(true) => self.toggle_play(),
+                media::Request::Pause if paused == Some(false) => self.toggle_play(),
+                media::Request::PlayPause => self.toggle_play(),
+                media::Request::Next => self.step(ctx, 1),
+                media::Request::Previous => self.step(ctx, -1),
+                media::Request::SeekBy(seconds) => self.seek_by(seconds),
+                media::Request::SeekTo(time) => {
+                    if let Some((_, player)) = &mut self.player {
+                        player.seek(time, true);
+                    }
+                }
+                media::Request::Play | media::Request::Pause => {}
+            }
+        }
+        let now = self.player.as_ref().map(|(path, player)| media::Now {
+            title: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            duration: player.duration(),
+            playing: !player.paused,
+            position: player.position,
+        });
+        if let Some(keys) = &mut self.media {
+            keys.show(now.as_ref());
         }
     }
 
@@ -1827,12 +1849,13 @@ impl App {
         let mut input = std::mem::take(&mut self.tag_input);
         let focus = std::mem::take(&mut self.focus_tag_input);
         let mut result = (false, false);
+        let known = self.known_tags();
         egui::Area::new(Id::unique("tag bar"))
             .anchor(Align2::CENTER_TOP, vec2(0.0, top + 6.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
                 bar_frame(&palette).show(ui, |ui| {
-                    result = tags::bar(ui, &mut meta, &mut input, focus, &palette);
+                    result = tags::bar(ui, &mut meta, &mut input, focus, &known, &palette);
                 });
             });
         self.tag_input = input;
@@ -2271,11 +2294,37 @@ impl App {
         let current = self.current().cloned();
         let known = self.folder_tags();
         let mut meta = current.as_deref().map(|path| self.meta_of(path));
-        let mut meta_changed = false;
+        let mut panel_change = None;
+        let mut make_default = false;
         let mut filter = self.filter.clone();
         let mut filter_changed = false;
         let count = self.filter_count();
         let mut tag_input = std::mem::take(&mut self.tag_input);
+        let mut rebinding = self.rebinding.filter(|_| page == Page::Help(HelpTab::Keybinds));
+        if let Some(rebind) = rebinding
+            && let Some((key, modifiers)) = take_key_press(ctx)
+        {
+            rebinding = None;
+            // Esc cancels; it can't be a shortcut, since it leaves modes.
+            if key != Key::Escape {
+                let chord = Chord::pressed(key, modifiers);
+                let mut keys = new_settings.keys.keys(rebind.action);
+                match rebind.slot {
+                    Some(index) if index < keys.len() => keys[index] = chord,
+                    _ => keys.push(chord),
+                }
+                let mut unique = Vec::new();
+                for key in keys {
+                    if !unique.contains(&key) {
+                        unique.push(key);
+                    }
+                }
+                let lost = new_settings.keys.set(rebind.action, unique);
+                if let Some(other) = lost.first() {
+                    self.notify(ctx, format!("{chord} no longer does {}", other.label()));
+                }
+            }
+        }
         let modal = modal("page", ctx, &palette).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
@@ -2300,14 +2349,21 @@ impl App {
             });
             ui.add_space(4.0);
             match page {
-                Page::Settings => settings_ui(ui, &mut new_settings, &palette),
+                Page::Settings => {
+                    let height = (ctx.content_rect().height() - 160.0).max(120.0);
+                    egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                        make_default = settings_ui(ui, &mut new_settings, &palette);
+                    });
+                }
                 Page::Tags => match meta.as_mut() {
                     Some(meta) => {
-                        meta_changed = tags::panel(
+                        panel_change = tags::panel(
                             ui,
                             meta,
                             &known,
+                            &self.tag_list,
                             &settings.quick_tags,
+                            &quick_tag_keys(&settings.keys),
                             &mut tag_input,
                             &palette,
                         );
@@ -2333,7 +2389,9 @@ impl App {
                     });
                     ui.separator();
                     match tab {
-                        HelpTab::Keybinds => shortcuts_ui(ui, &palette),
+                        HelpTab::Keybinds => {
+                            keybinds_ui(ui, &mut new_settings.keys, &mut rebinding, &palette);
+                        }
                         HelpTab::Version => self.version_ui(ctx, ui, &palette),
                         HelpTab::Report => self.report_ui(ctx, ui, &palette),
                     }
@@ -2341,9 +2399,27 @@ impl App {
             }
         });
         self.page = if modal.should_close() { None } else { next };
+        self.rebinding = rebinding.filter(|_| self.page == Some(Page::Help(HelpTab::Keybinds)));
         self.tag_input = tag_input;
-        if meta_changed && let (Some(path), Some(meta)) = (current, meta) {
-            self.set_meta(ctx, &path, meta);
+        if make_default {
+            match crate::desktop::make_default() {
+                Ok(count) => self.notify(ctx, format!("Ommata now opens {count} photo and video types")),
+                Err(error) => self.notify(ctx, format!("Couldn't make Ommata the default: {error}")),
+            }
+        }
+        match panel_change {
+            Some(tags::PanelChange::Tags) => {
+                if let (Some(path), Some(meta)) = (current, meta) {
+                    self.set_meta(ctx, &path, meta);
+                }
+            }
+            Some(tags::PanelChange::Forget(tag)) => {
+                self.tag_list.remove(&tag);
+                if let Err(error) = tags::save_list(&self.tag_list) {
+                    self.notify(ctx, format!("Couldn't save the tag list: {error}"));
+                }
+            }
+            None => {}
         }
         if filter_changed {
             self.filter = filter;
@@ -2441,6 +2517,53 @@ impl App {
         }
     }
 
+    /// A card in the corner while an update is out, from the moment the
+    /// window opens, until it is installed or closed with Later.
+    fn update_card(&mut self, ctx: &egui::Context) {
+        let version = match self.updater.state() {
+            update::State::Available(version)
+            | update::State::Downloading(version)
+            | update::State::Installed(version)
+            | update::State::Failed(version, _) => version,
+            _ => return,
+        };
+        if self.update_card_closed || self.page.is_some() {
+            return;
+        }
+        let palette = self.theme.palette;
+        let offset = if self.player.is_some() { -84.0 } else { -24.0 };
+        egui::Area::new(Id::unique("update card"))
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, offset))
+            .show(ctx, |ui| {
+                bar_frame(&palette).show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Update available").strong());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Ommata {version} is out."))
+                                .color(palette.muted),
+                        )
+                        .extend(),
+                    );
+                    ui.horizontal(|ui| {
+                        self.update_controls(ctx, ui, &palette, false);
+                        // Without an AppImage, the button above already opens
+                        // the release page.
+                        if update::appimage().is_some()
+                            && hand(ui.button("What's new")).clicked()
+                            && let Err(error) = update::open_url(&update::release_url(&version))
+                        {
+                            self.notify(ctx, error);
+                        }
+                        if hand(ui.button("Later")).clicked() {
+                            self.update_card_closed = true;
+                        }
+                    });
+                    ui.add_space(2.0);
+                });
+            });
+    }
+
     fn toast(&mut self, ctx: &egui::Context) {
         let Some((message, until)) = &self.toast else {
             return;
@@ -2453,11 +2576,16 @@ impl App {
         ctx.request_repaint_after(Duration::from_secs_f64(until - now));
         let palette = self.theme.palette;
         let offset = if self.player.is_some() { -84.0 } else { -24.0 };
-        egui::Area::new(Id::unique("toast"))
+        // An area lays out inside last frame's size, so a toast reusing the
+        // area of a shorter one would wrap into it. Each message gets its own
+        // area, sized in an invisible first pass, and the text never wraps.
+        egui::Area::new(Id::unique(("toast", message.as_str())))
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, offset))
             .interactable(false)
             .show(ctx, |ui| {
-                bar_frame(&palette).show(ui, |ui| ui.label(message.as_str()));
+                bar_frame(&palette).show(ui, |ui| {
+                    ui.add(egui::Label::new(message.as_str()).extend());
+                });
             });
     }
 
@@ -2595,6 +2723,8 @@ impl eframe::App for App {
             }
         }
 
+        self.media_keys(&ctx);
+
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, self.theme.palette.bg);
         self.canvas(ui, rect);
@@ -2631,6 +2761,7 @@ impl eframe::App for App {
             }
             self.bottom_bar(&ctx, opacity);
         }
+        self.update_card(&ctx);
         self.toast(&ctx);
         self.quit_dialog(&ctx);
         self.trash_dialog(&ctx);
@@ -2962,12 +3093,26 @@ fn hover_preview(
         });
 }
 
-fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::theme::Palette) {
+/// The Settings page. Returns whether the default-app button was clicked.
+fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::theme::Palette) -> bool {
     ui.spacing_mut().interact_size.y = 20.0;
     ui.spacing_mut().slider_width = 160.0;
+    ui.label(egui::RichText::new("Default app").strong());
+    let make_default = ui
+        .horizontal(|ui| {
+            let clicked = hand(ui.button("Open all photos and videos with Ommata")).clicked();
+            ui.label(
+                egui::RichText::new(format!("{} file types", crate::desktop::mime_types().len()))
+                    .color(palette.muted)
+                    .size(12.0),
+            );
+            clicked
+        })
+        .inner;
+    ui.add_space(10.0);
     ui.label(egui::RichText::new("Quick tags").strong());
     ui.label(
-        egui::RichText::new("Alt and a number adds or removes the tag; / to nest.")
+        egui::RichText::new("Its key adds or removes the tag; / to nest. Change keys in Help.")
             .color(palette.muted)
             .size(12.0),
     );
@@ -2975,8 +3120,9 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
         .num_columns(4)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
+            let names = quick_tag_keys(&settings.keys);
             for (index, tag) in settings.quick_tags.iter_mut().enumerate() {
-                let key = egui::RichText::new(format!("Alt+{}", index + 1))
+                let key = egui::RichText::new(&names[index])
                     .monospace()
                     .color(palette.accent);
                 ui.add_sized([48.0, 24.0], egui::Label::new(key));
@@ -2990,7 +3136,7 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
         });
     ui.add_space(10.0);
     ui.label(egui::RichText::new("Updates").strong());
-    hand(ui.checkbox(&mut settings.check_updates, "Check for updates once a day"));
+    hand(ui.checkbox(&mut settings.check_updates, "Check for updates when Ommata opens"));
     ui.label(
         egui::RichText::new("Asks GitHub for the newest version number; nothing else is sent.")
             .color(palette.muted)
@@ -3028,40 +3174,128 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
                 ui.end_row();
             });
     });
+    make_default
 }
 
-/// Every keyboard shortcut, in two compact columns that each line their
-/// groups up in one grid.
-fn shortcuts_ui(ui: &mut egui::Ui, palette: &crate::theme::Palette) {
-    // Browse, Video and Tags on the left; Photo, View and Save on the right.
-    let (left, right) = SHORTCUTS.split_at(3);
-    ui.columns(2, |columns| {
-        for (column, groups) in columns.iter_mut().zip([left, right]) {
-            column.spacing_mut().interact_size.y = 0.0;
-            egui::Grid::new(groups[0].0)
-                .num_columns(2)
-                .spacing([10.0, 3.0])
-                .show(column, |ui| {
-                    for (index, (group, keys)) in groups.iter().enumerate() {
-                        if index > 0 {
-                            ui.add_space(8.0);
+/// The first key of each quick tag, or a dash when it has none.
+pub(crate) fn quick_tag_keys(keymap: &Keymap) -> [String; 9] {
+    std::array::from_fn(|index| {
+        keymap
+            .keys(Action::QuickTag(index as u8))
+            .first()
+            .map_or("–".to_string(), ToString::to_string)
+    })
+}
+
+/// Every keyboard shortcut, grouped. Clicking a key waits for the new one
+/// (`rebinding`); right-clicking takes it away; + adds another key.
+fn keybinds_ui(
+    ui: &mut egui::Ui,
+    keymap: &mut Keymap,
+    rebinding: &mut Option<Rebind>,
+    palette: &crate::theme::Palette,
+) {
+    ui.label(
+        egui::RichText::new("Click a key to change it, right-click to remove it.")
+            .color(palette.muted)
+            .size(12.0),
+    );
+    // Room for the page's title, tabs and button in a short window.
+    let height = (ui.ctx().content_rect().height() - 280.0).clamp(120.0, 420.0);
+    egui::ScrollArea::vertical()
+        .max_height(height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for group in keys::GROUPS {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(group).size(15.0).color(palette.fg));
+                egui::Grid::new(group)
+                    .num_columns(2)
+                    .spacing([10.0, 3.0])
+                    .min_col_width(200.0)
+                    .show(ui, |ui| {
+                        for action in Action::all().into_iter().filter(|a| a.group() == group) {
+                            ui.label(egui::RichText::new(action.label()).size(12.5));
+                            ui.horizontal(|ui| {
+                                keybind_buttons(ui, keymap, rebinding, action, palette);
+                            });
                             ui.end_row();
                         }
-                        // Headings in the text colour and larger, apart from
-                        // the accent-coloured keys under them.
-                        let heading = egui::RichText::new(*group).size(15.0).color(palette.fg);
-                        ui.label(heading);
-                        ui.end_row();
-                        for (key, action) in *keys {
-                            let key = egui::RichText::new(*key).monospace().size(11.5);
-                            ui.label(key.color(palette.accent));
-                            ui.label(egui::RichText::new(*action).size(12.5));
-                            ui.end_row();
-                        }
-                    }
+                    });
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Fixed").size(15.0).color(palette.fg));
+            for (key, action) in [
+                ("Esc", "Leave crop, trim, the tag bar or fullscreen"),
+                ("Enter", "Apply crop"),
+                ("1 – 5", "Crop shape, while cropping"),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(key).monospace().size(11.5).color(palette.accent));
+                    ui.label(egui::RichText::new(action).size(12.5));
                 });
+            }
+        });
+    ui.add_space(6.0);
+    if ui
+        .add_enabled(!keymap.is_default(), egui::Button::new("Restore default keys"))
+        .clicked()
+    {
+        *keymap = Keymap::default();
+        *rebinding = None;
+    }
+}
+
+/// Take the next key press out of this frame's input, so nothing else
+/// (like Esc closing the window it's typed in) reacts to it.
+fn take_key_press(ctx: &egui::Context) -> Option<(Key, egui::Modifiers)> {
+    ctx.input_mut(|input| {
+        let index = input
+            .events
+            .iter()
+            .position(|event| matches!(event, egui::Event::Key { pressed: true, .. }))?;
+        match input.events.remove(index) {
+            egui::Event::Key { key, modifiers, .. } => Some((key, modifiers)),
+            _ => None,
         }
-    });
+    })
+}
+
+/// The keys of `action` as buttons, and + to add one.
+fn keybind_buttons(
+    ui: &mut egui::Ui,
+    keymap: &mut Keymap,
+    rebinding: &mut Option<Rebind>,
+    action: Action,
+    palette: &crate::theme::Palette,
+) {
+    let keys = keymap.keys(action);
+    let current = *rebinding;
+    let waiting = |slot: Option<usize>| current == Some(Rebind { action, slot });
+    for (index, chord) in keys.iter().enumerate() {
+        let text = if waiting(Some(index)) {
+            egui::RichText::new("Press a key…").color(palette.fg)
+        } else {
+            egui::RichText::new(chord.to_string()).monospace().color(palette.accent)
+        };
+        let button = hand(ui.button(text)).on_hover_text("Click to change, right-click to remove");
+        if button.clicked() {
+            *rebinding = Some(Rebind {
+                action,
+                slot: Some(index),
+            });
+        }
+        if button.secondary_clicked() {
+            let mut kept = keys.clone();
+            kept.remove(index);
+            keymap.set(action, kept);
+            *rebinding = None;
+        }
+    }
+    let add = if waiting(None) { "Press a key…" } else { "+" };
+    if hand(ui.button(add)).on_hover_text("Add a key").clicked() {
+        *rebinding = Some(Rebind { action, slot: None });
+    }
 }
 
 /// A quiet button at `rect`: an icon and a label, muted until hovered.

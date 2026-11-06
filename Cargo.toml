@@ -1,6 +1,6 @@
 [package]
 name = "ommata"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Fast unified image and video viewer with crop and trim"
 license = "GPL-3.0-or-later"
@@ -29,6 +29,7 @@ rawler = "0.8.0"
 libloading = "0.8"
 fast_image_resize = { version = "6.1.0", features = ["image", "rayon"] }
 quick-xml = "0.41"
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
 
 [features]
 # Link the minimal FFmpeg from scripts/build-ffmpeg.sh statically (single binary).

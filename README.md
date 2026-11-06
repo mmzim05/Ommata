@@ -64,7 +64,9 @@ Save over the original (it goes to the trash, not away) or keep a copy.
 Sort a shoot as you step through it: one key adds a tag, rates a clip or rejects it, and
 **Filter** then shows only the files you want. The tag button (`Ctrl+K`) opens a small bar
 under the top bar with the rating, colour labels, a reject button and a field to type new
-tags; **Edit tags** in it is where you remove them. Tags live in XMP sidecar files next to
+tags. While you type, it suggests the tags you have used before, in any folder: `↑` `↓`
+pick one, `Tab` fills it in and `Enter` adds it. **Edit tags** in it is where you remove
+tags, search them all and see every tag you have used. Tags live in XMP sidecar files next to
 your media (`clip.MOV.xmp`), never inside it, and use the same fields as digiKam, darktable,
 Lightroom and exiftool, so they keep working in those apps too. An existing sidecar keeps
 everything else in it, like a darktable edit history.
@@ -74,6 +76,10 @@ everything else in it, like a darktable edit history.
 - **Browse a folder:** step through every photo and video with the arrow keys.
 - **Thumbnails in your file manager,** including RAW files, when installed system-wide.
 - **Controls that get out of the way:** they fade when you stop moving the mouse.
+- **Media keys:** play, pause, next and previous work from your keyboard, `playerctl` and
+  your desktop's player controls.
+- **One click to make it your viewer:** **Open all photos and videos with Ommata** in
+  Settings makes it the default app for every type it opens.
 
 ## Install
 
@@ -90,8 +96,9 @@ chmod +x ommata-*-x86_64.AppImage
 
 To add it to your app menu, open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever).
 
-**Updates:** Ommata checks for a new release once a day. When there is one, an
-**Update** button appears in the top bar: it downloads the new version, and
+**Updates:** Ommata checks for a new release each time it opens. When there is one, a
+card in the corner says so, and an **Update** button in it and in the top bar downloads
+the new version;
 **Restart to update** opens it on the same file. Gear Lever can update it too.
 
 ### From source
@@ -122,10 +129,12 @@ problem. Settings are behind the gear in the top bar, or on the start screen.
 
 ### Keyboard shortcuts
 
+These are the defaults. To change a key, press `?` and click it under **Keybinds**.
+
 | Browse        |                    | View            |                              |
 | ------------- | ------------------ | --------------- | ---------------------------- |
 | `←` `→`       | Previous / next    | Scroll, `+` `-` | Zoom                         |
-| `Home` `End`  | First / last       | `0` / `1`       | Fit to window / actual size  |
+| `Home` `End`  | First / last       | `0` / `Z`       | Fit to window / actual size  |
 | `Del`         | Move to trash      | `F`             | Fullscreen                   |
 | `Ctrl+O`      | Open a file        | `?`             | Help                         |
 | `F2`          | Rename             |                 |                              |
@@ -150,7 +159,7 @@ problem. Settings are behind the gear in the top bar, or on the start screen.
 
 | Tags           |                                            |
 | -------------- | ------------------------------------------ |
-| `Alt+1` – `9`  | Quick tag on or off (set them in Settings) |
+| `1` – `9`      | Quick tag on or off (set them in Settings) |
 | `Ctrl+1` – `5` | Rating; the same rating again clears it    |
 | `Ctrl+0`       | Clear the rating                           |
 | `X`            | Reject                                     |

@@ -2,8 +2,9 @@
 //! through `curl` and `xdg-open`, which every desktop Linux has, so ommata
 //! carries no HTTP or TLS code of its own.
 //!
-//! The newest version comes from where `releases/latest` redirects to, at
-//! most once a day. An AppImage can replace itself: the new AppImage is
+//! The newest version comes from where `releases/latest` redirects to, each
+//! time ommata starts; the last answer is kept, so a known update shows at
+//! once, even offline. An AppImage can replace itself: the new AppImage is
 //! downloaded next to the running one, must start and report the expected
 //! version, and only then takes its place.
 
@@ -11,11 +12,9 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "https://github.com/mmzim05/Ommata";
-const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where the update stands.
 #[derive(Clone, PartialEq, Debug)]
@@ -44,17 +43,42 @@ pub struct Updater {
 }
 
 impl Updater {
-    /// With `automatic`, check in the background when the last check is a
-    /// day old.
+    /// With `automatic`, offer the update the last check found, and check
+    /// again in the background.
     pub fn new(ctx: &egui::Context, automatic: bool) -> Self {
+        let known = check_mark()
+            .and_then(|mark| std::fs::read_to_string(mark).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|latest| is_newer(latest, VERSION));
         let updater = Self {
             state: Arc::new(Mutex::new(State::Unknown)),
             ctx: ctx.clone(),
         };
-        if automatic && check_mark().is_none_or(|mark| check_due(&mark)) {
-            updater.check();
+        match known {
+            Some(latest) if automatic => {
+                updater.set(State::Available(latest));
+                updater.refresh();
+            }
+            _ if automatic => updater.check(),
+            _ => {}
         }
         updater
+    }
+
+    /// Check quietly while the update the last check found is offered; a
+    /// newer one replaces it, unless installing has started.
+    fn refresh(&self) {
+        let thread = self.clone();
+        std::thread::spawn(move || {
+            let Ok(latest) = latest_version() else {
+                return;
+            };
+            remember(&latest);
+            let offered = matches!(thread.state(), State::Available(old) if is_newer(&latest, &old));
+            if offered {
+                thread.set(State::Available(latest));
+            }
+        });
     }
 
     /// Ask GitHub for the newest release now.
@@ -64,12 +88,7 @@ impl Updater {
         std::thread::spawn(move || {
             let state = match latest_version() {
                 Ok(latest) => {
-                    if let Some(mark) = check_mark() {
-                        if let Some(dir) = mark.parent() {
-                            let _ = std::fs::create_dir_all(dir);
-                        }
-                        let _ = std::fs::write(&mark, "");
-                    }
+                    remember(&latest);
                     if is_newer(&latest, VERSION) {
                         State::Available(latest)
                     } else {
@@ -214,7 +233,7 @@ fn encode(text: &str) -> String {
         .collect()
 }
 
-/// The file whose modification time is the last successful check.
+/// The file that keeps the newest version the last check found.
 fn check_mark() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -222,15 +241,14 @@ fn check_mark() -> Option<PathBuf> {
     Some(dir.join("ommata/update-check"))
 }
 
-/// Whether a day has passed since the last successful check.
-fn check_due(mark: &Path) -> bool {
-    std::fs::metadata(mark)
-        .and_then(|meta| meta.modified())
-        .map_or(true, |last| {
-            SystemTime::now()
-                .duration_since(last)
-                .map_or(true, |age| age >= CHECK_EVERY)
-        })
+/// Keep `latest` for the next start.
+fn remember(latest: &str) {
+    if let Some(mark) = check_mark() {
+        if let Some(dir) = mark.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&mark, latest);
+    }
 }
 
 /// The newest release's version, from where `releases/latest` redirects

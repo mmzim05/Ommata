@@ -1,7 +1,10 @@
 mod app;
+mod desktop;
 mod gpu;
 mod grain;
+mod keys;
 mod library;
+mod media;
 mod picture;
 mod preview;
 mod settings;

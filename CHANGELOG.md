@@ -9,6 +9,43 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-05
+
+### Added
+
+- **Open all photos and videos with Ommata** in Settings makes Ommata the default app for
+  every photo, RAW and video type it opens. A copy no app menu knows yet (an AppImage
+  nobody integrated) first gets its own menu entry.
+- Keyboard shortcuts can be changed: press `?` and click a key under **Keybinds** to give
+  it a new one, right-click to remove it, or **+** to add another. Changed keys are kept in
+  `settings.conf`; **Restore default keys** undoes them all.
+- Media keys: play, pause, next, previous and seeking reach Ommata over MPRIS, so the
+  keyboard's media keys, `playerctl` and a bar's player controls work while a video is
+  open.
+- A tag list: every tag you use, in any folder, is remembered in
+  `~/.config/ommata/tags`. Typing a tag in the tag bar suggests the closest ones (fuzzy:
+  `sa` finds `People/Sam`); `↑` `↓` pick, `Tab` fills in, `Enter` adds. In **Edit tags**,
+  typing narrows the tags to the matching ones, and **All tags** lists the ones from other
+  folders (right-click forgets one).
+- When an update is out, a card in the corner says so as soon as Ommata opens, with the
+  **Update** button and **Later**.
+
+### Changed
+
+- Quick tags are on `1` to `9` instead of `Alt+1` to `Alt+9`. Actual size moved from `1`
+  to `Z`; `0` still fits the image to the window.
+- Ommata checks for an update each time it opens instead of once a day, and remembers the
+  newest version it found, so a known update shows at once, even offline.
+- The desktop entry also claims Matroska (`video/matroska`), M4V and the other RAW types
+  Ommata opens (Nikon NRW, Sony SR2 and SRF, Epson, Phase One, Kodak, Minolta).
+
+### Fixed
+
+- A message such as "Tagged Shot/Establishing" is sized to its text: it no longer wraps
+  into the width of the shorter message before it.
+- Settings and the Keybinds list scroll in a short window instead of running off the
+  screen.
+
 ## [0.5.0] - 2026-11-05
 
 ### Changed
@@ -119,7 +156,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.1
 [0.5.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.0
 [0.4.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.4.0
 [0.3.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.3.1

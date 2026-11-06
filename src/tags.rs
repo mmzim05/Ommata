@@ -36,6 +36,87 @@ pub fn normalize(tag: &str) -> String {
         .join("/")
 }
 
+/// How well `tag` matches the typed `query`, higher is better; `None` when
+/// the query's letters don't all appear in the tag, in order. Matches at the
+/// start of a level (`Shot/Action`) or a word, and runs of letters, count
+/// more, so `sa` finds `Shot/Action` before `Seasonal`.
+pub fn fuzzy_score(query: &str, tag: &str) -> Option<u32> {
+    let query: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let tag_lower: Vec<char> = tag.to_lowercase().chars().collect();
+    let mut score = 0;
+    let mut next = 0;
+    let mut previous: Option<usize> = None;
+    for wanted in &query {
+        let found = (next..tag_lower.len()).find(|&index| tag_lower[index] == *wanted)?;
+        let starts_word = found == 0 || matches!(tag_lower[found - 1], '/' | ' ' | '-' | '_');
+        score += 1;
+        if starts_word {
+            score += 8;
+        }
+        if previous == Some(found.wrapping_sub(1)) {
+            score += 5;
+        }
+        previous = Some(found);
+        next = found + 1;
+    }
+    let text: String = query.iter().collect();
+    let lower: String = tag_lower.iter().collect();
+    if lower.split('/').any(|level| level.starts_with(&text)) {
+        score += 30;
+    } else if lower.contains(&text) {
+        score += 15;
+    }
+    Some(score)
+}
+
+/// The best matches for `query` among `known`, leaving out `skip`.
+pub fn suggestions(query: &str, known: &BTreeSet<String>, skip: &BTreeSet<String>) -> Vec<String> {
+    let mut found = ranked(query, known, skip);
+    found.truncate(8);
+    found
+}
+
+/// Every tag of `known` matching `query`, best first, leaving out `skip`.
+pub fn ranked(query: &str, known: &BTreeSet<String>, skip: &BTreeSet<String>) -> Vec<String> {
+    let mut scored: Vec<(u32, &String)> = known
+        .iter()
+        .filter(|tag| !skip.contains(*tag) && !sidecar::is_internal(tag))
+        .filter_map(|tag| fuzzy_score(query, tag).map(|score| (score, tag)))
+        .collect();
+    // Best score first, then the shorter tag, then A to Z.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
+    scored.into_iter().map(|(_, tag)| tag.clone()).collect()
+}
+
+/// Every tag used before, in any folder: the tag list in
+/// `$XDG_CONFIG_HOME/ommata/tags`, one per line.
+pub fn load_list() -> BTreeSet<String> {
+    crate::settings::config_file("tags")
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .map(|text| {
+            text.lines()
+                .map(normalize)
+                .filter(|tag| !tag.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the tag list.
+pub fn save_list(tags: &BTreeSet<String>) -> std::io::Result<()> {
+    let Some(file) = crate::settings::config_file("tags") else {
+        return Ok(());
+    };
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text: String = tags.iter().map(|tag| format!("{tag}\n")).collect();
+    std::fs::write(file, text)
+}
+
 /// Which files the arrow keys step through.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Filter {
@@ -326,18 +407,20 @@ fn bubble(ui: &mut egui::Ui, text: &str, kind: Bubble, palette: &Palette) -> egu
     hand(response)
 }
 
-/// Tag bubbles for `tags` to turn on and off; returns the one clicked.
+/// Tag bubbles for `tags` to turn on and off; returns the one clicked, and
+/// whether with the right button.
 /// `removable`: the tags that are on turn red under the pointer, since a
-/// click removes them from the file. `quick` marks the tags with an
-/// Alt+number key.
-fn chips(
+/// click removes them from the file. `quick` marks the quick tags with their
+/// keys, `quick_keys`.
+fn chips<'a>(
     ui: &mut egui::Ui,
-    tags: &BTreeSet<String>,
+    tags: impl IntoIterator<Item = &'a String>,
     on: impl Fn(&str) -> bool,
     removable: bool,
     quick: &[String; 9],
+    quick_keys: &[String; 9],
     palette: &Palette,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -355,7 +438,7 @@ fn chips(
             let key = quick
                 .iter()
                 .position(|quick| quick == tag)
-                .map(|index| format!("Alt+{}", index + 1));
+                .map(|index| quick_keys[index].clone());
             let tip = match (action, key) {
                 ("", Some(key)) => key,
                 (action, Some(key)) => format!("{action} ({key})"),
@@ -364,7 +447,9 @@ fn chips(
             let chip = bubble(ui, tag, kind, palette);
             let chip = if tip.is_empty() { chip } else { chip.on_hover_text(tip) };
             if chip.clicked() {
-                clicked = Some(tag.clone());
+                clicked = Some((tag.clone(), false));
+            } else if chip.secondary_clicked() {
+                clicked = Some((tag.clone(), true));
             }
         }
     });
@@ -384,6 +469,7 @@ pub fn bar(
     meta: &mut Meta,
     input: &mut String,
     focus: bool,
+    known: &BTreeSet<String>,
     palette: &Palette,
 ) -> (bool, bool) {
     let before = meta.clone();
@@ -406,7 +492,7 @@ pub fn bar(
             meta.rating = if rejected { 0 } else { -1 };
         }
         ui.separator();
-        add_field(ui, meta, input, 180.0, focus);
+        add_field(ui, meta, input, 180.0, focus, Some(known));
         if hand(ui.button("Edit tags"))
             .on_hover_text("Remove tags, or pick from the folder's")
             .clicked()
@@ -417,37 +503,149 @@ pub fn bar(
     (*meta != before, edit)
 }
 
+/// What a tag field's suggestion list remembers between frames.
+#[derive(Clone, Copy, Default)]
+struct SuggestState {
+    /// The suggestion picked with the arrow keys.
+    selected: Option<usize>,
+    /// Where the list was drawn, so a click on it counts although the field
+    /// loses the cursor on the press.
+    list: Option<egui::Rect>,
+}
+
 /// A field that adds the typed tag on Enter and stays focused for the next.
-fn add_field(ui: &mut egui::Ui, meta: &mut Meta, input: &mut String, width: f32, focus: bool) {
+/// With `suggest`, a list under it offers the best matches among those tags
+/// while typing: ↑ ↓ pick one, Tab or a click takes it, Enter adds it.
+fn add_field(
+    ui: &mut egui::Ui,
+    meta: &mut Meta,
+    input: &mut String,
+    width: f32,
+    focus: bool,
+    suggest: Option<&BTreeSet<String>>,
+) {
+    let id = ui.scope_id().with("add tag");
+    let mut state: SuggestState = ui.data(|data| data.get_temp(id)).unwrap_or_default();
+    let found = match suggest {
+        Some(known) if !input.trim().is_empty() => suggestions(input, known, &meta.tags),
+        _ => Vec::new(),
+    };
+    state.selected = state.selected.filter(|index| *index < found.len());
+    let had_focus = ui.memory(|memory| memory.has_focus(id));
+    let mut completed = false;
+    if had_focus && !found.is_empty() {
+        ui.input_mut(|keys| {
+            let count = found.len();
+            if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                state.selected = Some(state.selected.map_or(0, |index| (index + 1) % count));
+            }
+            if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                state.selected = Some(state.selected.map_or(count - 1, |index| {
+                    (index + count - 1) % count
+                }));
+            }
+            if keys.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                *input = found[state.selected.unwrap_or(0)].clone();
+                state.selected = None;
+                completed = true;
+            }
+        });
+    }
     let field = ui.add(
         egui::TextEdit::singleline(input)
+            .id(id)
+            // While suggestions show, Tab takes one instead of moving on.
+            .lock_focus(!found.is_empty())
             .hint_text("Add tag, / to nest")
             .background_color(ui.visuals().widgets.inactive.bg_fill)
             .desired_width(width),
     );
-    if focus {
+    if field.changed() {
+        state.selected = None;
+    }
+    if focus || completed {
         field.request_focus();
+    }
+    if completed {
+        // Tab already moved the cursor on; keep it here, after the tag.
+        if let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), id) {
+            let end = egui::text::CCursor::new(input.chars().count());
+            edit.cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            edit.store(ui.ctx(), id);
+        }
     }
     let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-    let tag = normalize(input);
+    let picked = state.selected.and_then(|index| found.get(index).cloned());
+    let tag = picked.unwrap_or_else(|| normalize(input));
+    let mut added = false;
     if entered && !tag.is_empty() {
         meta.tags.insert(tag);
+        added = true;
+    }
+    // The list stays up while the pointer is on it, so the click that takes
+    // the field's cursor away still lands.
+    let over_list = state.list.is_some_and(|rect| {
+        ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)))
+    });
+    state.list = None;
+    if !added && !found.is_empty() && (field.has_focus() || over_list) {
+        let palette_fg = ui.visuals().text_color();
+        let list = egui::Area::new(id.with("suggestions"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(field.rect.left_bottom() + vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(field.rect.width());
+                    for (index, suggestion) in found.iter().enumerate() {
+                        let selected = state.selected == Some(index);
+                        let text = egui::RichText::new(suggestion).color(palette_fg);
+                        if hand(ui.selectable_label(selected, text)).clicked() {
+                            meta.tags.insert(suggestion.clone());
+                            added = true;
+                        }
+                    }
+                });
+            });
+        state.list = Some(list.response.rect);
+    }
+    if added {
         input.clear();
+        state = SuggestState::default();
         field.request_focus();
     }
+    ui.data_mut(|data| data.insert_temp(id, state));
+}
+
+/// What a click in Edit tags asks for.
+#[derive(PartialEq, Debug)]
+pub enum PanelChange {
+    /// The file's tags changed.
+    Tags,
+    /// Take this tag off the tag list.
+    Forget(String),
 }
 
 /// Edit tags for one file: its tags and the folder's as chips to turn on
-/// and off, and a field to add a new one. Returns whether `meta` changed.
+/// and off, every tag used before under All tags, and a field that adds a
+/// new tag and narrows the chips to the tags matching what is typed.
+#[allow(clippy::too_many_arguments)]
 pub fn panel(
     ui: &mut egui::Ui,
     meta: &mut Meta,
     known: &BTreeSet<String>,
+    list: &BTreeSet<String>,
     quick: &[String; 9],
+    quick_keys: &[String; 9],
     input: &mut String,
     palette: &Palette,
-) -> bool {
+) -> Option<PanelChange> {
     let before = meta.clone();
+    let mut forget = None;
+    // Ready for typing: the field takes the cursor whenever nothing has it.
+    let idle = ui.memory(|memory| memory.focused().is_none());
+    add_field(ui, meta, input, 260.0, idle, None);
+    ui.add_space(4.0);
     let shown: BTreeSet<String> = known
         .iter()
         .chain(quick.iter().filter(|tag| !tag.is_empty()))
@@ -455,23 +653,65 @@ pub fn panel(
         .filter(|tag| !sidecar::is_internal(tag))
         .cloned()
         .collect();
-    if shown.is_empty() {
-        ui.label(egui::RichText::new("No tags yet in this folder.").color(palette.muted));
+    let toggle = |meta: &mut Meta, tag: String| {
+        if !meta.tags.remove(&tag) {
+            meta.tags.insert(tag);
+        }
+    };
+    let query = normalize(input);
+    if !query.is_empty() {
+        let every: BTreeSet<String> = shown.iter().chain(list).cloned().collect();
+        let found = ranked(&query, &every, &BTreeSet::new());
+        if found.is_empty() {
+            let hint = format!("No tag matches; Enter adds {query}.");
+            ui.label(egui::RichText::new(hint).color(palette.muted));
+        }
+        let on = |tag: &str| meta.tags.contains(tag);
+        if let Some((tag, _)) = chips(ui, &found, on, true, quick, quick_keys, palette) {
+            toggle(meta, tag);
+        }
     } else {
-        ui.label(
-            egui::RichText::new("Click a tag to remove it from this file, or to add it.")
-                .color(palette.muted)
-                .size(12.0),
-        );
+        if shown.is_empty() {
+            ui.label(egui::RichText::new("No tags yet in this folder.").color(palette.muted));
+        } else {
+            ui.label(
+                egui::RichText::new("Click a tag to remove it from this file, or to add it.")
+                    .color(palette.muted)
+                    .size(12.0),
+            );
+        }
+        let on = |tag: &str| meta.tags.contains(tag);
+        if let Some((tag, _)) = chips(ui, &shown, on, true, quick, quick_keys, palette) {
+            toggle(meta, tag);
+        }
+        let others: Vec<&String> = list.iter().filter(|tag| !shown.contains(*tag)).collect();
+        if !others.is_empty() {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(format!("All tags ({})", others.len()))
+                .id_salt("all tags")
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Tags from other folders. Right-click to forget one.")
+                            .color(palette.muted)
+                            .size(12.0),
+                    );
+                    let none = &Default::default();
+                    if let Some((tag, right)) =
+                        chips(ui, others, |_| false, true, none, none, palette)
+                    {
+                        if right {
+                            forget = Some(tag);
+                        } else {
+                            meta.tags.insert(tag);
+                        }
+                    }
+                });
+        }
     }
-    if let Some(tag) = chips(ui, &shown, |tag| meta.tags.contains(tag), true, quick, palette)
-        && !meta.tags.remove(&tag)
-    {
-        meta.tags.insert(tag);
+    if let Some(tag) = forget {
+        return Some(PanelChange::Forget(tag));
     }
-    ui.add_space(4.0);
-    add_field(ui, meta, input, 260.0, false);
-    *meta != before
+    (*meta != before).then_some(PanelChange::Tags)
 }
 
 /// The filter panel: which tags, rating and label a file needs for the
@@ -526,11 +766,12 @@ pub fn filter_panel(
                 .size(12.0),
         );
     }
-    if let Some(tag) = chips(
+    if let Some((tag, _)) = chips(
         ui,
         &shown,
         |tag| filter.tags.contains(tag),
         false,
+        &Default::default(),
         &Default::default(),
         palette,
     ) && !filter.tags.remove(&tag)
@@ -556,6 +797,23 @@ mod tests {
             rating,
             label: label.map(String::from),
         }
+    }
+
+    #[test]
+    fn fuzzy_search_ranks_level_starts_first() {
+        let known: BTreeSet<String> = ["Shot/Action", "Seasonal", "Shot/Establishing", "People/Sam"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(fuzzy_score("xyz", "Shot/Action"), None);
+        assert!(fuzzy_score("ACT", "Shot/Action").is_some());
+        let found = suggestions("sa", &known, &BTreeSet::new());
+        assert_eq!(found.first().map(String::as_str), Some("People/Sam"));
+        assert!(found.contains(&"Shot/Action".to_string()));
+        let found = suggestions("est", &known, &BTreeSet::new());
+        assert_eq!(found, vec!["Shot/Establishing".to_string()]);
+        let skip: BTreeSet<String> = ["People/Sam".to_string()].into();
+        assert!(!suggestions("sam", &known, &skip).contains(&"People/Sam".to_string()));
     }
 
     #[test]
