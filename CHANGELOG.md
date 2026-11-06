@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-05
+
 ### Changed
 
 - The tag button (`Ctrl+K`) shows and hides a small bar under the top bar instead of
@@ -117,7 +119,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.0
 [0.4.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.4.0
 [0.3.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.3.1
 [0.3.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.3.0
