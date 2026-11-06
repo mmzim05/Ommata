@@ -63,7 +63,7 @@ const SHORTCUTS: [ShortcutGroup; 6] = [
             ("Ctrl+0", "Clear rating"),
             ("X", "Reject"),
             ("Ctrl+6 – 9", "Red, yellow, green, blue label"),
-            ("Ctrl+K", "Tags panel"),
+            ("Ctrl+K", "Tag bar"),
             ("Ctrl+F", "Filter"),
         ],
     ),
@@ -232,7 +232,7 @@ struct Rename {
 enum Page {
     Settings,
     Help(HelpTab),
-    /// Tags, rating and label of the current file.
+    /// Edit tags: remove the current file's tags, or pick the folder's.
     Tags,
     /// Which files browsing stops on.
     Filter,
@@ -300,8 +300,12 @@ pub struct App {
     meta_sender: Sender<Vec<(PathBuf, Meta)>>,
     meta_receiver: Receiver<Vec<(PathBuf, Meta)>>,
     filter: Filter,
-    /// The new tag being typed in the tag panel.
+    /// The new tag being typed in the tag bar or Edit tags.
     tag_input: String,
+    /// The tag bar under the top bar is shown.
+    tag_bar: bool,
+    /// Put the cursor in the tag bar's field on the next frame.
+    focus_tag_input: bool,
     /// The top bar is too wide for the window, so its controls take a
     /// second row.
     top_bar_wrap: bool,
@@ -394,6 +398,8 @@ impl App {
             meta_receiver,
             filter: Filter::default(),
             tag_input: String::new(),
+            tag_bar: false,
+            focus_tag_input: false,
             top_bar_wrap: false,
             top_bar_widths: (0.0, 0.0),
             quitting: false,
@@ -1193,6 +1199,14 @@ impl App {
     // ---- input --------------------------------------------------------------
 
     fn keys(&mut self, ctx: &egui::Context) {
+        // Ctrl+K closes the tag bar even while its field has the cursor.
+        if self.tag_bar
+            && self.page.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, Key::K))
+        {
+            self.tag_bar = false;
+            return;
+        }
         if ctx.egui_wants_keyboard_input()
             || self.confirm_quit
             || self.confirm_trash.is_some()
@@ -1246,7 +1260,7 @@ impl App {
                     self.set_label(ctx, label);
                 }
                 Key::X if has_file && !command => self.rate(ctx, -1),
-                Key::K if has_file && command => self.page = Some(Page::Tags),
+                Key::K if has_file && command => self.toggle_tag_bar(),
                 Key::F if command => self.page = Some(Page::Filter),
                 Key::S if command && modifiers.shift => self.save(ctx, SaveMode::Copy),
                 Key::S if command => self.save(ctx, SaveMode::Overwrite),
@@ -1283,6 +1297,8 @@ impl App {
                         self.crop = None;
                     } else if self.trim_mode {
                         self.toggle_trim();
+                    } else if self.tag_bar {
+                        self.tag_bar = false;
                     } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
                         toggle_fullscreen(ctx);
                     }
@@ -1728,10 +1744,9 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context, opacity: f32) {
-        let Some(path) = self.current().cloned() else {
-            return;
-        };
+    /// The top bar; returns its bottom edge, or `None` with no file open.
+    fn top_bar(&mut self, ctx: &egui::Context, opacity: f32) -> Option<f32> {
+        let path = self.current().cloned()?;
         let kind = library::kind(&path);
         let dirty = self.is_dirty(&path);
         let palette = self.theme.palette;
@@ -1745,7 +1760,7 @@ impl App {
             (0.0, 0.0)
         };
         let mut widths = (0.0, 0.0);
-        egui::Area::new(Id::unique("top"))
+        let area = egui::Area::new(Id::unique("top"))
             .anchor(Align2::CENTER_TOP, vec2(0.0, 12.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
@@ -1780,15 +1795,53 @@ impl App {
                 });
             });
         // Each part is measured on its own, so the choice doesn't depend on
-        // the layout it made; redo the frame when it changes.
+        // the layout it made; redo the frame when it changes. The bar is
+        // centred on last frame's size, so a frame drawn at a new width would
+        // sit off-centre and visibly jump back on the next one.
         let spacing = ctx.global_style().spacing.item_spacing.x * 2.0 + 8.0;
         let room = ctx.content_rect().width() - 24.0 - 2.0 * BAR_MARGIN;
         let wrap_now = widths.0 + spacing + widths.1 > room;
         let moved = (widths.0 - last.0).abs() > 0.5 || (widths.1 - last.1).abs() > 0.5;
         self.top_bar_widths = widths;
-        if wrap_now != wrap || (wrap && moved) {
+        if wrap_now != wrap || moved {
             self.top_bar_wrap = wrap_now;
             ctx.request_discard("top bar layout");
+        }
+        Some(area.response.rect.bottom())
+    }
+
+    /// Show or hide the tag bar; shown, its field takes the cursor.
+    fn toggle_tag_bar(&mut self) {
+        self.tag_bar = !self.tag_bar;
+        self.focus_tag_input = self.tag_bar;
+    }
+
+    /// The tag bar, just under the top bar at `top`: rating, label, a field
+    /// to add tags, and Edit tags for removing them.
+    fn tag_bar(&mut self, ctx: &egui::Context, top: f32, opacity: f32) {
+        let Some(path) = self.current().cloned() else {
+            return;
+        };
+        let palette = self.theme.palette;
+        let mut meta = self.meta_of(&path);
+        let mut input = std::mem::take(&mut self.tag_input);
+        let focus = std::mem::take(&mut self.focus_tag_input);
+        let mut result = (false, false);
+        egui::Area::new(Id::unique("tag bar"))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, top + 6.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(opacity);
+                bar_frame(&palette).show(ui, |ui| {
+                    result = tags::bar(ui, &mut meta, &mut input, focus, &palette);
+                });
+            });
+        self.tag_input = input;
+        let (changed, edit) = result;
+        if changed {
+            self.set_meta(ctx, &path, meta);
+        }
+        if edit {
+            self.page = Some(Page::Tags);
         }
     }
 
@@ -1869,10 +1922,10 @@ impl App {
             }
         }
         let meta = self.meta_of(path);
-        if let Some(summary) = tags::summary(ui, &meta, palette)
-            && summary.clicked()
-        {
-            self.page = Some(Page::Tags);
+        match tags::summary(ui, &meta, palette) {
+            Some(tags::SummaryClick::TagBar) => self.toggle_tag_bar(),
+            Some(tags::SummaryClick::EditTags) => self.page = Some(Page::Tags),
+            None => {}
         }
     }
 
@@ -1923,8 +1976,8 @@ impl App {
             }
             None => {}
         }
-        if icon(ui, Icon::Tag, "Tags and rating (Ctrl+K)").clicked() {
-            self.page = Some(Page::Tags);
+        if icon_toggle(ui, Icon::Tag, self.tag_bar, "Tags and rating (Ctrl+K)").clicked() {
+            self.toggle_tag_bar();
         }
         if dirty || self.job.is_some() {
             ui.separator();
@@ -2229,7 +2282,7 @@ impl App {
                 let title = match page {
                     Page::Settings => "Settings",
                     Page::Help(_) => "Help",
-                    Page::Tags => "Tags",
+                    Page::Tags => "Edit tags",
                     Page::Filter => "Filter",
                 };
                 ui.heading(title);
@@ -2560,6 +2613,7 @@ impl eframe::App for App {
             || self.confirm_trash.is_some()
             || self.page.is_some()
             || self.rename.is_some()
+            || ctx.egui_wants_keyboard_input()
             || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
@@ -2570,7 +2624,11 @@ impl eframe::App for App {
         }
         let opacity = ctx.animate_bool_with_time(Id::unique("chrome"), visible, 0.15);
         if opacity > 0.0 {
-            self.top_bar(&ctx, opacity);
+            if let Some(bottom) = self.top_bar(&ctx, opacity)
+                && self.tag_bar
+            {
+                self.tag_bar(&ctx, bottom, opacity);
+            }
             self.bottom_bar(&ctx, opacity);
         }
         self.toast(&ctx);
@@ -2909,7 +2967,7 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::them
     ui.spacing_mut().slider_width = 160.0;
     ui.label(egui::RichText::new("Quick tags").strong());
     ui.label(
-        egui::RichText::new("Alt and a number adds or removes the tag; / between levels.")
+        egui::RichText::new("Alt and a number adds or removes the tag; / to nest.")
             .color(palette.muted)
             .size(12.0),
     );
@@ -3233,7 +3291,7 @@ fn bar_frame(palette: &crate::theme::Palette) -> egui::Frame {
 }
 
 #[derive(Clone, Copy)]
-enum Icon {
+pub(crate) enum Icon {
     Play,
     Pause,
     RotateLeft,
@@ -3248,6 +3306,8 @@ enum Icon {
     Settings,
     Trim,
     Tag,
+    /// A circle with a slash: the file is rejected.
+    Reject,
     Help,
 }
 
@@ -3262,7 +3322,7 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, tip: &str) -> egui
 }
 
 /// Icon button drawn in `color` instead of the text colour, when given.
-fn icon_button(
+pub(crate) fn icon_button(
     ui: &mut egui::Ui,
     icon: Icon,
     selected: bool,
@@ -3285,7 +3345,7 @@ fn icon_button(
 }
 
 /// Draw `icon` centred on `center`, about 16 px across.
-fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, color: Color32) {
+pub(crate) fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.6, color);
     let at = |x: f32, y: f32| center + vec2(x, y);
     let arc = |clockwise: bool| {
@@ -3417,6 +3477,10 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, color: Color32)
             ];
             painter.add(Shape::closed_line(outline, stroke));
             painter.circle_stroke(at(2.0, 0.0), 1.4, stroke);
+        }
+        Icon::Reject => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.line_segment([at(-4.9, 4.9), at(4.9, -4.9)], stroke);
         }
         Icon::Help => {
             painter.circle_stroke(center, 7.5, stroke);

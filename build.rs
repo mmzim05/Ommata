@@ -10,6 +10,8 @@ fn main() {
     }
     if let Some(dir) = std::env::var_os("FFMPEG_DIR") {
         let lib = std::path::Path::new(&dir).join("lib/libdav1d.a");
+        // Rerun once build-ffmpeg.sh has (re)built it.
+        println!("cargo:rerun-if-changed={}", lib.display());
         if lib.exists() {
             println!("cargo:rustc-link-arg={}", lib.display());
         }

@@ -9,6 +9,21 @@ the new version.
 
 ## [Unreleased]
 
+### Changed
+
+- The tag button (`Ctrl+K`) shows and hides a small bar under the top bar instead of
+  opening a window: rating, colour label, a reject button and a field that adds a tag on
+  Enter. Removing tags is in **Edit tags** on that bar. `Esc` or `Ctrl+K` closes it.
+- A rejected file shows a red reject icon in the top bar instead of the word Rejected.
+- Tags are bubbles. In the top bar, clicking one opens **Edit tags**; in Edit tags, the
+  file's tags are filled and turn red under the pointer (a click removes the tag), and the
+  folder's other tags are outlined (a click adds it).
+
+### Fixed
+
+- The top bar no longer jumps for a frame when a tag, rating or label changes its width.
+- A build after `scripts/build-ffmpeg.sh` rebuilt FFmpeg no longer fails to link dav1d.
+
 ## [0.4.0] - 2026-11-05
 
 ### Changed

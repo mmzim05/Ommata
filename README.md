@@ -62,8 +62,10 @@ Save over the original (it goes to the trash, not away) or keep a copy.
 ### Tags, ratings and colour labels
 
 Sort a shoot as you step through it: one key adds a tag, rates a clip or rejects it, and
-**Filter** then shows only the files you want. Tags live in XMP sidecar files next to your
-media (`clip.MOV.xmp`), never inside it, and use the same fields as digiKam, darktable,
+**Filter** then shows only the files you want. The tag button (`Ctrl+K`) opens a small bar
+under the top bar with the rating, colour labels, a reject button and a field to type new
+tags; **Edit tags** in it is where you remove them. Tags live in XMP sidecar files next to
+your media (`clip.MOV.xmp`), never inside it, and use the same fields as digiKam, darktable,
 Lightroom and exiftool, so they keep working in those apps too. An existing sidecar keeps
 everything else in it, like a darktable edit history.
 
@@ -153,7 +155,7 @@ problem. Settings are behind the gear in the top bar, or on the start screen.
 | `Ctrl+0`       | Clear the rating                           |
 | `X`            | Reject                                     |
 | `Ctrl+6` – `9` | Red, yellow, green or blue label           |
-| `Ctrl+K`       | Tags panel                                 |
+| `Ctrl+K`       | Show or hide the tag bar                   |
 | `Ctrl+F`       | Filter                                     |
 
 Edits to a camera RAW save as a DNG: all the original sensor data, with the crop and

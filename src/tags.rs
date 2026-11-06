@@ -1,10 +1,10 @@
 //! How tags, ratings and colour labels look and are changed: stars, label
-//! swatches, the tag panel and the folder filter. The data lives in XMP
+//! swatches, the tag bar, Edit tags and the folder filter. The data lives in XMP
 //! sidecars (see `sidecar`); `app` owns loading and saving it.
 
-use crate::app::{focus_ring, hand};
+use crate::app::{Icon, focus_ring, hand, icon_button, paint_icon};
 use crate::sidecar::{self, Meta};
-use crate::theme::Palette;
+use crate::theme::{Palette, lerp};
 use eframe::egui::{self, Color32, Mesh, Pos2, Sense, Shape, Stroke, pos2, vec2};
 use std::collections::BTreeSet;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -189,58 +189,180 @@ pub fn labels(
     picked
 }
 
-/// A file's label, rating and tags, small, for the top bar. Nothing when
-/// it has none.
-pub fn summary(ui: &mut egui::Ui, meta: &Meta, palette: &Palette) -> Option<egui::Response> {
+/// What was clicked in the top bar's summary.
+pub enum SummaryClick {
+    /// The rating, label or reject: show or hide the tag bar.
+    TagBar,
+    /// A tag: open Edit tags.
+    EditTags,
+}
+
+/// The widest the top bar's tag bubbles get; the rest show as "+n".
+const SUMMARY_TAGS_WIDTH: f32 = 240.0;
+
+/// A file's rating, label, reject and tags, small, for the top bar. Nothing
+/// when it has none.
+pub fn summary(ui: &mut egui::Ui, meta: &Meta, palette: &Palette) -> Option<SummaryClick> {
     let tags: Vec<&str> = meta
         .tags
         .iter()
         .filter(|tag| !sidecar::is_internal(tag))
         .map(|tag| tag.rsplit('/').next().unwrap_or(tag))
         .collect();
-    if tags.is_empty() && meta.rating == 0 && meta.label.is_none() {
+    let marks = meta.rating != 0 || meta.label.is_some();
+    if tags.is_empty() && !marks {
         return None;
     }
-    let row = ui.horizontal(|ui| {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        if let Some(color) = meta.label.as_deref().and_then(label_color) {
-            let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-            ui.painter().circle_filled(dot.center(), 4.5, color);
+        if marks {
+            let row = ui.horizontal(|ui| {
+                // The tag bar's order: rating, colour label, reject.
+                for _ in 0..meta.rating.max(0) {
+                    let (star, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    paint_star(ui.painter(), star.center(), 5.5, palette.accent, true);
+                }
+                if let Some(color) = meta.label.as_deref().and_then(label_color) {
+                    let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.5, color);
+                }
+                if meta.rating < 0 {
+                    let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    paint_icon(ui.painter(), Icon::Reject, rect.center(), palette.danger);
+                }
+            });
+            let response = row.response.interact(Sense::click());
+            if hand(response).on_hover_text("Tag bar (Ctrl+K)").clicked() {
+                clicked = Some(SummaryClick::TagBar);
+            }
         }
-        if meta.rating < 0 {
-            ui.label(egui::RichText::new("Rejected").color(palette.danger));
-        }
-        for _ in 0..meta.rating.max(0) {
-            let (star, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-            paint_star(ui.painter(), star.center(), 5.5, palette.accent, true);
-        }
-        if !tags.is_empty() {
-            let text = crate::app::ellipsize(&tags.join(", "), 36);
-            ui.label(egui::RichText::new(text).color(palette.muted));
+        let mut used = 0.0;
+        for (shown, tag) in tags.iter().enumerate() {
+            let width = bubble_width(ui, tag, true);
+            if used + width > SUMMARY_TAGS_WIDTH && shown > 0 {
+                let rest = tags[shown..].join(", ");
+                let more = bubble(ui, &format!("+{}", tags.len() - shown), Bubble::Small, palette);
+                if more.on_hover_text(format!("{rest}\nEdit tags")).clicked() {
+                    clicked = Some(SummaryClick::EditTags);
+                }
+                break;
+            }
+            used += width + ui.spacing().item_spacing.x;
+            if bubble(ui, tag, Bubble::Small, palette)
+                .on_hover_text("Edit tags")
+                .clicked()
+            {
+                clicked = Some(SummaryClick::EditTags);
+            }
         }
     });
-    let response = row.response.interact(Sense::click());
-    Some(hand(response).on_hover_text("Tags (Ctrl+K)"))
+    clicked
 }
 
-/// Toggle chips for `tags`; returns the one clicked. `quick` marks the tags
-/// with an Alt+number key.
+/// How a tag bubble looks.
+#[derive(Clone, Copy, PartialEq)]
+enum Bubble {
+    /// In the top bar's summary: small, filled.
+    Small,
+    /// Not set (Edit tags, Filter): outlined; clicking sets it.
+    Off,
+    /// Set (Filter): filled.
+    On,
+    /// The file's tag in Edit tags: filled, red under the pointer, since
+    /// clicking removes it.
+    Removable,
+}
+
+fn bubble_galley(ui: &egui::Ui, text: &str, small: bool) -> std::sync::Arc<egui::Galley> {
+    let font = if small {
+        egui::FontId::proportional(13.0)
+    } else {
+        egui::TextStyle::Body.resolve(ui.style())
+    };
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER)
+}
+
+fn bubble_padding(small: bool) -> egui::Vec2 {
+    if small { vec2(7.0, 2.0) } else { vec2(10.0, 4.0) }
+}
+
+fn bubble_width(ui: &egui::Ui, text: &str, small: bool) -> f32 {
+    bubble_galley(ui, text, small).size().x + 2.0 * bubble_padding(small).x
+}
+
+/// A tag as a rounded bubble, shaped like the bars' buttons.
+fn bubble(ui: &mut egui::Ui, text: &str, kind: Bubble, palette: &Palette) -> egui::Response {
+    let small = kind == Bubble::Small;
+    let galley = bubble_galley(ui, text, small);
+    let padding = bubble_padding(small);
+    let height = if small { 20.0 } else { ui.spacing().interact_size.y };
+    let size = vec2(galley.size().x + 2.0 * padding.x, height.max(galley.size().y + 2.0 * padding.y));
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    let widget = ui.style().interact(&response);
+    let corner = widget.corner_radius;
+    let selection = ui.visuals().selection;
+    // Tinted from the bar's own colours, so the bubble reads on any theme
+    // (some give buttons almost the bar's colour).
+    let tint = |amount: f32| lerp(palette.surface, palette.fg, amount);
+    let (fill, stroke, text_color) = match kind {
+        Bubble::Small => (tint(if hovered { 0.22 } else { 0.14 }), Stroke::NONE, palette.fg),
+        Bubble::Off if hovered => (tint(0.14), Stroke::new(1.0, tint(0.30)), palette.fg),
+        Bubble::Off => (Color32::TRANSPARENT, Stroke::new(1.0, tint(0.30)), palette.muted),
+        Bubble::Removable if hovered => (
+            palette.danger.gamma_multiply(0.25),
+            Stroke::new(1.0, palette.danger),
+            palette.danger,
+        ),
+        Bubble::On | Bubble::Removable => (selection.bg_fill, Stroke::NONE, selection.stroke.color),
+    };
+    ui.painter()
+        .rect(rect, corner, fill, stroke, egui::StrokeKind::Inside);
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(at, galley, text_color);
+    focus_ring(ui, &response);
+    hand(response)
+}
+
+/// Tag bubbles for `tags` to turn on and off; returns the one clicked.
+/// `removable`: the tags that are on turn red under the pointer, since a
+/// click removes them from the file. `quick` marks the tags with an
+/// Alt+number key.
 fn chips(
     ui: &mut egui::Ui,
     tags: &BTreeSet<String>,
     on: impl Fn(&str) -> bool,
+    removable: bool,
     quick: &[String; 9],
+    palette: &Palette,
 ) -> Option<String> {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
         for tag in tags {
-            let chip = hand(ui.selectable_label(on(tag), tag));
-            let key = quick.iter().position(|quick| quick == tag);
-            let chip = match key {
-                Some(index) => chip.on_hover_text(format!("Alt+{}", index + 1)),
-                None => chip,
+            let kind = match (on(tag), removable) {
+                (false, _) => Bubble::Off,
+                (true, false) => Bubble::On,
+                (true, true) => Bubble::Removable,
             };
+            let action = match kind {
+                Bubble::Removable => "Remove",
+                Bubble::Off if removable => "Add",
+                _ => "",
+            };
+            let key = quick
+                .iter()
+                .position(|quick| quick == tag)
+                .map(|index| format!("Alt+{}", index + 1));
+            let tip = match (action, key) {
+                ("", Some(key)) => key,
+                (action, Some(key)) => format!("{action} ({key})"),
+                (action, None) => action.to_string(),
+            };
+            let chip = bubble(ui, tag, kind, palette);
+            let chip = if tip.is_empty() { chip } else { chip.on_hover_text(tip) };
             if chip.clicked() {
                 clicked = Some(tag.clone());
             }
@@ -254,8 +376,69 @@ fn row_label(ui: &mut egui::Ui, text: &str, palette: &Palette) {
     ui.add_sized([72.0, 24.0], egui::Label::new(label));
 }
 
-/// The tag panel for one file: rating, reject, colour label, tags and a
-/// field to add a new tag. Returns whether `meta` changed.
+/// The tag bar under the top bar: rating, colour label, reject, a field to
+/// add a tag, and Edit tags. `focus` puts the cursor in the field. Returns
+/// whether `meta` changed and whether Edit tags was clicked.
+pub fn bar(
+    ui: &mut egui::Ui,
+    meta: &mut Meta,
+    input: &mut String,
+    focus: bool,
+    palette: &Palette,
+) -> (bool, bool) {
+    let before = meta.clone();
+    let mut edit = false;
+    ui.horizontal(|ui| {
+        if let Some(rating) = stars(ui, meta.rating, palette) {
+            meta.rating = rating;
+        }
+        ui.separator();
+        if let Some(label) = labels(ui, meta.label.as_deref(), palette) {
+            meta.label = label;
+        }
+        let rejected = meta.rating < 0;
+        let (color, tip) = if rejected {
+            (Some(palette.danger), "Rejected; click to undo (X)")
+        } else {
+            (None, "Reject (X)")
+        };
+        if icon_button(ui, Icon::Reject, rejected, color, tip).clicked() {
+            meta.rating = if rejected { 0 } else { -1 };
+        }
+        ui.separator();
+        add_field(ui, meta, input, 180.0, focus);
+        if hand(ui.button("Edit tags"))
+            .on_hover_text("Remove tags, or pick from the folder's")
+            .clicked()
+        {
+            edit = true;
+        }
+    });
+    (*meta != before, edit)
+}
+
+/// A field that adds the typed tag on Enter and stays focused for the next.
+fn add_field(ui: &mut egui::Ui, meta: &mut Meta, input: &mut String, width: f32, focus: bool) {
+    let field = ui.add(
+        egui::TextEdit::singleline(input)
+            .hint_text("Add tag, / to nest")
+            .background_color(ui.visuals().widgets.inactive.bg_fill)
+            .desired_width(width),
+    );
+    if focus {
+        field.request_focus();
+    }
+    let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let tag = normalize(input);
+    if entered && !tag.is_empty() {
+        meta.tags.insert(tag);
+        input.clear();
+        field.request_focus();
+    }
+}
+
+/// Edit tags for one file: its tags and the folder's as chips to turn on
+/// and off, and a field to add a new one. Returns whether `meta` changed.
 pub fn panel(
     ui: &mut egui::Ui,
     meta: &mut Meta,
@@ -265,32 +448,6 @@ pub fn panel(
     palette: &Palette,
 ) -> bool {
     let before = meta.clone();
-    ui.horizontal(|ui| {
-        row_label(ui, "Rating", palette);
-        if let Some(rating) = stars(ui, meta.rating, palette) {
-            meta.rating = rating;
-        }
-        ui.add_space(12.0);
-        let reject = egui::RichText::new("Reject").color(if meta.rating < 0 {
-            palette.danger
-        } else {
-            palette.fg
-        });
-        if hand(ui.selectable_label(meta.rating < 0, reject))
-            .on_hover_text("X")
-            .clicked()
-        {
-            meta.rating = if meta.rating < 0 { 0 } else { -1 };
-        }
-    });
-    ui.horizontal(|ui| {
-        row_label(ui, "Label", palette);
-        if let Some(label) = labels(ui, meta.label.as_deref(), palette) {
-            meta.label = label;
-        }
-    });
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Tags").size(15.0));
     let shown: BTreeSet<String> = known
         .iter()
         .chain(quick.iter().filter(|tag| !tag.is_empty()))
@@ -300,29 +457,20 @@ pub fn panel(
         .collect();
     if shown.is_empty() {
         ui.label(egui::RichText::new("No tags yet in this folder.").color(palette.muted));
+    } else {
+        ui.label(
+            egui::RichText::new("Click a tag to remove it from this file, or to add it.")
+                .color(palette.muted)
+                .size(12.0),
+        );
     }
-    if let Some(tag) = chips(ui, &shown, |tag| meta.tags.contains(tag), quick)
+    if let Some(tag) = chips(ui, &shown, |tag| meta.tags.contains(tag), true, quick, palette)
         && !meta.tags.remove(&tag)
     {
         meta.tags.insert(tag);
     }
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let field = ui.add(
-            egui::TextEdit::singleline(input)
-                .hint_text("New tag, / between levels")
-                .background_color(ui.visuals().widgets.inactive.bg_fill)
-                .desired_width(260.0),
-        );
-        let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let added = hand(ui.button("Add")).clicked();
-        let tag = normalize(input);
-        if (entered || added) && !tag.is_empty() {
-            meta.tags.insert(tag);
-            input.clear();
-            field.request_focus();
-        }
-    });
+    add_field(ui, meta, input, 260.0, false);
     *meta != before
 }
 
@@ -382,7 +530,9 @@ pub fn filter_panel(
         ui,
         &shown,
         |tag| filter.tags.contains(tag),
+        false,
         &Default::default(),
+        palette,
     ) && !filter.tags.remove(&tag)
     {
         filter.tags.insert(tag);
