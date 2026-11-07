@@ -107,6 +107,20 @@ impl Action {
         all
     }
 
+    /// Whether the action's keys can't be changed: saving and quitting stay
+    /// where everyone expects them.
+    pub fn is_fixed(self) -> bool {
+        self.group() == "Save"
+    }
+
+    /// The fixed action `chord` belongs to, if any.
+    pub fn fixed_for(chord: Chord) -> Option<Action> {
+        Action::all()
+            .into_iter()
+            .filter(|action| action.is_fixed())
+            .find(|action| action.default_keys().contains(&chord))
+    }
+
     /// The group the action is listed under, one of `GROUPS`.
     pub fn group(self) -> &'static str {
         use Action::*;
@@ -440,7 +454,9 @@ impl Keymap {
 
     /// Give `action` the keys `keys`, taking each of them away from any other
     /// action. Returns the actions that lost a key.
-    pub fn set(&mut self, action: Action, keys: Vec<Chord>) -> Vec<Action> {
+    /// Keys of fixed actions are left out: they can't be taken.
+    pub fn set(&mut self, action: Action, mut keys: Vec<Chord>) -> Vec<Action> {
+        keys.retain(|key| Action::fixed_for(*key).is_none());
         let mut lost = Vec::new();
         for other in Action::all() {
             if other == action {
@@ -462,7 +478,7 @@ impl Keymap {
     }
 
     fn store(&mut self, action: Action, keys: Vec<Chord>) {
-        if keys == action.default_keys() {
+        if keys == action.default_keys() || action.is_fixed() {
             self.changed.remove(&action);
         } else {
             self.changed.insert(action, keys);
@@ -502,6 +518,17 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_keys_are_fixed() {
+        let mut keys = Keymap::default();
+        assert!(keys.read_setting("key_save", "Ctrl+W"));
+        assert_eq!(keys.keys(Action::Save), Action::Save.default_keys());
+        let lost = keys.set(Action::Next, vec![Chord::plain(Key::N), Chord::ctrl(Key::S)]);
+        assert!(lost.is_empty());
+        assert_eq!(keys.keys(Action::Save), vec![Chord::ctrl(Key::S)]);
+        assert_eq!(keys.keys(Action::Next), vec![Chord::plain(Key::N)]);
+    }
 
     #[test]
     fn chords_round_trip_through_text() {

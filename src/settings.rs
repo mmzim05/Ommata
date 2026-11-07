@@ -42,7 +42,8 @@ impl Default for Settings {
     }
 }
 
-fn config_dir() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME`, or `~/.config`.
+pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))

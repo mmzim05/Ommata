@@ -129,7 +129,7 @@ problem. Settings are behind the gear in the top bar, or on the start screen.
 
 ### Keyboard shortcuts
 
-These are the defaults. To change a key, press `?` and click it under **Keybinds**.
+These are the defaults. To change a key, open Settings and click it under **Keybinds**.
 
 | Browse        |                    | View            |                              |
 | ------------- | ------------------ | --------------- | ---------------------------- |

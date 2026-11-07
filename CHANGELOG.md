@@ -9,6 +9,34 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-07
+
+### Added
+
+- **Tag list** in Settings: add a tag to the list without putting it on a file, and click
+  one to forget it.
+- Quick tag fields suggest tags from the tag list while typing.
+- Settings says whether Ommata is the default app, with a check mark when it is;
+  otherwise the button reads **Set Ommata as default**.
+
+### Changed
+
+- Settings has a tab per category: General, Tags, Video and Keybinds.
+- Keys are changed in Settings › Keybinds, one category at a time from tabs on the left.
+- Save, Save a copy, Undo all edits and Quit keep their keys (`Ctrl+S`, `Ctrl+Shift+S`,
+  `Ctrl+Z`, `Ctrl+Q`); a changed key for them in `settings.conf` is ignored.
+- Help shows a short overview of the keys for what is open (no video keys for a photo),
+  with the quick tags by name and the keys that work only in a mode (`Esc`, `Enter`,
+  `1`–`5` while cropping).
+- Quick tags are numbered down the left column, then down the right.
+- The trash button is last in the top bar, set apart from Help.
+
+### Fixed
+
+- Scrolling or pinching over a menu, bar or dialog no longer zooms the picture under it.
+- Settings and Keybinds no longer open in a short window that never grows.
+- Quick tag fields in the left column are as wide as those on the right.
+
 ## [0.5.1] - 2026-11-05
 
 ### Added
@@ -156,7 +184,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.2
 [0.5.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.1
 [0.5.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.0
 [0.4.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.4.0

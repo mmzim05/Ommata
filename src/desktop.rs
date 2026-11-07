@@ -44,6 +44,42 @@ pub fn make_default() -> Result<usize, String> {
     Ok(types.len())
 }
 
+/// Whether Ommata already opens every type in `mime_types`: the user's
+/// `mimeapps.list`, where `xdg-mime default` writes, names this copy's
+/// desktop entry first for each.
+pub fn is_default() -> bool {
+    let Some(entry) = program().and_then(|program| find_entry(&program)) else {
+        return false;
+    };
+    let Some(text) = crate::settings::config_dir()
+        .map(|dir| dir.join("mimeapps.list"))
+        .and_then(|file| std::fs::read_to_string(file).ok())
+    else {
+        return false;
+    };
+    let defaults = default_apps(&text);
+    mime_types()
+        .iter()
+        .all(|kind| defaults.get(kind) == Some(&entry.as_str()))
+}
+
+/// The first app of each type under `[Default Applications]` in a
+/// `mimeapps.list`.
+fn default_apps(text: &str) -> std::collections::HashMap<&str, &str> {
+    let mut defaults = std::collections::HashMap::new();
+    let mut in_defaults = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_defaults = line == "[Default Applications]";
+        } else if in_defaults && let Some((kind, apps)) = line.split_once('=') {
+            if let Some(first) = apps.split(';').map(str::trim).find(|app| !app.is_empty()) {
+                defaults.insert(kind.trim(), first);
+            }
+        }
+    }
+    defaults
+}
+
 /// The file that starts this copy: the AppImage, not the binary inside it.
 fn program() -> Option<PathBuf> {
     crate::update::appimage().or_else(|| std::env::current_exe().ok())
@@ -153,6 +189,17 @@ mod tests {
         ] {
             assert!(types.contains(&kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn reads_default_apps() {
+        let text = "[Added Associations]\nimage/png=other.desktop;\n\
+                    [Default Applications]\nimage/jpeg=ommata.desktop;gimp.desktop;\n\
+                    video/mp4 = mpv.desktop\n";
+        let defaults = default_apps(text);
+        assert_eq!(defaults.get("image/jpeg"), Some(&"ommata.desktop"));
+        assert_eq!(defaults.get("video/mp4"), Some(&"mpv.desktop"));
+        assert_eq!(defaults.get("image/png"), None);
     }
 
     #[test]

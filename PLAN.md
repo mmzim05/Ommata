@@ -98,6 +98,23 @@ Rules:
 - Register as default handler (`.desktop` file with image/* and video/* MIME types).
 - AUR package.
 
+### 0.6.0: slideshow (planned, not started)
+
+A slideshow mode the user turns on from the file that is open.
+
+- **Order**, picked in its settings:
+  - *Random*: each next file is picked at random from the open file's folder.
+  - *Sequential*: files play in date order, starting from the open file.
+- **Settings**: a Slideshow tab in Settings with the order and two options:
+  - Hide the top bar during a slideshow.
+  - Hide the progress bar during a slideshow.
+- Photos and videos both take part.
+
+Still to decide: how long a photo stays up; whether a video plays to its end
+before the next file; how to start and stop the slideshow (key, button);
+whether Random may repeat a file before every file has played; which date
+Sequential sorts by (capture date from EXIF, or file modified time).
+
 ## Open questions
 
 - GStreamer vs. libmpv for playback: GStreamer integrates cleanly with GTK4;

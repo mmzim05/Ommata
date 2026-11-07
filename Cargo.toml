@@ -1,6 +1,6 @@
 [package]
 name = "ommata"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 description = "Fast unified image and video viewer with crop and trim"
 license = "GPL-3.0-or-later"

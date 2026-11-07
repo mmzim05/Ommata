@@ -161,12 +161,20 @@ struct Rename {
 /// A window over everything, the same from the start screen and a file.
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
-    Settings,
+    Settings(SettingsTab),
     Help(HelpTab),
     /// Edit tags: remove the current file's tags, or pick the folder's.
     Tags,
     /// Which files browsing stops on.
     Filter,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsTab {
+    General,
+    Tags,
+    Video,
+    Keybinds,
 }
 
 /// A key of the Keybinds list waiting for its new key.
@@ -179,7 +187,8 @@ struct Rebind {
 
 #[derive(Clone, Copy, PartialEq)]
 enum HelpTab {
-    Keybinds,
+    /// The keys, quick tags included, to look up; they change in Settings.
+    Keys,
     Version,
     Report,
 }
@@ -245,6 +254,11 @@ pub struct App {
     tag_list: std::collections::BTreeSet<String>,
     /// The new tag being typed in the tag bar or Edit tags.
     tag_input: String,
+    /// The tag being typed for the tag list in Settings.
+    list_input: String,
+    /// Whether Ommata opens photos and videos by default; checked when
+    /// Settings shows it.
+    is_default: Option<bool>,
     /// The tag bar under the top bar is shown.
     tag_bar: bool,
     /// Put the cursor in the tag bar's field on the next frame.
@@ -349,6 +363,8 @@ impl App {
             filter: Filter::default(),
             tag_list: tags::load_list(),
             tag_input: String::new(),
+            list_input: String::new(),
+            is_default: None,
             tag_bar: false,
             focus_tag_input: false,
             top_bar_wrap: false,
@@ -458,6 +474,15 @@ impl App {
             && let Err(error) = tags::save_list(&self.tag_list)
         {
             eprintln!("ommata: couldn't save the tag list: {error}");
+        }
+    }
+
+    /// Take `tag` off the tag list.
+    fn forget_tag(&mut self, ctx: &egui::Context, tag: &str) {
+        if self.tag_list.remove(tag)
+            && let Err(error) = tags::save_list(&self.tag_list)
+        {
+            self.notify(ctx, format!("Couldn't save the tag list: {error}"));
         }
     }
 
@@ -1298,7 +1323,7 @@ impl App {
                 }
             }
             Action::Fullscreen => toggle_fullscreen(ctx),
-            Action::Help => self.page = Some(Page::Help(HelpTab::Keybinds)),
+            Action::Help => self.page = Some(Page::Help(HelpTab::Keys)),
             Action::Trash => self.ask_trash(ctx),
             Action::Rename => self.start_rename(),
             Action::Crop if self.crop.is_some() => self.apply_crop(),
@@ -1474,11 +1499,11 @@ impl App {
         }
         let settings = Rect::from_center_size(center + vec2(-56.0, 92.0), vec2(104.0, 32.0));
         if icon_label_button(ui, settings, Icon::Settings, "Settings", &palette).clicked() {
-            self.page = Some(Page::Settings);
+            self.page = Some(Page::Settings(SettingsTab::General));
         }
         let help = Rect::from_center_size(center + vec2(56.0, 92.0), vec2(104.0, 32.0));
         if icon_label_button(ui, help, Icon::Help, "Help", &palette).clicked() {
-            self.page = Some(Page::Help(HelpTab::Keybinds));
+            self.page = Some(Page::Help(HelpTab::Keys));
         }
     }
 
@@ -1535,8 +1560,11 @@ impl App {
                 )
             });
             let factor = (scroll * 0.0025).exp() * pinch;
+            // Only when the picture is what the pointer is over, not a menu,
+            // dialog or bar on top of it.
             if (factor - 1.0).abs() > 1e-4
-                && let Some(pointer) = hover.filter(|pointer| rect.contains(*pointer))
+                && response.contains_pointer()
+                && let Some(pointer) = hover
             {
                 let zoom = clamp_zoom(scale * factor, fit_scale);
                 let anchor = pointer - rect.center() - self.pan;
@@ -2042,6 +2070,23 @@ impl App {
         if self.update_controls(ctx, ui, &palette, false) {
             ui.separator();
         }
+        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        let (screen_icon, screen_tip) = if fullscreen {
+            (Icon::ExitFullscreen, "Leave fullscreen (F)")
+        } else {
+            (Icon::Fullscreen, "Fullscreen (F)")
+        };
+        if icon(ui, screen_icon, screen_tip).clicked() {
+            toggle_fullscreen(ctx);
+        }
+        if icon(ui, Icon::Settings, "Settings").clicked() {
+            self.page = Some(Page::Settings(SettingsTab::General));
+        }
+        if icon(ui, Icon::Help, "Help (?)").clicked() {
+            self.page = Some(Page::Help(HelpTab::Keys));
+        }
+        // Last, and set apart, so a click meant for Help can't land on it.
+        ui.add_space(16.0);
         let trash = if self.trash_without_asking {
             icon_button(
                 ui,
@@ -2055,21 +2100,6 @@ impl App {
         };
         if trash.clicked() {
             self.ask_trash(ctx);
-        }
-        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
-        let (screen_icon, screen_tip) = if fullscreen {
-            (Icon::ExitFullscreen, "Leave fullscreen (F)")
-        } else {
-            (Icon::Fullscreen, "Fullscreen (F)")
-        };
-        if icon(ui, screen_icon, screen_tip).clicked() {
-            toggle_fullscreen(ctx);
-        }
-        if icon(ui, Icon::Settings, "Settings").clicked() {
-            self.page = Some(Page::Settings);
-        }
-        if icon(ui, Icon::Help, "Help (?)").clicked() {
-            self.page = Some(Page::Help(HelpTab::Keybinds));
         }
     }
 
@@ -2295,19 +2325,21 @@ impl App {
         let known = self.folder_tags();
         let mut meta = current.as_deref().map(|path| self.meta_of(path));
         let mut panel_change = None;
-        let mut make_default = false;
+        let mut settings_change = None;
         let mut filter = self.filter.clone();
         let mut filter_changed = false;
         let count = self.filter_count();
         let mut tag_input = std::mem::take(&mut self.tag_input);
-        let mut rebinding = self.rebinding.filter(|_| page == Page::Help(HelpTab::Keybinds));
+        let mut rebinding = self.rebinding.filter(|_| page == Page::Settings(SettingsTab::Keybinds));
         if let Some(rebind) = rebinding
             && let Some((key, modifiers)) = take_key_press(ctx)
         {
             rebinding = None;
             // Esc cancels; it can't be a shortcut, since it leaves modes.
-            if key != Key::Escape {
-                let chord = Chord::pressed(key, modifiers);
+            let chord = Chord::pressed(key, modifiers);
+            if let Some(fixed) = Action::fixed_for(chord) {
+                self.notify(ctx, format!("{chord} is kept for {}", fixed.label()));
+            } else if key != Key::Escape {
                 let mut keys = new_settings.keys.keys(rebind.action);
                 match rebind.slot {
                     Some(index) if index < keys.len() => keys[index] = chord,
@@ -2329,7 +2361,7 @@ impl App {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
                 let title = match page {
-                    Page::Settings => "Settings",
+                    Page::Settings(_) => "Settings",
                     Page::Help(_) => "Help",
                     Page::Tags => "Edit tags",
                     Page::Filter => "Filter",
@@ -2349,11 +2381,47 @@ impl App {
             });
             ui.add_space(4.0);
             match page {
-                Page::Settings => {
-                    let height = (ctx.content_rect().height() - 160.0).max(120.0);
-                    egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
-                        make_default = settings_ui(ui, &mut new_settings, &palette);
+                Page::Settings(tab) => {
+                    ui.horizontal(|ui| {
+                        for (label, option) in [
+                            ("General", SettingsTab::General),
+                            ("Tags", SettingsTab::Tags),
+                            ("Video", SettingsTab::Video),
+                            ("Keybinds", SettingsTab::Keybinds),
+                        ] {
+                            if hand(ui.selectable_label(tab == option, label)).clicked() {
+                                next = Some(Page::Settings(option));
+                            }
+                        }
                     });
+                    ui.separator();
+                    match tab {
+                        SettingsTab::Keybinds => {
+                            let keys = &mut new_settings.keys;
+                            keybinds_ui(ui, keys, &mut rebinding, &settings.quick_tags, &palette);
+                        }
+                        _ => {
+                            let is_default = tab == SettingsTab::General
+                                && *self.is_default.get_or_insert_with(crate::desktop::is_default);
+                            let height = (ctx.content_rect().height() - 200.0).max(120.0);
+                            // The modal lays out within last frame's size, so without a
+                            // minimum the scroll area never grows past its first guess.
+                            egui::ScrollArea::vertical()
+                                .max_height(height)
+                                .min_scrolled_height(height)
+                                .show(ui, |ui| {
+                                    settings_change = settings_ui(
+                                        ui,
+                                        tab,
+                                        &mut new_settings,
+                                        &self.tag_list,
+                                        &mut self.list_input,
+                                        is_default,
+                                        &palette,
+                                    );
+                                });
+                        }
+                    }
                 }
                 Page::Tags => match meta.as_mut() {
                     Some(meta) => {
@@ -2378,7 +2446,7 @@ impl App {
                 Page::Help(tab) => {
                     ui.horizontal(|ui| {
                         for (label, option) in [
-                            ("Keybinds", HelpTab::Keybinds),
+                            ("Keys", HelpTab::Keys),
                             ("Version", HelpTab::Version),
                             ("Report an issue", HelpTab::Report),
                         ] {
@@ -2389,8 +2457,9 @@ impl App {
                     });
                     ui.separator();
                     match tab {
-                        HelpTab::Keybinds => {
-                            keybinds_ui(ui, &mut new_settings.keys, &mut rebinding, &palette);
+                        HelpTab::Keys => {
+                            let kind = current.as_deref().and_then(library::kind);
+                            keys_overview(ui, &settings, kind, &palette);
                         }
                         HelpTab::Version => self.version_ui(ctx, ui, &palette),
                         HelpTab::Report => self.report_ui(ctx, ui, &palette),
@@ -2399,13 +2468,27 @@ impl App {
             }
         });
         self.page = if modal.should_close() { None } else { next };
-        self.rebinding = rebinding.filter(|_| self.page == Some(Page::Help(HelpTab::Keybinds)));
+        if !matches!(self.page, Some(Page::Settings(_))) {
+            // Checked again next time, in case another app took over.
+            self.is_default = None;
+        }
+        self.rebinding = rebinding.filter(|_| self.page == Some(Page::Settings(SettingsTab::Keybinds)));
         self.tag_input = tag_input;
-        if make_default {
-            match crate::desktop::make_default() {
-                Ok(count) => self.notify(ctx, format!("Ommata now opens {count} photo and video types")),
-                Err(error) => self.notify(ctx, format!("Couldn't make Ommata the default: {error}")),
+        match settings_change {
+            Some(SettingsChange::MakeDefault) => {
+                match crate::desktop::make_default() {
+                    Ok(count) => {
+                        self.notify(ctx, format!("Ommata now opens {count} photo and video types"));
+                    }
+                    Err(error) => {
+                        self.notify(ctx, format!("Couldn't make Ommata the default: {error}"));
+                    }
+                }
+                self.is_default = None;
             }
+            Some(SettingsChange::List(tags::ListChange::Add(tag))) => self.remember_tags([tag]),
+            Some(SettingsChange::List(tags::ListChange::Forget(tag))) => self.forget_tag(ctx, &tag),
+            None => {}
         }
         match panel_change {
             Some(tags::PanelChange::Tags) => {
@@ -2413,12 +2496,7 @@ impl App {
                     self.set_meta(ctx, &path, meta);
                 }
             }
-            Some(tags::PanelChange::Forget(tag)) => {
-                self.tag_list.remove(&tag);
-                if let Err(error) = tags::save_list(&self.tag_list) {
-                    self.notify(ctx, format!("Couldn't save the tag list: {error}"));
-                }
-            }
+            Some(tags::PanelChange::Forget(tag)) => self.forget_tag(ctx, &tag),
             None => {}
         }
         if filter_changed {
@@ -3093,88 +3171,129 @@ fn hover_preview(
         });
 }
 
-/// The Settings page. Returns whether the default-app button was clicked.
-fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, palette: &crate::theme::Palette) -> bool {
+/// What a click on the Settings page asks for.
+enum SettingsChange {
+    MakeDefault,
+    List(tags::ListChange),
+}
+
+/// A tab of Settings other than Keybinds. `list` is the tag list,
+/// `list_input` the tag being typed for it.
+fn settings_ui(
+    ui: &mut egui::Ui,
+    tab: SettingsTab,
+    settings: &mut Settings,
+    list: &std::collections::BTreeSet<String>,
+    list_input: &mut String,
+    is_default: bool,
+    palette: &crate::theme::Palette,
+) -> Option<SettingsChange> {
     ui.spacing_mut().interact_size.y = 20.0;
     ui.spacing_mut().slider_width = 160.0;
-    ui.label(egui::RichText::new("Default app").strong());
-    let make_default = ui
-        .horizontal(|ui| {
-            let clicked = hand(ui.button("Open all photos and videos with Ommata")).clicked();
-            ui.label(
-                egui::RichText::new(format!("{} file types", crate::desktop::mime_types().len()))
-                    .color(palette.muted)
-                    .size(12.0),
-            );
-            clicked
-        })
-        .inner;
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("Quick tags").strong());
-    ui.label(
-        egui::RichText::new("Its key adds or removes the tag; / to nest. Change keys in Help.")
-            .color(palette.muted)
-            .size(12.0),
-    );
-    egui::Grid::new("quick-tags")
-        .num_columns(4)
-        .spacing([8.0, 6.0])
-        .show(ui, |ui| {
-            let names = quick_tag_keys(&settings.keys);
-            for (index, tag) in settings.quick_tags.iter_mut().enumerate() {
-                let key = egui::RichText::new(&names[index])
-                    .monospace()
-                    .color(palette.accent);
-                ui.add_sized([48.0, 24.0], egui::Label::new(key));
-                let fill = ui.visuals().widgets.inactive.bg_fill;
-                let field = egui::TextEdit::singleline(tag).background_color(fill);
-                ui.add_sized([170.0, 24.0], field);
-                if index % 2 == 1 {
-                    ui.end_row();
-                }
+    let hint = |ui: &mut egui::Ui, text: &str| {
+        ui.label(egui::RichText::new(text).color(palette.muted).size(12.0));
+    };
+    let mut change = None;
+    match tab {
+        SettingsTab::General => {
+            ui.label(egui::RichText::new("Default app").strong());
+            if is_default {
+                ui.horizontal(|ui| {
+                    // Drawn, since not every font has a check mark.
+                    let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    paint_icon(ui.painter(), Icon::Check, rect.center(), palette.accent);
+                    ui.label("Ommata is default");
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Ommata is not default");
+                    if hand(ui.button("Set Ommata as default")).clicked() {
+                        change = Some(SettingsChange::MakeDefault);
+                    }
+                });
             }
-        });
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("Updates").strong());
-    hand(ui.checkbox(&mut settings.check_updates, "Check for updates when Ommata opens"));
-    ui.label(
-        egui::RichText::new("Asks GitHub for the newest version number; nothing else is sent.")
-            .color(palette.muted)
-            .size(12.0),
-    );
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("Video seek bar").strong());
-    hand(ui.checkbox(&mut settings.waveform, "Show audio waveform"));
-    ui.add_enabled_ui(settings.waveform, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Style");
-            hand(ui.selectable_value(&mut settings.wave_filled, false, "Bars"));
-            hand(ui.selectable_value(&mut settings.wave_filled, true, "Filled"));
-        });
-        egui::Grid::new("wave-settings")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Min height");
-                ui.add(
-                    egui::Slider::new(&mut settings.wave_min, 1.0..=40.0)
-                        .suffix(" px")
-                        .max_decimals(0),
-                );
-                ui.end_row();
-                ui.label("Max height");
-                ui.add(
-                    egui::Slider::new(&mut settings.wave_max, 2.0..=40.0)
-                        .suffix(" px")
-                        .max_decimals(0),
-                );
-                ui.end_row();
-                ui.label("Smoothing");
-                ui.add(egui::Slider::new(&mut settings.wave_smooth, 0.0..=1.0).max_decimals(2));
-                ui.end_row();
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Updates").strong());
+            hand(ui.checkbox(&mut settings.check_updates, "Check for updates when Ommata opens"));
+            hint(ui, "Asks GitHub for the newest version number; nothing else is sent.");
+        }
+        SettingsTab::Tags => {
+            ui.label(egui::RichText::new("Quick tags").strong());
+            hint(ui, "Its key adds or removes the tag; / to nest. Change keys in Keybinds.");
+            egui::Grid::new("quick-tags")
+                .num_columns(4)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    let names = quick_tag_keys(&settings.keys);
+                    // Numbered down the left column, then down the right.
+                    let rows = settings.quick_tags.len().div_ceil(2);
+                    let order = (0..rows).flat_map(|row| [row, row + rows]);
+                    for (cell, index) in order.enumerate() {
+                        let Some(tag) = settings.quick_tags.get_mut(index) else {
+                            ui.end_row();
+                            continue;
+                        };
+                        let key = egui::RichText::new(&names[index])
+                            .monospace()
+                            .color(palette.accent);
+                        ui.add_sized([48.0, 24.0], egui::Label::new(key));
+                        let field = tags::TagField {
+                            width: 170.0,
+                            focus: false,
+                            hint: "",
+                            clear: false,
+                        };
+                        let id = Id::unique(("quick tag", index));
+                        field.show(ui, id, tag, list, &Default::default());
+                        if cell % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Tag list").strong());
+            if let Some(list_change) = tags::list_editor(ui, list, list_input, palette) {
+                change = Some(SettingsChange::List(list_change));
+            }
+        }
+        SettingsTab::Video => {
+            ui.label(egui::RichText::new("Seek bar").strong());
+            hand(ui.checkbox(&mut settings.waveform, "Show audio waveform"));
+            ui.add_enabled_ui(settings.waveform, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Style");
+                    hand(ui.selectable_value(&mut settings.wave_filled, false, "Bars"));
+                    hand(ui.selectable_value(&mut settings.wave_filled, true, "Filled"));
+                });
+                egui::Grid::new("wave-settings")
+                    .num_columns(2)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Min height");
+                        ui.add(
+                            egui::Slider::new(&mut settings.wave_min, 1.0..=40.0)
+                                .suffix(" px")
+                                .max_decimals(0),
+                        );
+                        ui.end_row();
+                        ui.label("Max height");
+                        ui.add(
+                            egui::Slider::new(&mut settings.wave_max, 2.0..=40.0)
+                                .suffix(" px")
+                                .max_decimals(0),
+                        );
+                        ui.end_row();
+                        ui.label("Smoothing");
+                        ui.add(
+                            egui::Slider::new(&mut settings.wave_smooth, 0.0..=1.0).max_decimals(2),
+                        );
+                        ui.end_row();
+                    });
             });
-    });
-    make_default
+        }
+        SettingsTab::Keybinds => {}
+    }
+    change
 }
 
 /// The first key of each quick tag, or a dash when it has none.
@@ -3187,12 +3306,116 @@ pub(crate) fn quick_tag_keys(keymap: &Keymap) -> [String; 9] {
     })
 }
 
+/// Help's overview of the keys that matter for what is open (`kind`): no
+/// video keys for a photo, no photo or zoom keys for a video. Ratings and
+/// labels share a row each, and only quick tags that are set are listed.
+fn keys_overview(
+    ui: &mut egui::Ui,
+    settings: &Settings,
+    kind: Option<Kind>,
+    palette: &crate::theme::Palette,
+) {
+    let keymap = &settings.keys;
+    let first = |action: Action| keymap.keys(action).first().map(ToString::to_string);
+    let range = |from: Action, to: Action| Some(format!("{} – {}", first(from)?, first(to)?));
+    let zoom = kind != Some(Kind::Video);
+    let groups: Vec<(&str, Vec<(String, String)>)> = keys::GROUPS
+        .iter()
+        .filter(|group| match **group {
+            "Video" => kind == Some(Kind::Video),
+            "Photo" => kind == Some(Kind::Image),
+            "Tags" | "Save" => kind.is_some(),
+            _ => true,
+        })
+        .map(|group| {
+            let mut rows = Vec::new();
+            for action in Action::all().into_iter().filter(|a| a.group() == *group) {
+                let row = match action {
+                    Action::ZoomIn | Action::ZoomOut | Action::Fit | Action::ActualSize
+                        if !zoom =>
+                    {
+                        None
+                    }
+                    Action::Rate(1) => {
+                        range(Action::Rate(1), Action::Rate(5)).map(|key| (key, "1 to 5 stars".into()))
+                    }
+                    Action::Rate(stars) if stars > 1 => None,
+                    Action::Label(0) => range(Action::Label(0), Action::Label(3))
+                        .map(|key| (key, "Red, yellow, green, blue label".into())),
+                    Action::Label(_) => None,
+                    Action::QuickTag(index) => {
+                        let tag = tags::normalize(&settings.quick_tags[usize::from(index)]);
+                        if tag.is_empty() {
+                            None
+                        } else {
+                            first(action).map(|key| (key, tag))
+                        }
+                    }
+                    _ => first(action).map(|key| (key, action.label())),
+                };
+                rows.extend(row);
+            }
+            // Keys that work only in a mode, and can't be changed.
+            let fixed: &[(&str, &str)] = match *group {
+                "Video" => &[("Esc", "Leave trim")],
+                "Tags" => &[("Esc", "Close the tag bar")],
+                "Photo" => &[
+                    ("Enter", "Apply crop"),
+                    ("Esc", "Leave crop"),
+                    ("1 – 5", "Crop shape, while cropping"),
+                ],
+                "View" => &[("Esc", "Leave fullscreen")],
+                _ => &[],
+            };
+            rows.extend(fixed.iter().map(|(key, label)| (key.to_string(), label.to_string())));
+            (*group, rows)
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect();
+    ui.label(
+        egui::RichText::new("Change keys and quick tags in Settings.")
+            .color(palette.muted)
+            .size(12.0),
+    );
+    // Two columns, each group in the one with fewer rows so far.
+    let mut columns: [Vec<&(&str, Vec<(String, String)>)>; 2] = [Vec::new(), Vec::new()];
+    let mut heights = [0; 2];
+    for group in &groups {
+        let side = usize::from(heights[1] < heights[0]);
+        heights[side] += group.1.len() + 2;
+        columns[side].push(group);
+    }
+    ui.columns(2, |uis| {
+        for (ui, column) in uis.iter_mut().zip(&columns) {
+            for (name, rows) in column {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(*name).size(15.0).color(palette.fg));
+                egui::Grid::new(("overview", *name))
+                    .num_columns(2)
+                    .spacing([10.0, 2.0])
+                    .show(ui, |ui| {
+                        for (key, label) in rows {
+                            let key = egui::RichText::new(key)
+                                .monospace()
+                                .size(11.5)
+                                .color(palette.accent);
+                            ui.label(key);
+                            ui.label(egui::RichText::new(label).size(12.5));
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+    });
+}
+
 /// Every keyboard shortcut, grouped. Clicking a key waits for the new one
 /// (`rebinding`); right-clicking takes it away; + adds another key.
 fn keybinds_ui(
     ui: &mut egui::Ui,
     keymap: &mut Keymap,
     rebinding: &mut Option<Rebind>,
+    quick_tags: &[String; 9],
     palette: &crate::theme::Palette,
 ) {
     ui.label(
@@ -3202,40 +3425,72 @@ fn keybinds_ui(
     );
     // Room for the page's title, tabs and button in a short window.
     let height = (ui.ctx().content_rect().height() - 280.0).clamp(120.0, 420.0);
-    egui::ScrollArea::vertical()
-        .max_height(height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for group in keys::GROUPS {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(group).size(15.0).color(palette.fg));
-                egui::Grid::new(group)
+    // The category picked on the left, kept while Settings is open.
+    let id = ui.scope_id().with("keybind group");
+    let mut picked: &str = ui
+        .data(|data| data.get_temp(id))
+        .filter(|group| *group != "Save")
+        .unwrap_or(keys::GROUPS[0]);
+    ui.horizontal_top(|ui| {
+        // The tab pane on its own background, set apart from the keys.
+        egui::Frame::new()
+            .fill(palette.surface)
+            .corner_radius(6.0)
+            .inner_margin(4.0)
+            .show(ui, |ui| {
+                ui.set_width(90.0);
+                ui.set_min_height(height - 8.0);
+                ui.vertical(|ui| {
+                    // Fixed keys (saving, quitting, Esc) are listed in Help.
+                    let editable = keys::GROUPS.into_iter().filter(|group| *group != "Save");
+                    for group in editable {
+                        let tab = egui::Button::selectable(picked == group, group)
+                            .min_size(vec2(90.0, 26.0));
+                        if hand(ui.add(tab)).clicked() {
+                            picked = group;
+                        }
+                    }
+                });
+            });
+        // A separator would take the modal's whole height, which is last
+        // frame's size plus spacing, and the window would grow every frame.
+        let (line, _) = ui.allocate_exact_size(vec2(17.0, height), Sense::hover());
+        let stroke = Stroke::new(1.0, palette.muted.gamma_multiply(0.5));
+        ui.painter().vline(line.center().x, line.y_range(), stroke);
+        // A fixed height, so the window keeps its size between categories.
+        egui::ScrollArea::vertical()
+            .max_height(height)
+            .min_scrolled_height(height)
+            .auto_shrink([false, false])
+            // The row lays out sideways; the list inside runs down.
+            .show(ui, |ui| ui.vertical(|ui| {
+                egui::Grid::new(picked)
                     .num_columns(2)
                     .spacing([10.0, 3.0])
-                    .min_col_width(200.0)
+                    .min_col_width(150.0)
                     .show(ui, |ui| {
-                        for action in Action::all().into_iter().filter(|a| a.group() == group) {
-                            ui.label(egui::RichText::new(action.label()).size(12.5));
+                        for action in Action::all().into_iter().filter(|a| a.group() == picked) {
+                            let label = match action {
+                                Action::QuickTag(index) => {
+                                    let tag = tags::normalize(&quick_tags[usize::from(index)]);
+                                    if tag.is_empty() {
+                                        format!("Quick tag {} (not set)", index + 1)
+                                    } else {
+                                        format!("Tag {tag} on / off")
+                                    }
+                                }
+                                _ => action.label(),
+                            };
+                            ui.label(egui::RichText::new(label).size(12.5));
                             ui.horizontal(|ui| {
                                 keybind_buttons(ui, keymap, rebinding, action, palette);
                             });
                             ui.end_row();
                         }
                     });
-            }
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Fixed").size(15.0).color(palette.fg));
-            for (key, action) in [
-                ("Esc", "Leave crop, trim, the tag bar or fullscreen"),
-                ("Enter", "Apply crop"),
-                ("1 – 5", "Crop shape, while cropping"),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(key).monospace().size(11.5).color(palette.accent));
-                    ui.label(egui::RichText::new(action).size(12.5));
-                });
-            }
-        });
+            }));
+    });
+    ui.data_mut(|data| data.insert_temp(id, picked));
     ui.add_space(6.0);
     if ui
         .add_enabled(!keymap.is_default(), egui::Button::new("Restore default keys"))
@@ -3543,6 +3798,8 @@ pub(crate) enum Icon {
     /// A circle with a slash: the file is rejected.
     Reject,
     Help,
+    /// A tick: something is already done.
+    Check,
 }
 
 /// Icons are drawn as vector paths: no icon font to ship, crisp at any scale.
@@ -3715,6 +3972,13 @@ pub(crate) fn paint_icon(painter: &egui::Painter, icon: Icon, center: Pos2, colo
         Icon::Reject => {
             painter.circle_stroke(center, 7.0, stroke);
             painter.line_segment([at(-4.9, 4.9), at(4.9, -4.9)], stroke);
+        }
+        Icon::Check => {
+            let stroke = Stroke::new(2.2, color);
+            painter.add(Shape::line(
+                vec![at(-5.5, 0.5), at(-1.5, 4.5), at(6.0, -4.5)],
+                stroke,
+            ));
         }
         Icon::Help => {
             painter.circle_stroke(center, 7.5, stroke);

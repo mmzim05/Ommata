@@ -525,96 +525,139 @@ fn add_field(
     suggest: Option<&BTreeSet<String>>,
 ) {
     let id = ui.scope_id().with("add tag");
-    let mut state: SuggestState = ui.data(|data| data.get_temp(id)).unwrap_or_default();
-    let found = match suggest {
-        Some(known) if !input.trim().is_empty() => suggestions(input, known, &meta.tags),
-        _ => Vec::new(),
+    let empty = BTreeSet::new();
+    let known = suggest.unwrap_or(&empty);
+    let field = TagField {
+        width,
+        focus,
+        hint: "Add tag, / to nest",
+        clear: true,
     };
-    state.selected = state.selected.filter(|index| *index < found.len());
-    let had_focus = ui.memory(|memory| memory.has_focus(id));
-    let mut completed = false;
-    if had_focus && !found.is_empty() {
-        ui.input_mut(|keys| {
-            let count = found.len();
-            if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                state.selected = Some(state.selected.map_or(0, |index| (index + 1) % count));
-            }
-            if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                state.selected = Some(state.selected.map_or(count - 1, |index| {
-                    (index + count - 1) % count
-                }));
-            }
-            if keys.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                *input = found[state.selected.unwrap_or(0)].clone();
-                state.selected = None;
-                completed = true;
-            }
-        });
-    }
-    let field = ui.add(
-        egui::TextEdit::singleline(input)
-            .id(id)
-            // While suggestions show, Tab takes one instead of moving on.
-            .lock_focus(!found.is_empty())
-            .hint_text("Add tag, / to nest")
-            .background_color(ui.visuals().widgets.inactive.bg_fill)
-            .desired_width(width),
-    );
-    if field.changed() {
-        state.selected = None;
-    }
-    if focus || completed {
-        field.request_focus();
-    }
-    if completed {
-        // Tab already moved the cursor on; keep it here, after the tag.
-        if let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), id) {
-            let end = egui::text::CCursor::new(input.chars().count());
-            edit.cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(end)));
-            edit.store(ui.ctx(), id);
-        }
-    }
-    let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-    let picked = state.selected.and_then(|index| found.get(index).cloned());
-    let tag = picked.unwrap_or_else(|| normalize(input));
-    let mut added = false;
-    if entered && !tag.is_empty() {
+    if let Some(tag) = field.show(ui, id, input, known, &meta.tags) {
         meta.tags.insert(tag);
-        added = true;
     }
-    // The list stays up while the pointer is on it, so the click that takes
-    // the field's cursor away still lands.
-    let over_list = state.list.is_some_and(|rect| {
-        ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)))
-    });
-    state.list = None;
-    if !added && !found.is_empty() && (field.has_focus() || over_list) {
-        let palette_fg = ui.visuals().text_color();
-        let list = egui::Area::new(id.with("suggestions"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(field.rect.left_bottom() + vec2(0.0, 4.0))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(field.rect.width());
-                    for (index, suggestion) in found.iter().enumerate() {
-                        let selected = state.selected == Some(index);
-                        let text = egui::RichText::new(suggestion).color(palette_fg);
-                        if hand(ui.selectable_label(selected, text)).clicked() {
-                            meta.tags.insert(suggestion.clone());
-                            added = true;
-                        }
-                    }
-                });
+}
+
+/// A text field for one tag that suggests the best matches among known tags
+/// while typing: ↑ ↓ pick one, Tab fills it in, a click or Enter takes it.
+pub struct TagField<'a> {
+    pub width: f32,
+    /// Put the cursor in the field.
+    pub focus: bool,
+    pub hint: &'a str,
+    /// Empty the field and keep the cursor in it once a tag is taken, ready
+    /// for the next; otherwise the field keeps the tag.
+    pub clear: bool,
+}
+
+impl TagField<'_> {
+    /// Returns the tag taken this frame, if any. `skip` is left out of the
+    /// suggestions.
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        input: &mut String,
+        known: &BTreeSet<String>,
+        skip: &BTreeSet<String>,
+    ) -> Option<String> {
+        let mut state: SuggestState = ui.data(|data| data.get_temp(id)).unwrap_or_default();
+        let had_focus = ui.memory(|memory| memory.has_focus(id));
+        // Suggestions only while typing, and not once the field holds one.
+        let found = if had_focus && !input.trim().is_empty() {
+            let mut found = suggestions(input, known, skip);
+            found.retain(|tag| *tag != normalize(input));
+            found
+        } else {
+            Vec::new()
+        };
+        state.selected = state.selected.filter(|index| *index < found.len());
+        let mut completed = false;
+        if !found.is_empty() {
+            ui.input_mut(|keys| {
+                let count = found.len();
+                if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    state.selected = Some(state.selected.map_or(0, |index| (index + 1) % count));
+                }
+                if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    state.selected = Some(state.selected.map_or(count - 1, |index| {
+                        (index + count - 1) % count
+                    }));
+                }
+                if keys.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    *input = found[state.selected.unwrap_or(0)].clone();
+                    state.selected = None;
+                    completed = true;
+                }
             });
-        state.list = Some(list.response.rect);
+        }
+        let field = ui.add(
+            egui::TextEdit::singleline(input)
+                .id(id)
+                // While suggestions show, Tab takes one instead of moving on.
+                .lock_focus(!found.is_empty())
+                .hint_text(self.hint)
+                .background_color(ui.visuals().widgets.inactive.bg_fill)
+                .desired_width(self.width)
+                // A grid column starts narrow; this keeps every field as wide.
+                .min_size(vec2(self.width, 0.0)),
+        );
+        if field.changed() {
+            state.selected = None;
+        }
+        if self.focus || completed {
+            field.request_focus();
+        }
+        if completed {
+            // Tab already moved the cursor on; keep it here, after the tag.
+            if let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), id) {
+                let end = egui::text::CCursor::new(input.chars().count());
+                edit.cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                edit.store(ui.ctx(), id);
+            }
+        }
+        let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let picked = state.selected.and_then(|index| found.get(index).cloned());
+        let tag = picked.unwrap_or_else(|| normalize(input));
+        let mut taken = (entered && !tag.is_empty()).then_some(tag);
+        // The list stays up while the pointer is on it, so the click that takes
+        // the field's cursor away still lands.
+        let over_list = state.list.is_some_and(|rect| {
+            ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)))
+        });
+        state.list = None;
+        if taken.is_none() && !found.is_empty() && (field.has_focus() || over_list) {
+            let palette_fg = ui.visuals().text_color();
+            let list = egui::Area::new(id.with("suggestions"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(field.rect.left_bottom() + vec2(0.0, 4.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(field.rect.width());
+                        for (index, suggestion) in found.iter().enumerate() {
+                            let selected = state.selected == Some(index);
+                            let text = egui::RichText::new(suggestion).color(palette_fg);
+                            if hand(ui.selectable_label(selected, text)).clicked() {
+                                taken = Some(suggestion.clone());
+                            }
+                        }
+                    });
+                });
+            state.list = Some(list.response.rect);
+        }
+        if let Some(tag) = &taken {
+            state = SuggestState::default();
+            if self.clear {
+                input.clear();
+                field.request_focus();
+            } else {
+                input.clone_from(tag);
+            }
+        }
+        ui.data_mut(|data| data.insert_temp(id, state));
+        taken
     }
-    if added {
-        input.clear();
-        state = SuggestState::default();
-        field.request_focus();
-    }
-    ui.data_mut(|data| data.insert_temp(id, state));
 }
 
 /// What a click in Edit tags asks for.
@@ -712,6 +755,48 @@ pub fn panel(
         return Some(PanelChange::Forget(tag));
     }
     (*meta != before).then_some(PanelChange::Tags)
+}
+
+/// A change to the tag list asked for in Settings.
+#[derive(PartialEq, Debug)]
+pub enum ListChange {
+    Add(String),
+    Forget(String),
+}
+
+/// The tag list in Settings: a field that adds a tag to it without putting
+/// it on a file, and every tag on it as a bubble a click forgets.
+pub fn list_editor(
+    ui: &mut egui::Ui,
+    list: &BTreeSet<String>,
+    input: &mut String,
+    palette: &Palette,
+) -> Option<ListChange> {
+    ui.label(
+        egui::RichText::new(
+            "Tags offered while typing one, in every folder. Click a tag to forget it.",
+        )
+        .color(palette.muted)
+        .size(12.0),
+    );
+    let field = TagField {
+        width: 260.0,
+        focus: false,
+        hint: "Add a tag to the list, / to nest",
+        clear: true,
+    };
+    let id = ui.make_persistent_id("tag list field");
+    let added = field.show(ui, id, input, list, list);
+    if let Some(tag) = added.filter(|tag| !sidecar::is_internal(tag)) {
+        return Some(ListChange::Add(tag));
+    }
+    if list.is_empty() {
+        ui.label(egui::RichText::new("No tags yet.").color(palette.muted));
+        return None;
+    }
+    ui.add_space(4.0);
+    let none = &Default::default();
+    chips(ui, list, |_| true, true, none, none, palette).map(|(tag, _)| ListChange::Forget(tag))
 }
 
 /// The filter panel: which tags, rating and label a file needs for the
