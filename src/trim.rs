@@ -39,11 +39,17 @@ fn seek_keyframe(
                 .then(|| packet.pts().or(packet.dts()))
                 .flatten()
         });
-        let keyframe = key_pts.ok_or(ff::Error::Eof)? as f64 * time_base - start;
+        // A seek near the end (MPEG-TS seeks by byte) can land after the
+        // last keyframe, finding none: step back as for one shown too late.
+        let keyframe = key_pts.map(|pts| pts as f64 * time_base - start);
         // Decode times can start before the file's start time (B-frames in
         // MPEG-TS), so the search goes a little past it before giving up.
-        if keyframe <= time + 1e-4 || time - back <= -2.0 {
+        let gave_up = time - back <= -2.0;
+        if let Some(keyframe) = keyframe.filter(|keyframe| *keyframe <= time + 1e-4 || gave_up) {
             return Ok((video_index, keyframe, target));
+        }
+        if gave_up {
+            return Err(ff::Error::Eof);
         }
         back = if back == 0.0 { 0.1 } else { back * 2.0 };
     }

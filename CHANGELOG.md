@@ -9,6 +9,21 @@ the new version.
 
 ## [Unreleased]
 
+### Added
+
+- Zoom on videos: scroll or pinch at the pointer, drag to pan, and the zoom keys, as on
+  photos. A paused frame is decoded again at the zoomed size, so zooming in shows detail.
+
+### Changed
+
+- The update button is gone from the top bar; the update card and Help › Version offer
+  the update instead.
+
+### Fixed
+
+- Trimming an MPEG-TS video (`.ts`, `.mts`, `.m2ts`) no longer fails with "End of file"
+  when the trim starts in the last seconds of the clip.
+
 ## [0.5.2] - 2026-11-07
 
 ### Added

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Idle time after which the bars fade out and the cursor hides.
 const CHROME_SECS: f64 = 3.0;
@@ -225,6 +225,10 @@ pub struct App {
     pan: Vec2,
     /// The scale that fits the current image in the window, from the last frame.
     fit_scale: f32,
+    /// The size the video was last decoded for, in pixels.
+    video_target: Option<(u32, u32)>,
+    /// When a paused video's size changed, to decode its frame again.
+    resized_at: Option<Instant>,
     crop: Option<CropTool>,
     job: Option<Job>,
     toast: Option<(String, f64)>,
@@ -345,6 +349,8 @@ impl App {
             zoom: None,
             pan: Vec2::ZERO,
             fit_scale: 1.0,
+            video_target: None,
+            resized_at: None,
             crop: None,
             job: None,
             toast: None,
@@ -1460,12 +1466,35 @@ impl App {
                     return;
                 };
                 let size = vec2(info.size[0] as f32, info.size[1] as f32);
-                let frame_rect = fit(rect, size, f32::INFINITY);
+                let frame_rect = self.zoom_view(ui, rect, rect, &response, size, f32::INFINITY);
+                // Decode at the size shown, zoomed in or not; the decoder
+                // never goes past the video's own resolution.
                 let scale = ui.ctx().pixels_per_point();
-                player.set_target(
+                let target = (
                     (frame_rect.width() * scale) as u32,
                     (frame_rect.height() * scale) as u32,
                 );
+                if let Some((_, player)) = &mut self.player {
+                    player.set_target(target.0, target.1);
+                    // A paused frame was decoded for the old size: decode it
+                    // again once the zoom settles, so zooming in shows detail.
+                    if player.paused && self.video_target.is_some_and(|old| old != target) {
+                        self.resized_at = Some(Instant::now());
+                    }
+                    if let Some(at) = self.resized_at {
+                        let settle = Duration::from_millis(250);
+                        if !player.paused {
+                            self.resized_at = None;
+                        } else if at.elapsed() >= settle {
+                            self.resized_at = None;
+                            let position = player.position;
+                            player.seek(position, true);
+                        } else {
+                            ui.ctx().request_repaint_after(settle - at.elapsed());
+                        }
+                    }
+                }
+                self.video_target = Some(target);
                 let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
                 ui.painter().image(texture, frame_rect, uv, Color32::WHITE);
                 if response.clicked() {
@@ -1507,39 +1536,21 @@ impl App {
         }
     }
 
-    fn image_canvas(
+    /// Zoom at the pointer and pan by dragging, for a picture or video frame
+    /// of `out` pixels shown in `area` of the canvas `rect`. Fitting scales
+    /// it up to at most `max_fit`. Returns where it goes on screen.
+    fn zoom_view(
         &mut self,
-        ui: &mut egui::Ui,
+        ui: &egui::Ui,
         rect: Rect,
+        area: Rect,
         response: &egui::Response,
-        path: &Path,
-    ) {
-        let palette = self.theme.palette;
-        let (texture, size) = match self.images.get(path) {
-            Some(Slot::Ready { texture, size }) => (texture.clone(), *size),
-            Some(Slot::Failed(error)) => {
-                let error = error.clone();
-                centered_text(
-                    ui,
-                    rect,
-                    &format!("Can't open this image\n{error}"),
-                    palette.muted,
-                );
-                return;
-            }
-            _ => return,
-        };
-        let edit = self.edits.get(path).copied().unwrap_or_default();
-        // While cropping, show the whole rotated image with the crop overlaid.
-        let shown = Edit {
-            crop: if self.crop.is_some() { None } else { edit.crop },
-            ..edit
-        };
-        let out = shown.output_size(size);
-        let out = vec2(out[0] as f32, out[1] as f32);
-        let area = rect.shrink(if self.crop.is_some() { 48.0 } else { 0.0 });
-
-        let fit_scale = (area.width() / out.x).min(area.height() / out.y).min(1.0);
+        out: Vec2,
+        max_fit: f32,
+    ) -> Rect {
+        let fit_scale = (area.width() / out.x)
+            .min(area.height() / out.y)
+            .min(max_fit);
         self.fit_scale = fit_scale;
         // A window grown since the zoom was set may now need more.
         self.zoom = self.zoom.map(|zoom| clamp_zoom(zoom, fit_scale));
@@ -1585,7 +1596,42 @@ impl App {
         let scale = self.zoom.unwrap_or(fit_scale);
         let limit = overflow(scale);
         self.pan = self.pan.clamp(-limit, limit);
-        let image_rect = Rect::from_center_size(area.center() + self.pan, out * scale);
+        Rect::from_center_size(area.center() + self.pan, out * scale)
+    }
+
+    fn image_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        response: &egui::Response,
+        path: &Path,
+    ) {
+        let palette = self.theme.palette;
+        let (texture, size) = match self.images.get(path) {
+            Some(Slot::Ready { texture, size }) => (texture.clone(), *size),
+            Some(Slot::Failed(error)) => {
+                let error = error.clone();
+                centered_text(
+                    ui,
+                    rect,
+                    &format!("Can't open this image\n{error}"),
+                    palette.muted,
+                );
+                return;
+            }
+            _ => return,
+        };
+        let edit = self.edits.get(path).copied().unwrap_or_default();
+        // While cropping, show the whole rotated image with the crop overlaid.
+        let shown = Edit {
+            crop: if self.crop.is_some() { None } else { edit.crop },
+            ..edit
+        };
+        let out = shown.output_size(size);
+        let out = vec2(out[0] as f32, out[1] as f32);
+        let area = rect.shrink(if self.crop.is_some() { 48.0 } else { 0.0 });
+
+        let image_rect = self.zoom_view(ui, rect, area, response, out, 1.0);
 
         let crop = shown
             .crop
@@ -2067,9 +2113,6 @@ impl App {
             }
         }
         ui.separator();
-        if self.update_controls(ctx, ui, &palette, false) {
-            ui.separator();
-        }
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         let (screen_icon, screen_tip) = if fullscreen {
             (Icon::ExitFullscreen, "Leave fullscreen (F)")
@@ -2228,15 +2271,14 @@ impl App {
     }
 
     /// Update status and its action. `full` (the Version tab) shows every
-    /// state; the top bar shows only an update on offer or in progress.
-    /// Returns whether anything was drawn.
+    /// state; the update card shows only an update on offer or in progress.
     fn update_controls(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         palette: &crate::theme::Palette,
         full: bool,
-    ) -> bool {
+    ) {
         let accent = |ui: &mut egui::Ui, text: String| {
             filled_button(ui, text, palette.accent, palette)
         };
@@ -2306,9 +2348,8 @@ impl App {
                     self.updater.install(version);
                 }
             }
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
     /// Help or Settings: the same window from the start screen and from a
@@ -3307,7 +3348,7 @@ pub(crate) fn quick_tag_keys(keymap: &Keymap) -> [String; 9] {
 }
 
 /// Help's overview of the keys that matter for what is open (`kind`): no
-/// video keys for a photo, no photo or zoom keys for a video. Ratings and
+/// video keys for a photo, no photo keys for a video. Ratings and
 /// labels share a row each, and only quick tags that are set are listed.
 fn keys_overview(
     ui: &mut egui::Ui,
@@ -3318,7 +3359,6 @@ fn keys_overview(
     let keymap = &settings.keys;
     let first = |action: Action| keymap.keys(action).first().map(ToString::to_string);
     let range = |from: Action, to: Action| Some(format!("{} – {}", first(from)?, first(to)?));
-    let zoom = kind != Some(Kind::Video);
     let groups: Vec<(&str, Vec<(String, String)>)> = keys::GROUPS
         .iter()
         .filter(|group| match **group {
@@ -3331,11 +3371,6 @@ fn keys_overview(
             let mut rows = Vec::new();
             for action in Action::all().into_iter().filter(|a| a.group() == *group) {
                 let row = match action {
-                    Action::ZoomIn | Action::ZoomOut | Action::Fit | Action::ActualSize
-                        if !zoom =>
-                    {
-                        None
-                    }
                     Action::Rate(1) => {
                         range(Action::Rate(1), Action::Rate(5)).map(|key| (key, "1 to 5 stars".into()))
                     }
@@ -3745,13 +3780,6 @@ fn fit_aspect_centered(rect: Rect, aspect: f32, size: [usize; 2]) -> Rect {
 }
 
 /// `size` scaled to fit centered in `area`, at most `max_scale`.
-fn fit(area: Rect, size: Vec2, max_scale: f32) -> Rect {
-    let scale = (area.width() / size.x)
-        .min(area.height() / size.y)
-        .min(max_scale);
-    Rect::from_center_size(area.center(), size * scale)
-}
-
 fn centered_text(ui: &egui::Ui, rect: Rect, text: &str, color: Color32) {
     ui.painter().text(
         rect.center(),
@@ -4065,5 +4093,85 @@ fn fmt_time(time: f64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    /// A fresh folder for one test, inside a fake data home so the trash
+    /// used is a test one, on the same disk as the files.
+    fn folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ommata-save-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn failed_write_leaves_the_original_alone() {
+        let dir = folder("fail");
+        let clip = dir.join("files/clip.mp4");
+        std::fs::write(&clip, b"original").unwrap();
+        let result = replace_trashing_original(&clip, |temp| {
+            std::fs::write(temp, b"half").unwrap();
+            Err("encoder failed".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&clip).unwrap(), b"original");
+        assert_eq!(names(&dir.join("files")), ["clip.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_never_touches_the_original() {
+        let dir = folder("copy");
+        let clip = dir.join("files/clip.mp4");
+        std::fs::write(&clip, b"original").unwrap();
+        let copy = library::edit_copy_path(&clip, None);
+        save_to(&clip, &copy, SaveMode::Copy, |temp| {
+            std::fs::write(temp, b"trimmed").map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&clip).unwrap(), b"original");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"trimmed");
+        assert_eq!(names(&dir.join("files")), ["clip-edit.mp4", "clip.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overwriting puts the new file in place and the untouched original in
+    /// the trash, without replacing a file already called `clip-original`.
+    #[test]
+    fn overwrite_keeps_the_original_in_the_trash() {
+        let dir = folder("overwrite");
+        // SAFETY: only this test uses the trash, which reads XDG_DATA_HOME.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        let clip = dir.join("files/clip.mp4");
+        let other = dir.join("files/clip-original.mp4");
+        std::fs::write(&clip, b"original").unwrap();
+        std::fs::write(&other, b"someone else's").unwrap();
+        let note = replace_trashing_original(&clip, |temp| {
+            assert_eq!(std::fs::read(&clip).unwrap(), b"original");
+            std::fs::write(temp, b"trimmed").map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(note.contains("clip-original-2.mp4"), "{note}");
+        assert_eq!(std::fs::read(&clip).unwrap(), b"trimmed");
+        assert_eq!(std::fs::read(&other).unwrap(), b"someone else's");
+        assert_eq!(names(&dir.join("files")), ["clip-original.mp4", "clip.mp4"]);
+        let trashed = dir.join("Trash/files/clip-original-2.mp4");
+        assert_eq!(std::fs::read(&trashed).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

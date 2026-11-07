@@ -39,8 +39,8 @@ window, or go fullscreen. EXIF rotation is applied for you.
 
 ### Smooth video
 
-Play and scrub even 4K video. Hover the seek bar to preview any moment, and step frame by
-frame with `,` and `.`.
+Play and scrub even 4K video. Hover the seek bar to preview any moment, step frame by
+frame with `,` and `.`, and zoom in with the scroll wheel or `+` like on a photo.
 
 <img src="docs/screenshots/hover.webp" alt="Scrubbing a video with seek-bar thumbnails" width="800" />
 
@@ -78,8 +78,8 @@ everything else in it, like a darktable edit history.
 - **Controls that get out of the way:** they fade when you stop moving the mouse.
 - **Media keys:** play, pause, next and previous work from your keyboard, `playerctl` and
   your desktop's player controls.
-- **One click to make it your viewer:** **Open all photos and videos with Ommata** in
-  Settings makes it the default app for every type it opens.
+- **One click to make it your viewer:** **Set Ommata as default** in Settings makes it
+  the default app for every type it opens.
 
 ## Install
 
