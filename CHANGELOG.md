@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-07
+
 ### Added
 
 - Zoom on videos: scroll or pinch at the pointer, drag to pan, and the zoom keys, as on
@@ -199,7 +201,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.3
 [0.5.2]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.2
 [0.5.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.1
 [0.5.0]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.0
