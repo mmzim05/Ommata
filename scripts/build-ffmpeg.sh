@@ -21,8 +21,12 @@ readonly PREFIX="$ROOT/target/ffmpeg"
 # MPEG-PS identifies its video streams by probing them with the raw-stream
 # demuxers (mpegvideo, h264, hevc); without them a stream can come out as MP3.
 readonly DEMUXERS=(mov matroska avi mpegts mpegps flv ogg asf ivf mp3 wav aac
-  flac mpegvideo h264 hevc)
-readonly MUXERS=(mov mp4 matroska webm avi mpegts ogg flv asf ivf)
+  flac mpegvideo h264 hevc
+  aiff ape wv tta tak shorten amr au caf dsf iff w64 voc mpc mpc8 rm ac3 eac3
+  dts truehd mlp gsm qoa oma xwma)
+readonly MUXERS=(mov mp4 matroska webm avi mpegts ogg flv asf ivf
+  mp3 mp2 ipod adts flac wav opus spx aiff wv tta amr au caf w64 voc rm ac3
+  eac3 dts truehd mlp gsm oma)
 # AV1 has two decoders: FFmpeg's own (av1) decodes only on the GPU, and
 # libdav1d on the CPU when the GPU can't.
 readonly DECODERS=(
@@ -30,9 +34,15 @@ readonly DECODERS=(
   vc1 wmv3 h263 msmpeg4v3 dvvideo
   aac aac_latm mp3 mp3float mp2 opus vorbis flac ac3 eac3 alac dca truehd wmav2
   pcm_s16le pcm_s16be pcm_s24le pcm_s32le pcm_f32le pcm_u8
+  mp1 mp1float mp2float wmav1 wmapro wmalossless wmavoice ape wavpack tta tak
+  shorten als mlp mpc7 mpc8 amrnb amrwb speex gsm gsm_ms qoa cook ra_144 ra_288
+  sipr atrac3 atrac3p atrac9 qdm2 qdmc dsd_lsbf dsd_msbf dsd_lsbf_planar
+  dsd_msbf_planar dst pcm_s24be pcm_s32be pcm_f32be pcm_f64le pcm_f64be pcm_s8
+  pcm_u16le pcm_u16be pcm_s16le_planar pcm_mulaw pcm_alaw adpcm_ms adpcm_ima_wav
+  adpcm_ima_qt eightsvx_fib eightsvx_exp ralf
 )
 readonly PARSERS=(h264 hevc vp8 vp9 av1 mpeg4video mpegvideo mjpeg vc1 aac
-  aac_latm mpegaudio opus vorbis flac ac3 dca)
+  aac_latm mpegaudio opus vorbis flac ac3 dca mlp amr gsm tak sipr cook)
 # GPU decoding through VA-API. libva is linked dynamically: it loads the GPU
 # vendor's driver at runtime, and ommata falls back to the CPU without one.
 readonly HWACCELS=(h264_vaapi hevc_vaapi vp8_vaapi vp9_vaapi av1_vaapi
@@ -84,6 +94,7 @@ build_dav1d() {
   if [[ -f "$PREFIX/lib/libdav1d.a" ]]; then
     return
   fi
+  check_tools
   dav1d_src="$(fetch "${DAV1D_SOURCE:-}" \
     "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" \
     "$DAV1D_SHA256")"
@@ -129,7 +140,6 @@ main() {
     echo "FFmpeg already built in $PREFIX (delete it to rebuild)"
     exit 0
   fi
-  check_tools
   build_dav1d
   build_ffmpeg
   # Rust bundles the static libraries into ffmpeg-sys-next's rlib, so a

@@ -7,8 +7,12 @@
 //! and the size stays proportional to the length kept. Other codecs there
 //! are copied from the keyframe at or before the in point (the UI shows that
 //! snapped point).
+//!
+//! Audio alone is copied packet for packet into the same format: a packet
+//! lasts a few milliseconds, so the cut lands within one of the in point,
+//! never after it.
 
-use crate::video::start_time;
+use crate::video::{display_turns, start_time, video_stream};
 use ffmpeg_next as ff;
 use std::path::Path;
 use std::sync::Arc;
@@ -59,6 +63,9 @@ fn seek_keyframe(
 /// can be frame-exact, else the keyframe at or before it.
 pub fn cut_point(path: &Path, time: f64) -> Option<f64> {
     let mut input = ff::format::input(path).ok()?;
+    if video_stream(&input).is_none() {
+        return Some(time.max(0.0));
+    }
     let exact = has_edit_list(&guess_muxer(path, ""))
         || input
             .streams()
@@ -504,15 +511,24 @@ impl Head {
     }
 }
 
-/// Write `[start, end]` of `src` to `dst` (same container format as `src`).
+/// Write `[start, end]` of `src` to `dst` (same container format as `src`),
+/// its picture turned a further `turns` quarter turns clockwise.
 pub fn export(
     src: &Path,
     dst: &Path,
     start: f64,
     end: f64,
+    turns: u8,
     progress: Arc<Progress>,
 ) -> Result<(), String> {
-    let result = export_inner(src, dst, start, end, &progress);
+    let audio_only = ff::format::input(src)
+        .map(|input| video_stream(&input).is_none())
+        .unwrap_or(false);
+    let result = if audio_only {
+        export_audio(src, dst, start, end, &progress)
+    } else {
+        export_inner(src, dst, start, end, turns, &progress)
+    };
     if result.is_err() {
         // Best effort: a partial file left behind is only clutter.
         let _ = std::fs::remove_file(dst);
@@ -520,11 +536,191 @@ pub fn export(
     result
 }
 
+/// Containers whose muxer stores a display matrix, so a turned picture saves
+/// without re-encoding.
+const ROTATING_MUXERS: &[&str] = &["mov", "mp4", "ipod", "3gp", "3g2", "matroska", "webm"];
+
+/// Whether a turned picture can be saved into `path`'s format.
+pub fn can_rotate(path: &Path) -> bool {
+    let demuxer = ff::format::input(path)
+        .map(|input| {
+            let format = input.format();
+            format.name().split(',').next().unwrap_or("").to_string()
+        })
+        .unwrap_or_default();
+    ROTATING_MUXERS.contains(&guess_muxer(path, &demuxer).as_str())
+}
+
+/// Replace `stream`'s display matrix with one turning its picture `turns`
+/// quarter turns clockwise (none for zero).
+fn set_display_turns(stream: &mut ff::StreamMut, turns: u8) -> Result<(), String> {
+    use ff::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX;
+    // SAFETY: edits the side data list of a stream the output owns, before
+    // its header is written; a display matrix is nine i32s.
+    unsafe {
+        let parameters = (*stream.as_mut_ptr()).codecpar;
+        ff::ffi::av_packet_side_data_remove(
+            (*parameters).coded_side_data,
+            &mut (*parameters).nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX,
+        );
+        if turns == 0 {
+            return Ok(());
+        }
+        let side = ff::ffi::av_packet_side_data_new(
+            &mut (*parameters).coded_side_data,
+            &mut (*parameters).nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX,
+            36,
+            0,
+        );
+        if side.is_null() {
+            return Err("out of memory".into());
+        }
+        // Setting an angle reads back negated, as the clockwise turn
+        // `display_turns` takes it for.
+        ff::ffi::av_display_rotation_set((*side).data.cast::<i32>(), 90.0 * f64::from(turns));
+    }
+    Ok(())
+}
+
+/// Whether a file of audio alone can be trimmed: its format must be one
+/// this build can write.
+pub fn can_trim_audio(path: &Path) -> bool {
+    let muxer = guess_muxer(path, "");
+    let Ok(name) = std::ffi::CString::new(muxer) else {
+        return false;
+    };
+    // SAFETY: looks the name up in FFmpeg's static muxer list.
+    !name.is_empty()
+        && unsafe {
+            !ff::ffi::av_guess_format(name.as_ptr(), std::ptr::null(), std::ptr::null()).is_null()
+        }
+}
+
+/// Copy the audio packets covering `[start, end]` of `src` into `dst`, in
+/// the same format, starting from the packet that plays at `start`. Cover
+/// art and tags come along.
+fn export_audio(
+    src: &Path,
+    dst: &Path,
+    start: f64,
+    end: f64,
+    progress: &Progress,
+) -> Result<(), String> {
+    let to_text = |error: ff::Error| error.to_string();
+    if !can_trim_audio(src) {
+        return Err("this audio format can't be trimmed".into());
+    }
+    let mut input = ff::format::input(src).map_err(to_text)?;
+    let start_offset = start_time(&input);
+    let audio = input
+        .streams()
+        .best(ff::media::Type::Audio)
+        .ok_or("no audio stream")?;
+    let (audio_index, audio_time_base) = (audio.index(), audio.time_base());
+    let mut output = ff::format::output_as(dst, &guess_muxer(src, "")).map_err(to_text)?;
+    // SAFETY: a muxer's codec tag table is static data.
+    let tags = unsafe { (*output.format().as_ptr()).codec_tag };
+    let picture = ff::format::stream::Disposition::ATTACHED_PIC;
+    let stream_count = input.nb_streams() as usize;
+    let mut output_index = vec![None; stream_count];
+    // SAFETY: the muxer's static description, asked whether it stores a codec.
+    // SAFETY: a muxer's description is static data.
+    let muxer = unsafe { output.format().as_ptr() };
+    let stores =
+        |id: ff::codec::Id| unsafe { ff::ffi::avformat_query_codec(muxer, id.into(), 0) == 1 };
+    for in_stream in input.streams() {
+        // Cover art comes along when the format can hold its picture type
+        // (an M4A takes JPEG but not PNG).
+        let kept = in_stream.index() == audio_index
+            || in_stream.disposition().contains(picture) && stores(in_stream.parameters().id());
+        if !kept {
+            continue;
+        }
+        let mut out_stream = output
+            .add_stream(ff::encoder::find(ff::codec::Id::None))
+            .map_err(to_text)?;
+        out_stream.set_parameters(in_stream.parameters());
+        keep_codec_tag_if_valid(tags, &mut out_stream);
+        out_stream.set_time_base(in_stream.time_base());
+        out_stream.set_metadata(in_stream.metadata().to_owned());
+        // SAFETY: plain field copy between live streams, before the header.
+        unsafe { (*out_stream.as_mut_ptr()).disposition = (*in_stream.as_ptr()).disposition };
+        output_index[in_stream.index()] = Some((out_stream.index(), in_stream.time_base()));
+    }
+    output.set_metadata(input.metadata().to_owned());
+    let mut options = ff::Dictionary::new();
+    options.set("avoid_negative_ts", "make_zero");
+    output.write_header_with(options).map_err(to_text)?;
+    let output_time_base: Vec<_> = output.streams().map(|stream| stream.time_base()).collect();
+
+    // Raw streams seek by byte and can land past the point asked for, so aim
+    // a second early. Those without an index can't seek: they are read from
+    // the start, which only takes longer.
+    let target =
+        ((start - 1.0 + start_offset).max(start_offset) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+    if input.seek(target, ..target).is_err() {
+        input = ff::format::input(src).map_err(to_text)?;
+    }
+    let seconds = f64::from(audio_time_base);
+    // Time of a packet without a timestamp: right after the one before.
+    let mut next = 0.0;
+    // Length of a packet that doesn't say (WMA): the gap to the one before.
+    let mut previous = f64::NAN;
+    let mut shift = None;
+    for (stream, mut packet) in input.packets() {
+        if progress.cancel.load(Relaxed) {
+            return Err("cancelled".into());
+        }
+        let Some((out_index, in_time_base)) = output_index[stream.index()] else {
+            continue;
+        };
+        if stream.index() != audio_index {
+            // Cover art: one picture, whenever the demuxer hands it over.
+            packet.rescale_ts(in_time_base, output_time_base[out_index]);
+            packet.set_stream(out_index);
+            packet.set_position(-1);
+            packet.write_interleaved(&mut output).map_err(to_text)?;
+            continue;
+        }
+        let time = packet
+            .pts()
+            .or(packet.dts())
+            .map_or(next, |pts| pts as f64 * seconds - start_offset);
+        // NaN for the first packet that doesn't say.
+        let length = match packet.duration() {
+            0 => time - previous,
+            ticks => ticks as f64 * seconds,
+        };
+        previous = time;
+        next = time + length.max(0.0);
+        // Keep every packet that plays any of [start, end].
+        if next <= start + 1e-6 || length.is_nan() && time < start {
+            continue;
+        }
+        if time >= end {
+            break;
+        }
+        let zero = *shift.get_or_insert(packet.pts().or(packet.dts()).unwrap_or(0));
+        packet.set_pts(packet.pts().map(|pts| pts - zero));
+        packet.set_dts(packet.dts().map(|dts| dts - zero));
+        packet.rescale_ts(audio_time_base, output_time_base[out_index]);
+        packet.set_stream(out_index);
+        packet.set_position(-1);
+        packet.write_interleaved(&mut output).map_err(to_text)?;
+        progress.set((time - start) / (end - start).max(1e-3));
+    }
+    output.write_trailer().map_err(to_text)?;
+    Ok(())
+}
+
 fn export_inner(
     src: &Path,
     dst: &Path,
     start: f64,
     end: f64,
+    turns: u8,
     progress: &Progress,
 ) -> Result<(), String> {
     let to_text = |error: ff::Error| error.to_string();
@@ -582,6 +778,9 @@ fn export_inner(
             .add_stream(ff::encoder::find(ff::codec::Id::None))
             .map_err(to_text)?;
         out_stream.set_parameters(in_stream.parameters());
+        if in_stream.index() == video_index && turns % 4 != 0 {
+            set_display_turns(&mut out_stream, (display_turns(&in_stream) + turns) % 4)?;
+        }
         keep_codec_tag_if_valid(tags, &mut out_stream);
         out_stream.set_time_base(in_stream.time_base());
         out_stream.set_metadata(in_stream.metadata().to_owned());
@@ -793,6 +992,35 @@ fn guess_muxer(src: &Path, demuxer: &str) -> String {
         "flv" => "flv",
         "ogv" => "ogg",
         "wmv" => "asf",
+        // Audio alone.
+        "mp3" => "mp3",
+        "mp2" | "mp1" => "mp2",
+        "m4a" | "m4b" => "ipod",
+        "aac" | "adts" => "adts",
+        "flac" => "flac",
+        "wav" | "wave" => "wav",
+        "ogg" | "oga" => "ogg",
+        "opus" => "opus",
+        "spx" => "spx",
+        "weba" => "webm",
+        "mka" => "matroska",
+        "wma" => "asf",
+        "aif" | "aiff" | "aifc" => "aiff",
+        "wv" => "wv",
+        "tta" => "tta",
+        "amr" | "awb" => "amr",
+        "au" | "snd" => "au",
+        "caf" => "caf",
+        "w64" => "w64",
+        "voc" => "voc",
+        "ra" | "rm" => "rm",
+        "ac3" => "ac3",
+        "eac3" => "eac3",
+        "dts" => "dts",
+        "thd" => "truehd",
+        "mlp" => "mlp",
+        "gsm" => "gsm",
+        "oma" => "oma",
         _ => demuxer,
     }
     .to_string()
@@ -800,6 +1028,80 @@ fn guess_muxer(src: &Path, demuxer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Trims 1 s to 3 s out of every file in a folder of audio samples that
+    /// can be trimmed and checks the result decodes to about 2 s:
+    /// OMMATA_TEST_AUDIO_DIR=dir OMMATA_TRIM_OUT=dir cargo test --release trims_audio -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn trims_audio_files() {
+        use ffmpeg_next as ff;
+        let dir = std::env::var("OMMATA_TEST_AUDIO_DIR").unwrap();
+        let out = std::path::PathBuf::from(std::env::var("OMMATA_TRIM_OUT").unwrap());
+        ff::init().unwrap();
+        let decoded = |path: &std::path::Path| -> Result<f64, ff::Error> {
+            let mut input = ff::format::input(path)?;
+            let stream = input
+                .streams()
+                .best(ff::media::Type::Audio)
+                .ok_or(ff::Error::StreamNotFound)?;
+            let index = stream.index();
+            let mut decoder = ff::codec::Context::from_parameters(stream.parameters())?
+                .decoder()
+                .audio()?;
+            let mut frame = ff::frame::Audio::empty();
+            let mut seconds = 0.0;
+            for (stream, packet) in input.packets() {
+                if stream.index() == index {
+                    let _ = decoder.send_packet(&packet);
+                    while decoder.receive_frame(&mut frame).is_ok() {
+                        seconds += frame.samples() as f64 / f64::from(frame.rate());
+                    }
+                }
+            }
+            let _ = decoder.send_eof();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                seconds += frame.samples() as f64 / f64::from(frame.rate());
+            }
+            Ok(seconds)
+        };
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        let mut failed = Vec::new();
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !super::can_trim_audio(&path) {
+                eprintln!("skip {name}: format can't be written");
+                continue;
+            }
+            let length = decoded(&path).unwrap_or(0.0);
+            if length < 3.5 {
+                eprintln!("skip {name}: {length:.2}s is too short");
+                continue;
+            }
+            let dst = out.join(&name);
+            let progress = std::sync::Arc::new(super::Progress::default());
+            let result = super::export(&path, &dst, 1.0, 3.0, 0, progress)
+                .and_then(|()| decoded(&dst).map_err(|error| error.to_string()));
+            match result {
+                Ok(seconds) if (1.99..2.3).contains(&seconds) => {
+                    eprintln!("ok   {name}: {seconds:.3}s")
+                }
+                Ok(seconds) => {
+                    eprintln!("FAIL {name}: {seconds:.3}s");
+                    failed.push(name);
+                }
+                Err(error) => {
+                    eprintln!("FAIL {name}: {error}");
+                    failed.push(name);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "failed: {failed:?}");
+    }
+
     /// Needs a real clip: OMMATA_TEST_VIDEO=clip.mp4 cargo test -- --ignored
     /// Optional OMMATA_TRIM=start,end and OMMATA_TRIM_OUT=path.
     #[test]
@@ -819,7 +1121,7 @@ mod tests {
         let dst = std::env::var("OMMATA_TRIM_OUT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| src.with_file_name(format!("trim-test-out.{ext}")));
-        super::export(&src, &dst, start, end, Default::default()).unwrap();
+        super::export(&src, &dst, start, end, 0, Default::default()).unwrap();
         let out = ffmpeg_next::format::input(&dst).unwrap();
         let duration = out.duration() as f64 / 1e6;
         let source = std::fs::metadata(&src).unwrap().len() as f64;
@@ -836,5 +1138,63 @@ mod tests {
             duration >= want - 0.05 && duration <= want + 0.5,
             "duration {duration}, want {want}"
         );
+    }
+
+    /// Saving a turn writes it to the display matrix, added to the file's
+    /// own. Needs the `ffmpeg` command to make the clips:
+    /// cargo test --release saves_turns -- --ignored
+    #[test]
+    #[ignore]
+    fn saves_turns() {
+        let dir = std::env::temp_dir().join(format!("ommata-turns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let turns_of = |path: &std::path::Path| {
+            let input = super::ff::format::input(path).unwrap();
+            crate::video::display_turns(&super::video_stream(&input).unwrap())
+        };
+        let mut failed = Vec::new();
+        // (name, codec, turn already in the file in ffmpeg's counter-clockwise degrees)
+        for (name, codec, own) in [
+            ("a.mp4", "libx264", None),
+            ("b.mov", "libx264", Some(-90)),
+            ("c.mkv", "libx264", None),
+            ("d.webm", "libvpx-vp9", Some(180)),
+        ] {
+            let src = dir.join(name);
+            let plain = dir.join(format!("plain-{name}"));
+            let ffmpeg = |args: &[&str]| {
+                let status = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-y"])
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "ffmpeg made no {name}");
+            };
+            let lavfi = "testsrc2=size=320x240:rate=25:duration=3";
+            let plain_path = plain.to_str().unwrap();
+            ffmpeg(&["-f", "lavfi", "-i", lavfi, "-c:v", codec, plain_path]);
+            // A display rotation is set on an input whose streams are copied.
+            let degrees = own.unwrap_or(0).to_string();
+            let src_path = src.to_str().unwrap();
+            ffmpeg(&[
+                "-display_rotation",
+                &degrees,
+                "-i",
+                plain_path,
+                "-c",
+                "copy",
+                src_path,
+            ]);
+            let before = turns_of(&src);
+            let dst = dir.join(format!("turned-{name}"));
+            super::export(&src, &dst, 0.0, 3.0, 1, Default::default()).unwrap();
+            let after = turns_of(&dst);
+            eprintln!("{name}: {before} -> {after}");
+            if after != (before + 1) % 4 {
+                failed.push(name);
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(failed.is_empty(), "failed: {failed:?}");
     }
 }

@@ -40,13 +40,13 @@ window, or go fullscreen. EXIF rotation is applied for you.
 ### Smooth video
 
 Play and scrub even 4K video. Hover the seek bar to preview any moment, step frame by
-frame with `,` and `.`, and zoom in with the scroll wheel or `+` like on a photo.
+frame with `Alt+,` and `Alt+.`, and zoom in with the scroll wheel or `Alt+=` like on a photo.
 
 <img src="docs/screenshots/hover.webp" alt="Scrubbing a video with seek-bar thumbnails" width="800" />
 
 ### Trim clips to the exact frame
 
-Press `T`, drag the handles or press `I` and `O`, then save. The video is copied, not
+Press `Alt+T`, drag the handles or press `Alt+I` and `Alt+O`, then save. The video is copied, not
 re-encoded, so it saves in a fraction of a second with no loss in quality. MP4 and MOV
 clips start on exactly the frame you chose, in any codec.
 
@@ -54,8 +54,12 @@ clips start on exactly the frame you chose, in any codec.
 
 ### Crop, rotate and flip
 
-Press `C` to crop freely or to a fixed shape such as 16:9, `R` to rotate and `H` to flip.
-Save over the original (it goes to the trash, not away) or keep a copy.
+Press `Alt+C` to crop freely or to a fixed shape such as 16:9, `Alt+R` to rotate and `Alt+H`
+to flip. Save over the original (it goes to the trash, not away) or keep a copy.
+
+Videos rotate too. MP4, MOV, MKV and WebM save the turn in the file without re-encoding, so
+saving is instant and loses nothing. Phone videos recorded on their side show the right way
+up.
 
 <img src="docs/screenshots/crop.webp" alt="Cropping a photo to 16:9 and saving a copy" width="800" />
 
@@ -124,31 +128,33 @@ ommata photo.jpg        # open a file, with its folder ready to browse
 ommata ~/Pictures/trip  # open a folder
 ```
 
-Press `?` for Help: the keyboard shortcuts, your version and updates, and reporting a
-problem. Settings are behind the gear in the top bar, or on the start screen.
+Press `F1` (or `Alt+?`) for Help: a search of the keyboard shortcuts, your version and updates, and
+reporting a problem. Settings are behind the gear in the top bar, or on the start screen.
 
 ### Keyboard shortcuts
 
 These are the defaults. To change a key, open Settings and click it under **Keybinds**.
+Keys that type a character take `Alt` (or `Ctrl`), so typing while a file is open starts a
+tag in the tag bar.
 
-| Browse        |                    | View            |                              |
-| ------------- | ------------------ | --------------- | ---------------------------- |
-| `←` `→`       | Previous / next    | Scroll, `+` `-` | Zoom                         |
-| `Home` `End`  | First / last       | `0` / `Z`       | Fit to window / actual size  |
-| `Del`         | Move to trash      | `F`             | Fullscreen                   |
-| `Ctrl+O`      | Open a file        | `?`             | Help                         |
-| `F2`          | Rename             |                 |                              |
+| Browse        |                    | View                    |                             |
+| ------------- | ------------------ | ----------------------- | --------------------------- |
+| `←` `→`       | Previous / next    | Scroll, `Alt+=` `Alt+-` | Zoom                        |
+| `Home` `End`  | First / last       | `Alt+0` / `Alt+Z`       | Fit to window / actual size |
+| `Del`         | Move to trash      | `Ctrl+F`, `F11`         | Fullscreen                  |
+| `Ctrl+O`      | Open a file        | `F1`, `Alt+?`           | Help                        |
+| `F2`          | Rename             |                         |                             |
 
-| Video        |                           | Photo         |                            |
-| ------------ | ------------------------- | ------------- | -------------------------- |
-| `Space`      | Play / pause              | `C`           | Crop                       |
-| `J` `L`      | Back / forward 5 seconds  | `1` – `5`     | Crop shape, while cropping |
-| `,` `.`      | Back / forward one frame  | `Enter`       | Apply crop                 |
-| `M`          | Mute                      | `R` `Shift+R` | Rotate right / left        |
-| `↑` `↓`      | Volume                    | `H`           | Flip                       |
-| `T`          | Trim                      | `Esc`         | Cancel crop                |
-| `I` `O`      | Set trim start / end      |               |                            |
-| `Esc`        | Leave trim                |               |                            |
+| Video            |                           | Photo                 |                            |
+| ---------------- | ------------------------- | --------------------- | -------------------------- |
+| `Space`          | Play / pause              | `Alt+C`               | Crop                       |
+| `Alt+J` `Alt+L`  | Back / forward 5 seconds  | `1` – `5`             | Crop shape, while cropping |
+| `Alt+,` `Alt+.`  | Back / forward one frame  | `Enter`               | Apply crop                 |
+| `Alt+M`          | Mute                      | `Alt+R` `Alt+Shift+R` | Rotate right / left        |
+| `↑` `↓`          | Volume                    | `Alt+H`               | Flip                       |
+| `Alt+T`          | Trim                      | `Esc`                 | Cancel crop                |
+| `Alt+I` `Alt+O`  | Set trim start / end      |                       |                            |
+| `Esc`            | Leave trim                |                       |                            |
 
 | Save           |                                                     |
 | -------------- | --------------------------------------------------- |
@@ -159,13 +165,18 @@ These are the defaults. To change a key, open Settings and click it under **Keyb
 
 | Tags           |                                            |
 | -------------- | ------------------------------------------ |
-| `1` – `9`      | Quick tag on or off (set them in Settings) |
+| `Alt+1` – `9`  | Quick tag on or off (set them in Settings) |
 | `Ctrl+1` – `5` | Rating; the same rating again clears it    |
-| `Ctrl+0`       | Clear the rating                           |
-| `X`            | Reject                                     |
+| `Ctrl+X`       | Clear the rating                           |
+| `Backspace`    | Reject                                     |
 | `Ctrl+6` – `9` | Red, yellow, green or blue label           |
+| `Ctrl+0`       | Purple label                               |
 | `Ctrl+K`       | Show or hide the tag bar                   |
-| `Ctrl+F`       | Filter                                     |
+| `Ctrl+C`       | Copy the file's tags                       |
+| `Ctrl+V`       | Add the copied tags                        |
+| `Ctrl+Shift+V` | Replace the file's tags with the copied    |
+| `Ctrl+Shift+F` | Filter                                     |
+| Type a letter  | Open the tag bar and start typing a tag    |
 
 Edits to a camera RAW save as a DNG: all the original sensor data, with the crop and
 rotation stored in the file for RAW editors (Lightroom, darktable, RawTherapee) to apply.
@@ -178,7 +189,7 @@ To rename a file, click its name in the top bar or press `F2`, type, and press E
 
 ## Reporting problems
 
-Press `?`, open **Report an issue**, and click **Report an issue**. It opens a
+Press `F1`, open **Report an issue**, and click **Report an issue**. It opens a
 [bug report](https://github.com/mmzim05/Ommata/issues/new/choose) with your Ommata
 version, system and GPU already filled in; describe what happened and, if you can, which
 file it happened with. Ideas are welcome as feature requests.
@@ -190,8 +201,12 @@ file it happened with. Ideas are welcome as feature requests.
 | Photos     | JPEG, PNG, WebP, GIF, TIFF, BMP                                                                                                   |
 | Camera RAW | Canon, Nikon, Sony, Fujifilm, Olympus, Panasonic, Pentax, Samsung, Leica and other DNG, Phase One, Kodak, Epson, Minolta          |
 | Video      | MP4, MOV, MKV, WebM, AVI, MPEG-TS, MPG, FLV, OGV, WMV, 3GP                                                                        |
+| Audio      | MP3, AAC, M4A, FLAC, WAV, Ogg Vorbis, Opus, WMA, AIFF, ALAC, APE, WavPack, TTA, TAK, Musepack, AC-3, DTS, TrueHD, AMR, DSD, more |
 
 Hasselblad (`.3fr`) and Leaf (`.mos`) RAW files do not open yet.
+
+Audio files play with an empty screen for now. APE, Musepack, TAK, Shorten, DSD and QOA
+files play but can't be trimmed.
 
 ## Build from source
 

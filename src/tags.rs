@@ -87,7 +87,11 @@ pub fn ranked(query: &str, known: &BTreeSet<String>, skip: &BTreeSet<String>) ->
         .filter_map(|tag| fuzzy_score(query, tag).map(|score| (score, tag)))
         .collect();
     // Best score first, then the shorter tag, then A to Z.
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.len().cmp(&b.1.len()))
+            .then(a.1.cmp(b.1))
+    });
     scored.into_iter().map(|(_, tag)| tag.clone()).collect()
 }
 
@@ -323,7 +327,12 @@ pub fn summary(ui: &mut egui::Ui, meta: &Meta, palette: &Palette) -> Option<Summ
             let width = bubble_width(ui, tag, true);
             if used + width > SUMMARY_TAGS_WIDTH && shown > 0 {
                 let rest = tags[shown..].join(", ");
-                let more = bubble(ui, &format!("+{}", tags.len() - shown), Bubble::Small, palette);
+                let more = bubble(
+                    ui,
+                    &format!("+{}", tags.len() - shown),
+                    Bubble::Small,
+                    palette,
+                );
                 if more.on_hover_text(format!("{rest}\nEdit tags")).clicked() {
                     clicked = Some(SummaryClick::EditTags);
                 }
@@ -366,7 +375,11 @@ fn bubble_galley(ui: &egui::Ui, text: &str, small: bool) -> std::sync::Arc<egui:
 }
 
 fn bubble_padding(small: bool) -> egui::Vec2 {
-    if small { vec2(7.0, 2.0) } else { vec2(10.0, 4.0) }
+    if small {
+        vec2(7.0, 2.0)
+    } else {
+        vec2(10.0, 4.0)
+    }
 }
 
 fn bubble_width(ui: &egui::Ui, text: &str, small: bool) -> f32 {
@@ -378,8 +391,15 @@ fn bubble(ui: &mut egui::Ui, text: &str, kind: Bubble, palette: &Palette) -> egu
     let small = kind == Bubble::Small;
     let galley = bubble_galley(ui, text, small);
     let padding = bubble_padding(small);
-    let height = if small { 20.0 } else { ui.spacing().interact_size.y };
-    let size = vec2(galley.size().x + 2.0 * padding.x, height.max(galley.size().y + 2.0 * padding.y));
+    let height = if small {
+        20.0
+    } else {
+        ui.spacing().interact_size.y
+    };
+    let size = vec2(
+        galley.size().x + 2.0 * padding.x,
+        height.max(galley.size().y + 2.0 * padding.y),
+    );
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
     let widget = ui.style().interact(&response);
@@ -389,9 +409,17 @@ fn bubble(ui: &mut egui::Ui, text: &str, kind: Bubble, palette: &Palette) -> egu
     // (some give buttons almost the bar's colour).
     let tint = |amount: f32| lerp(palette.surface, palette.fg, amount);
     let (fill, stroke, text_color) = match kind {
-        Bubble::Small => (tint(if hovered { 0.22 } else { 0.14 }), Stroke::NONE, palette.fg),
+        Bubble::Small => (
+            tint(if hovered { 0.22 } else { 0.14 }),
+            Stroke::NONE,
+            palette.fg,
+        ),
         Bubble::Off if hovered => (tint(0.14), Stroke::new(1.0, tint(0.30)), palette.fg),
-        Bubble::Off => (Color32::TRANSPARENT, Stroke::new(1.0, tint(0.30)), palette.muted),
+        Bubble::Off => (
+            Color32::TRANSPARENT,
+            Stroke::new(1.0, tint(0.30)),
+            palette.muted,
+        ),
         Bubble::Removable if hovered => (
             palette.danger.gamma_multiply(0.25),
             Stroke::new(1.0, palette.danger),
@@ -445,7 +473,11 @@ fn chips<'a>(
                 (action, None) => action.to_string(),
             };
             let chip = bubble(ui, tag, kind, palette);
-            let chip = if tip.is_empty() { chip } else { chip.on_hover_text(tip) };
+            let chip = if tip.is_empty() {
+                chip
+            } else {
+                chip.on_hover_text(tip)
+            };
             if chip.clicked() {
                 clicked = Some((tag.clone(), false));
             } else if chip.secondary_clicked() {
@@ -470,6 +502,7 @@ pub fn bar(
     input: &mut String,
     focus: bool,
     known: &BTreeSet<String>,
+    reject_key: Option<&str>,
     palette: &Palette,
 ) -> (bool, bool) {
     let before = meta.clone();
@@ -478,18 +511,22 @@ pub fn bar(
         if let Some(rating) = stars(ui, meta.rating, palette) {
             meta.rating = rating;
         }
+        let rejected = meta.rating < 0;
+        let (color, tip) = if rejected {
+            (Some(palette.danger), "Rejected; click to undo")
+        } else {
+            (None, "Reject")
+        };
+        let tip = match reject_key {
+            Some(key) => format!("{tip} ({key})"),
+            None => tip.to_string(),
+        };
+        if icon_button(ui, Icon::Reject, rejected, color, &tip).clicked() {
+            meta.rating = if rejected { 0 } else { -1 };
+        }
         ui.separator();
         if let Some(label) = labels(ui, meta.label.as_deref(), palette) {
             meta.label = label;
-        }
-        let rejected = meta.rating < 0;
-        let (color, tip) = if rejected {
-            (Some(palette.danger), "Rejected; click to undo (X)")
-        } else {
-            (None, "Reject (X)")
-        };
-        if icon_button(ui, Icon::Reject, rejected, color, tip).clicked() {
-            meta.rating = if rejected { 0 } else { -1 };
         }
         ui.separator();
         add_field(ui, meta, input, 180.0, focus, Some(known));
@@ -580,9 +617,11 @@ impl TagField<'_> {
                     state.selected = Some(state.selected.map_or(0, |index| (index + 1) % count));
                 }
                 if keys.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                    state.selected = Some(state.selected.map_or(count - 1, |index| {
-                        (index + count - 1) % count
-                    }));
+                    state.selected = Some(
+                        state
+                            .selected
+                            .map_or(count - 1, |index| (index + count - 1) % count),
+                    );
                 }
                 if keys.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
                     *input = found[state.selected.unwrap_or(0)].clone();
@@ -608,14 +647,14 @@ impl TagField<'_> {
         if self.focus || completed {
             field.request_focus();
         }
-        if completed {
-            // Tab already moved the cursor on; keep it here, after the tag.
-            if let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), id) {
-                let end = egui::text::CCursor::new(input.chars().count());
-                edit.cursor
-                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
-                edit.store(ui.ctx(), id);
-            }
+        if self.focus || completed {
+            // Tab already moved the cursor on, and text typed before the field
+            // had the cursor is already in it: either way, keep typing after it.
+            let mut edit = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            let end = egui::text::CCursor::new(input.chars().count());
+            edit.cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            edit.store(ui.ctx(), id);
         }
         let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         let picked = state.selected.and_then(|index| found.get(index).cloned());
@@ -624,7 +663,12 @@ impl TagField<'_> {
         // The list stays up while the pointer is on it, so the click that takes
         // the field's cursor away still lands.
         let over_list = state.list.is_some_and(|rect| {
-            ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)))
+            ui.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|pos| rect.contains(pos))
+            })
         });
         state.list = None;
         if taken.is_none() && !found.is_empty() && (field.has_focus() || over_list) {
@@ -799,6 +843,27 @@ pub fn list_editor(
     chips(ui, list, |_| true, true, none, none, palette).map(|(tag, _)| ListChange::Forget(tag))
 }
 
+/// The tags on the files in the current folder, read only: they come and go
+/// with the files, apart from the tag list.
+pub fn folder_list(ui: &mut egui::Ui, folder: &BTreeSet<String>, palette: &Palette) {
+    ui.label(
+        egui::RichText::new("Tags on the files in this folder, offered while typing here.")
+            .color(palette.muted)
+            .size(12.0),
+    );
+    let shown: Vec<&String> = folder
+        .iter()
+        .filter(|tag| !sidecar::is_internal(tag))
+        .collect();
+    if shown.is_empty() {
+        ui.label(egui::RichText::new("No tags in this folder.").color(palette.muted));
+        return;
+    }
+    ui.add_space(4.0);
+    let none = &Default::default();
+    chips(ui, shown, |_| true, false, none, none, palette);
+}
+
 /// The filter panel: which tags, rating and label a file needs for the
 /// arrow keys to stop on it. Returns whether `filter` changed.
 pub fn filter_panel(
@@ -886,10 +951,11 @@ mod tests {
 
     #[test]
     fn fuzzy_search_ranks_level_starts_first() {
-        let known: BTreeSet<String> = ["Shot/Action", "Seasonal", "Shot/Establishing", "People/Sam"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let known: BTreeSet<String> =
+            ["Shot/Action", "Seasonal", "Shot/Establishing", "People/Sam"]
+                .into_iter()
+                .map(String::from)
+                .collect();
         assert_eq!(fuzzy_score("xyz", "Shot/Action"), None);
         assert!(fuzzy_score("ACT", "Shot/Action").is_some());
         let found = suggestions("sa", &known, &BTreeSet::new());

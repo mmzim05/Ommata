@@ -9,6 +9,72 @@ the new version.
 
 ## [Unreleased]
 
+### Added
+
+- Audio files play: MP3, AAC, M4A, FLAC, WAV, Ogg Vorbis, Opus, WMA, AIFF, ALAC, APE,
+  WavPack, TTA, TAK, Musepack, AC-3, E-AC-3, DTS, TrueHD, AMR, DSD (`.dsf`, `.dff`), RealAudio
+  and more, with the seek bar, waveform and media keys. The screen stays empty for now;
+  album art is not shown.
+- Trim audio files too, in their own format, keeping tags and album art. The cut lands on
+  the audio packet at the in point: within a few milliseconds for most formats, about a
+  second for TTA. APE, Musepack, TAK, Shorten, DSD, QOA and AAC or Opus in CAF can't be
+  trimmed.
+- Previous and next arrows on the left and right edges, halfway down; each shows on a dark
+  backing while the pointer is over it.
+- Typing while no field has the cursor opens the tag bar with the text in its field.
+- Settings › Tags lists the tags on the files in the current folder, under the tag list.
+- `Ctrl+C` copies a file's tags, `Ctrl+V` adds them to another file's, and `Ctrl+Shift+V`
+  puts them in place of its own.
+- The reject button sits between the stars and the colour labels in the tag bar.
+- While typing in the tag bar, keys with `Ctrl` or `Alt` still work (quick tags, ratings,
+  labels); copy, paste, select all and undo stay with the field.
+- Skipping quickly through a folder loads only the file it stops on.
+- Rotate videos with the rotate buttons or `Alt+R` / `Alt+Shift+R`. MP4, MOV, MKV and WebM
+  save the turn in the file's rotation tag without re-encoding, along with any trim; other
+  formats can't save it.
+
+### Changed
+
+- Trashing a file moves on in the direction of the last step through the folder: back
+  after going back, forward otherwise.
+- Switching files no longer flashes a blank screen: the first frame of the videos either
+  side is decoded ahead, and until the new file has a picture the last one stays up.
+- Tags put on files no longer join the tag list by themselves; the tag list holds only the
+  tags added to it in Settings.
+- No default key types a character on its own, so typing goes to the tag bar: quick tags
+  are `Alt+1` – `9`, and letters and punctuation take `Alt` (`Alt+R` rotate, `Alt+C` crop,
+  `Alt+J`/`Alt+L` seek, `Alt+T`/`Alt+I`/`Alt+O` trim,
+  `Alt+0` fit). Help is `F1`. Fullscreen is `Ctrl+F` (or `F11`) and the filter
+  `Ctrl+Shift+F`. `Backspace` rejects, `Ctrl+X` clears the rating, and `Ctrl+0` sets the
+  new purple label key. Keys changed in Settings stay as they are.
+- Tooltips show the key set in Settings rather than the default.
+- Revert, Save copy and Save appear beside the top bar instead of in it, so the bar no
+  longer moves when a file gets edits (in it only when the window is too narrow).
+- Help › Keys is a search: type to find a key or an action by fuzzy match. Every key has a
+  row of its own (each star rating and colour label separately), with its group beside it;
+  colour labels show as coloured dots.
+
+### Fixed
+
+- Audio whose length the file doesn't give (raw MLP, TrueHD, Shorten) or only estimates
+  (ADTS `.aac`) gets its exact length, counted in the background; the seek bar works.
+- Seeking back in audio that has no index (Shorten, some RealAudio) works.
+- The Keybinds page scrolls in a small window instead of running off it.
+- Keys stopped working after clicking a button (such as the edge arrows), until a click
+  on the picture.
+- While trimming, the part of the seek bar before the in point no longer shows as played.
+- The playhead shows the time of the frame on screen, so it no longer runs past a trim's out
+  point and jumps back, or steps back after setting the in point.
+- The Keybinds page keeps a compact size, twice the height of its category tabs; a long
+  category (Tags) scrolls within it.
+- Settings, Help and the other pages open just under the top and tag bars, so their top
+  stays put when switching tabs.
+- Clicking or dragging on the parts of the seek bar a trim cuts off does nothing, and a
+  seek dragged past the in or out point stops at it.
+- Videos that carry a rotation tag (phone videos recorded on their side) show the right way
+  up, as do their seek-bar thumbnails.
+- The play button and time line up with the middle of the waveform in the seek bar.
+
 ## [0.5.3] - 2026-11-07
 
 ### Added

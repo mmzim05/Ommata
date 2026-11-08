@@ -28,6 +28,8 @@ pub struct Info {
     pub duration: f64,
     pub size: [usize; 2],
     pub fps: f64,
+    /// Quarter turns clockwise the file asks its picture to be shown at.
+    pub turns: u8,
     audio_rate: Option<u32>,
 }
 
@@ -384,6 +386,10 @@ struct Shared {
     /// Set when the GPU path failed: the decoder then copies VA-API frames
     /// into system memory instead of handing over surfaces.
     cpu_only: AtomicBool,
+    /// Length in seconds as f64 bits, counted by reading the whole file when
+    /// the container doesn't say (raw streams) or only guesses from the
+    /// bitrate (ADTS AAC); 0 until known.
+    length: AtomicU64,
 }
 
 /// One open video: decode thread, audio output and the frame on screen.
@@ -419,6 +425,8 @@ pub struct Player {
     pub frame_pts: f64,
     pub volume: f32,
     pub muted: bool,
+    /// Playback holds frames past this time back (a trim's out point).
+    pub stop: Option<f64>,
     path: PathBuf,
     preview: Option<crate::preview::Preview>,
 }
@@ -437,6 +445,7 @@ impl Player {
             drag: Mutex::default(),
             cache: Mutex::default(),
             cpu_only: AtomicBool::new(false),
+            length: AtomicU64::new(0),
         });
         let (thread_shared, thread_ctx) = (shared.clone(), ctx.clone());
         let thread = std::thread::Builder::new()
@@ -479,6 +488,7 @@ impl Player {
             frame_pts: 0.0,
             volume: 1.0,
             muted: false,
+            stop: None,
             path: path_for_preview,
             preview: None,
         }
@@ -494,6 +504,9 @@ impl Player {
     /// Hover thumbnail (nearest earlier keyframe) for `time`. The preview
     /// decoder starts on first use.
     pub fn preview_at(&mut self, time: f64, ctx: &egui::Context) -> Option<&TextureHandle> {
+        if !self.has_video() {
+            return None;
+        }
         let path = &self.path;
         self.preview
             .get_or_insert_with(|| crate::preview::Preview::spawn(path.clone(), ctx.clone()))
@@ -517,8 +530,29 @@ impl Player {
         self.since = (!self.paused).then(Instant::now);
     }
 
+    /// Whether the file has pictures to show; false for audio alone (and
+    /// until the file is open).
+    pub fn has_video(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| info.size[0] > 0)
+    }
+
+    /// Where the playhead shows: the time of the frame on screen, so it
+    /// never runs ahead of the picture. Audio alone, and a drag along the
+    /// bar, show the playback position.
+    pub fn shown_time(&self) -> f64 {
+        if self.has_video() && !self.scrubbing && self.shown.is_some() {
+            self.frame_pts
+        } else {
+            self.position
+        }
+    }
+
     /// Length in seconds, 0 until the file is open.
     pub fn duration(&self) -> f64 {
+        let counted = f64::from_bits(self.shared.length.load(Relaxed));
+        if counted > 0.0 {
+            return counted;
+        }
         self.info.as_ref().map_or(0.0, |info| info.duration)
     }
 
@@ -544,6 +578,11 @@ impl Player {
     pub fn scrub(&mut self, time: f64) {
         if !self.paused {
             self.set_paused(true);
+        }
+        if self.info.is_some() && !self.has_video() {
+            // No frames to cache: just move the playhead.
+            self.seek(time, true);
+            return;
         }
         let time = time.clamp(0.0, self.duration().max(0.0));
         self.scrubbing = true;
@@ -600,6 +639,17 @@ impl Player {
     /// Whether playback has shown the last frame.
     pub fn at_end(&self) -> bool {
         let state = lock(&self.shared.state);
+        if self.info.is_some() && !self.has_video() {
+            // Decoding ends half a second before playback does, so the end
+            // is when the queue runs dry. Without an output device nothing
+            // drains it; the clock tells then.
+            return state.eof
+                && if self.stream.is_some() {
+                    self.shared.audio.queued.load(Relaxed) == 0
+                } else {
+                    self.position >= self.duration()
+                };
+        }
         state.eof && state.frames.iter().all(|frame| frame.serial != self.serial)
     }
 
@@ -623,6 +673,9 @@ impl Player {
         self.shared.audio.volume.store(volume.to_bits(), Relaxed);
         self.convert_cache(gpu.as_deref_mut());
 
+        if self.info.is_some() && !self.has_video() {
+            return self.update_audio();
+        }
         if self.scrubbing {
             return self.update_drag(ctx, gpu);
         }
@@ -641,7 +694,8 @@ impl Player {
         let mut shown = None;
         let mut synced = false;
         while let Some(frame) = state.frames.front() {
-            let due = self.want_frame || (!self.paused && frame.pts <= now);
+            let past_stop = self.stop.is_some_and(|stop| frame.pts > stop + 1e-3);
+            let due = self.want_frame || (!self.paused && frame.pts <= now && !past_stop);
             if frame.serial == self.serial && !due {
                 break;
             }
@@ -699,6 +753,33 @@ impl Player {
 }
 
 impl Player {
+    /// Audio alone: the audio clock moves the playhead; nothing to show.
+    fn update_audio(&mut self) -> Option<Duration> {
+        self.want_frame = false;
+        let audio = &self.shared.audio;
+        if self.stream.is_some() && !self.paused && audio.queued.load(Relaxed) > 0 {
+            let audio_time = audio.pos();
+            if (audio_time - self.clock()).abs() > 0.04 {
+                self.set_clock(audio_time);
+            }
+        }
+        if self.paused {
+            return None;
+        }
+        // Some raw streams (MLP, Shorten) have no known length, and an ADTS
+        // AAC's is only estimated: then the playhead runs on past it.
+        self.position = if self.duration() > 0.0 {
+            self.clock().min(self.duration())
+        } else {
+            self.clock()
+        };
+        if let Some(stop) = self.stop {
+            self.position = self.position.min(stop);
+        }
+        // Repaint for the moving playhead.
+        Some(Duration::from_millis(33))
+    }
+
     fn show_cpu(&mut self, ctx: &egui::Context, pts: f64, image: &ColorImage) {
         self.frame_pts = pts;
         #[cfg(test)]
@@ -918,11 +999,13 @@ impl Drop for Scaler {
 
 /// Seek `input` to the keyframe at or before `time`. A failed seek leaves the
 /// demuxer where it was, which only delays the frame the caller waits for.
-fn seek_to(input: &mut ff::format::context::Input, time: f64, start_offset: f64) {
+/// Returns whether the seek happened.
+fn seek_to(input: &mut ff::format::context::Input, time: f64, start_offset: f64) -> bool {
     let target = ((time + start_offset) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
-    if let Err(error) = input.seek(target, ..target) {
-        eprintln!("ommata: seek to {time:.3}: {error}");
-    }
+    input
+        .seek(target, ..target)
+        .inspect_err(|error| eprintln!("ommata: seek to {time:.3}: {error}"))
+        .is_ok()
 }
 
 /// Active-drag frames are cached at most DRAG_MAX_WIDTH wide.
@@ -939,7 +1022,7 @@ fn drag_size(width: u32, height: u32) -> (u32, u32) {
 /// the GPU and frames are handed over as VA-API surfaces.
 fn decode(
     path: &std::path::Path,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     ctx: &egui::Context,
     use_gpu: bool,
 ) -> Result<(), ff::Error> {
@@ -947,11 +1030,10 @@ fn decode(
     let start_offset = start_time(&input);
     let duration = input.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
 
-    let video_stream = input
-        .streams()
-        .best(ff::media::Type::Video)
-        .ok_or(ff::Error::StreamNotFound)?;
-    let video_index = video_stream.index();
+    let Some(video_index) = video_stream(&input).map(|stream| stream.index()) else {
+        return decode_audio(path, input, start_offset, duration, shared, ctx);
+    };
+    let video_stream = input.stream(video_index).ok_or(ff::Error::StreamNotFound)?;
     let video_time_base = f64::from(video_stream.time_base());
     let stream_fps = f64::from(video_stream.avg_frame_rate());
     let fps = if stream_fps.is_finite() && stream_fps > 0.0 {
@@ -960,7 +1042,9 @@ fn decode(
         30.0
     };
     let frame = 1.0 / fps;
+    let turns = display_turns(&video_stream);
     let mut video_codec = ff::codec::Context::from_parameters(video_stream.parameters())?;
+    let video_codec_id = video_codec.id();
     let hardware = use_gpu
         .then(|| gpu::decoder(video_codec.id()))
         .flatten()
@@ -979,17 +1063,8 @@ fn decode(
         video_codec.decoder().video()?
     };
 
-    let mut audio_decoder = None;
-    let mut audio_time_base = 0.0;
-    let mut audio_index = usize::MAX;
-    if let Some(stream) = input.streams().best(ff::media::Type::Audio)
-        && let Ok(decoder) = ff::codec::Context::from_parameters(stream.parameters())
-            .and_then(|codec| codec.decoder().audio())
-    {
-        audio_index = stream.index();
-        audio_time_base = f64::from(stream.time_base());
-        audio_decoder = Some(decoder);
-    }
+    let mut audio = AudioTrack::open(&input);
+    let audio_index = audio.as_ref().map_or(usize::MAX, |track| track.index);
 
     let info = Arc::new(Info {
         duration,
@@ -998,10 +1073,8 @@ fn decode(
             video_decoder.height() as usize,
         ],
         fps,
-        audio_rate: audio_decoder
-            .as_ref()
-            .map(|decoder| decoder.rate())
-            .filter(|&rate| rate > 0),
+        turns,
+        audio_rate: audio.as_ref().and_then(AudioTrack::rate),
     });
     lock(&shared.state).info = Some(Ok(info));
     ctx.request_repaint();
@@ -1009,13 +1082,18 @@ fn decode(
     // The main decoder's frame threads need a dozen packets before the first
     // frame comes out (~0.3 s on 4K). Show frame one from a slice-threaded
     // decoder first, then rewind.
-    let first = first_frame(
-        &mut input,
-        video_index,
-        video_time_base,
-        start_offset,
-        shared,
-    );
+    // dav1d's own threading already delivers frame one quickly.
+    let first = (video_codec_id != ff::codec::Id::AV1)
+        .then(|| {
+            first_frame(
+                &mut input,
+                video_index,
+                video_time_base,
+                start_offset,
+                shared.target.load(Relaxed),
+            )
+        })
+        .flatten();
     if let Some((pts, image)) = first {
         push_frame(
             shared,
@@ -1032,11 +1110,9 @@ fn decode(
 
     lock(&shared.cache).frame = frame;
     let mut scaler = Scaler::new().ok_or(ff::Error::Bug)?;
-    let mut converter = AudioConverter::new(ff::ChannelLayout::STEREO, 2);
     let mut video_frame = ff::frame::Video::empty();
     let mut downloaded = ff::frame::Video::empty();
     let mut rgba = ff::frame::Video::empty();
-    let mut audio_frame = ff::frame::Audio::empty();
     let mut serial = 0;
     let mut skip_until = f64::NEG_INFINITY;
     // Newest frame out of the decoder, and whether it has been told the file
@@ -1080,8 +1156,8 @@ fn decode(
                     if !continue_forward {
                         seek_to(&mut input, seek.time, start_offset);
                         video_decoder.flush();
-                        if let Some(decoder) = &mut audio_decoder {
-                            decoder.flush();
+                        if let Some(track) = &mut audio {
+                            track.flush(seek.time);
                         }
                         last_decoded = f64::NEG_INFINITY;
                         eof_sent = false;
@@ -1198,7 +1274,7 @@ fn decode(
                 // queued: while paused nothing drains audio, and the frame a
                 // seek is waiting for may sit behind it in the file.
                 let audio_secs = shared.audio.queued_secs();
-                let use_audio = audio_decoder.is_some();
+                let use_audio = audio.is_some();
                 let audio_low = use_audio && audio_secs < 0.2;
                 let frame_bytes = state
                     .frames
@@ -1249,16 +1325,16 @@ fn decode(
             }
             Some((index, _)) if *index == audio_index && drag.is_some() => continue,
             Some((index, packet)) if *index == audio_index => {
-                if let Some(decoder) = &mut audio_decoder {
-                    let _ = decoder.send_packet(packet);
+                if let Some(track) = &mut audio {
+                    let _ = track.decoder.send_packet(packet);
                 }
             }
             Some(_) => continue,
             None => {
                 eof_sent = true;
                 let _ = video_decoder.send_eof();
-                if let Some(decoder) = &mut audio_decoder {
-                    let _ = decoder.send_eof();
+                if let Some(track) = &mut audio {
+                    let _ = track.decoder.send_eof();
                 }
             }
         }
@@ -1338,28 +1414,8 @@ fn decode(
             }
         }
 
-        if let Some(decoder) = &mut audio_decoder {
-            while decoder.receive_frame(&mut audio_frame).is_ok() {
-                let Some(timestamp) = audio_frame.timestamp().or(audio_frame.pts()) else {
-                    continue;
-                };
-                let pts = timestamp as f64 * audio_time_base - start_offset;
-                if pts < skip_until - 0.05 {
-                    continue;
-                }
-                let Some(data) = converter.run(&mut audio_frame) else {
-                    continue;
-                };
-                push_audio(
-                    shared,
-                    Chunk {
-                        serial,
-                        pts,
-                        data,
-                        offset: 0,
-                    },
-                );
-            }
+        if let Some(track) = &mut audio {
+            track.drain(shared, serial, skip_until, start_offset);
         }
 
         if packet.is_none() {
@@ -1369,19 +1425,336 @@ fn decode(
     }
 }
 
-/// Frame one from a quick slice-threaded decoder, scaled for the screen.
+/// Decode thread for a file without video: only the audio plays, from the
+/// seek the UI last sent. Seeks are always exact, since nothing shows where
+/// an inexact one landed.
+fn decode_audio(
+    path: &std::path::Path,
+    mut input: ff::format::context::Input,
+    start_offset: f64,
+    duration: f64,
+    shared: &Arc<Shared>,
+    ctx: &egui::Context,
+) -> Result<(), ff::Error> {
+    let mut audio = AudioTrack::open(&input).ok_or(ff::Error::StreamNotFound)?;
+    let info = Arc::new(Info {
+        duration,
+        size: [0, 0],
+        fps: AUDIO_STEPS,
+        turns: 0,
+        audio_rate: audio.rate(),
+    });
+    lock(&shared.state).info = Some(Ok(info));
+    ctx.request_repaint();
+    // SAFETY: plain field read on a live, opened context.
+    let guessed = unsafe { (*input.as_ptr()).duration_estimation_method }
+        == ff::ffi::AVDurationEstimationMethod::AVFMT_DURATION_FROM_BITRATE;
+    if duration <= 0.0 || guessed {
+        count_length(path, shared, ctx);
+    }
+
+    let mut serial = 0;
+    let mut skip_until = f64::NEG_INFINITY;
+    loop {
+        {
+            let mut state = lock(&shared.state);
+            loop {
+                if state.quit {
+                    return Ok(());
+                }
+                if let Some(seek) = state.seek.take() {
+                    serial = state.serial;
+                    drop(state);
+                    if seek_to(&mut input, seek.time, start_offset) {
+                        audio.flush(seek.time);
+                    } else if seek.time < audio.next_pts {
+                        // No index to seek with (Shorten, raw MLP): read
+                        // from the start up to the point behind; one ahead
+                        // is reached by reading on.
+                        input = ff::format::input(path)?;
+                        audio.flush(0.0);
+                    }
+                    skip_until = seek.time;
+                    state = lock(&shared.state);
+                    continue;
+                }
+                if !state.eof && shared.audio.queued_secs() < MAX_AUDIO_SECS {
+                    break;
+                }
+                // Audio drains without notifying, so wake periodically while it does.
+                let timeout = if state.eof {
+                    Duration::from_secs(3600)
+                } else {
+                    Duration::from_millis(50)
+                };
+                state = shared
+                    .wake
+                    .wait_timeout(state, timeout)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+        // A packet the decoder rejects (corrupt data) loses only its own samples.
+        let packet = input
+            .packets()
+            .next()
+            .map(|(stream, packet)| (stream.index(), packet));
+        match &packet {
+            Some((index, packet)) if *index == audio.index => {
+                let _ = audio.decoder.send_packet(packet);
+            }
+            Some(_) => continue,
+            None => {
+                let _ = audio.decoder.send_eof();
+            }
+        }
+        audio.drain(shared, serial, skip_until, start_offset);
+        if packet.is_none() {
+            lock(&shared.state).eof = true;
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// Count the length of the audio at `path` on a thread of its own, from its
+/// packets, or by decoding those that don't say how long they last. The
+/// count so far shows as it goes, so the seek bar fills in.
+fn count_length(path: &std::path::Path, shared: &Arc<Shared>, ctx: &egui::Context) {
+    let (path, shared, ctx) = (path.to_path_buf(), shared.clone(), ctx.clone());
+    let spawned = std::thread::Builder::new()
+        .name("length".into())
+        .spawn(move || {
+            if let Err(error) = scan_length(&path, &shared, &ctx) {
+                eprintln!("ommata: length of {}: {error}", path.display());
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("ommata: length thread: {error}");
+    }
+}
+
+fn scan_length(
+    path: &std::path::Path,
+    shared: &Shared,
+    ctx: &egui::Context,
+) -> Result<(), ff::Error> {
+    let mut input = ff::format::input(path)?;
+    let start_offset = start_time(&input);
+    let mut audio = AudioTrack::open(&input).ok_or(ff::Error::StreamNotFound)?;
+    let seconds = audio.time_base;
+    let mut length: f64 = 0.0;
+    let mut shown = Instant::now();
+    let publish = |length: f64| {
+        shared.length.store(length.to_bits(), Relaxed);
+        ctx.request_repaint();
+    };
+    for (stream, packet) in input.packets() {
+        if stream.index() != audio.index {
+            continue;
+        }
+        let start = packet
+            .pts()
+            .or(packet.dts())
+            .map_or(length, |pts| pts as f64 * seconds - start_offset);
+        let lasts = if packet.duration() > 0 {
+            packet.duration() as f64 * seconds
+        } else {
+            // Nothing says how long it lasts: decode it and count samples.
+            let _ = audio.decoder.send_packet(&packet);
+            let mut samples = 0.0;
+            while audio.decoder.receive_frame(&mut audio.frame).is_ok() {
+                samples += audio.frame.samples() as f64 / f64::from(audio.frame.rate().max(1));
+            }
+            samples
+        };
+        length = length.max(start + lasts);
+        if shown.elapsed() > Duration::from_millis(250) {
+            if lock(&shared.state).quit {
+                return Ok(());
+            }
+            publish(length);
+            shown = Instant::now();
+        }
+    }
+    // Samples the decoder still holds.
+    let _ = audio.decoder.send_eof();
+    while audio.decoder.receive_frame(&mut audio.frame).is_ok() {
+        length += audio.frame.samples() as f64 / f64::from(audio.frame.rate().max(1));
+    }
+    publish(length);
+    Ok(())
+}
+
+/// Frame steps per second for a file without video.
+const AUDIO_STEPS: f64 = 30.0;
+
+/// The video stream to play: not a cover picture (an MP3's or M4A's album
+/// art comes as a one-frame video stream), so such files play as audio.
+pub fn video_stream(input: &ff::format::context::Input) -> Option<ff::Stream<'_>> {
+    let picture = |stream: &ff::Stream| {
+        stream
+            .disposition()
+            .contains(ff::format::stream::Disposition::ATTACHED_PIC)
+    };
+    input
+        .streams()
+        .best(ff::media::Type::Video)
+        .filter(|stream| !picture(stream))
+        .or_else(|| {
+            input.streams().find(|stream| {
+                stream.parameters().medium() == ff::media::Type::Video && !picture(stream)
+            })
+        })
+}
+
+/// The audio stream being played, decoded to interleaved stereo f32.
+struct AudioTrack {
+    decoder: ff::decoder::Audio,
+    index: usize,
+    time_base: f64,
+    converter: AudioConverter,
+    frame: ff::frame::Audio,
+    /// Where the next frame starts, for frames without a timestamp (8SVX).
+    next_pts: f64,
+}
+
+impl AudioTrack {
+    /// The file's main audio stream, if it has one that decodes.
+    fn open(input: &ff::format::context::Input) -> Option<Self> {
+        let stream = input.streams().best(ff::media::Type::Audio)?;
+        let decoder = ff::codec::Context::from_parameters(stream.parameters())
+            .and_then(|codec| codec.decoder().audio())
+            .inspect_err(|error| eprintln!("ommata: audio decoder: {error}"))
+            .ok()?;
+        Some(Self {
+            decoder,
+            index: stream.index(),
+            time_base: f64::from(stream.time_base()),
+            converter: AudioConverter::new(ff::ChannelLayout::STEREO, 2),
+            frame: ff::frame::Audio::empty(),
+            next_pts: 0.0,
+        })
+    }
+
+    /// Drop decoder state after a seek to `time`.
+    fn flush(&mut self, time: f64) {
+        self.decoder.flush();
+        self.next_pts = time;
+    }
+
+    fn rate(&self) -> Option<u32> {
+        Some(self.decoder.rate()).filter(|&rate| rate > 0)
+    }
+
+    /// Queue the samples the decoder has ready for `serial`, dropping those
+    /// before `skip_until`.
+    fn drain(&mut self, shared: &Shared, serial: u64, skip_until: f64, start_offset: f64) {
+        while self.decoder.receive_frame(&mut self.frame).is_ok() {
+            let pts = self
+                .frame
+                .timestamp()
+                .or(self.frame.pts())
+                .map_or(self.next_pts, |timestamp| {
+                    timestamp as f64 * self.time_base - start_offset
+                });
+            let rate = f64::from(self.frame.rate().max(1));
+            self.next_pts = pts + self.frame.samples() as f64 / rate;
+            if pts < skip_until - 0.05 {
+                continue;
+            }
+            let Some(data) = self.converter.run(&mut self.frame) else {
+                continue;
+            };
+            push_audio(
+                shared,
+                Chunk {
+                    serial,
+                    pts,
+                    data,
+                    offset: 0,
+                },
+            );
+        }
+    }
+}
+
+/// Frame one of the video at `path`, scaled to fit `width`×`height` physical
+/// pixels: shown while the player for it starts. `None` for audio alone or a
+/// file that doesn't decode.
+pub fn poster(path: &std::path::Path, width: u32, height: u32) -> Option<ColorImage> {
+    let mut input = ff::format::input(path).ok()?;
+    let start_offset = start_time(&input);
+    let stream = video_stream(&input)?;
+    let (index, time_base) = (stream.index(), f64::from(stream.time_base()));
+    let turns = display_turns(&stream);
+    let target = (u64::from(width) << 32) | u64::from(height);
+    first_frame(&mut input, index, time_base, start_offset, target)
+        .map(|(_, image)| turn_image(image, turns))
+}
+
+/// Quarter turns clockwise `stream` asks its picture to be shown at, from its
+/// display matrix (phones store portrait video sideways with one). Turns that
+/// aren't a quarter, and mirroring, are ignored.
+pub fn display_turns(stream: &ff::Stream) -> u8 {
+    // SAFETY: reads side data owned by the stream's codec parameters, which
+    // outlive this call; a display matrix is nine i32s.
+    let angle = unsafe {
+        let parameters = (*stream.as_ptr()).codecpar;
+        let side = ff::ffi::av_packet_side_data_get(
+            (*parameters).coded_side_data,
+            (*parameters).nb_coded_side_data,
+            ff::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+        );
+        if side.is_null() || (*side).size < 36 {
+            return 0;
+        }
+        ff::ffi::av_display_rotation_get((*side).data as *const i32)
+    };
+    if angle.is_finite() {
+        // The matrix holds the turn counter-clockwise.
+        ((-angle / 90.0).round() as i64).rem_euclid(4) as u8
+    } else {
+        0
+    }
+}
+
+/// `image` turned `turns` quarter turns clockwise.
+pub fn turn_image(image: ColorImage, turns: u8) -> ColorImage {
+    let [width, height] = image.size;
+    let turns = turns % 4;
+    if turns == 0 {
+        return image;
+    }
+    let size = if turns == 2 {
+        [width, height]
+    } else {
+        [height, width]
+    };
+    let mut pixels = Vec::with_capacity(image.pixels.len());
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            // Where the output pixel (x, y) comes from in the source.
+            let (from_x, from_y) = match turns {
+                1 => (y, height - 1 - x),
+                2 => (width - 1 - x, height - 1 - y),
+                _ => (width - 1 - y, x),
+            };
+            pixels.push(image.pixels[from_y * width + from_x]);
+        }
+    }
+    ColorImage::new(size, pixels)
+}
+
+/// Frame one from a quick slice-threaded decoder, scaled to fit the packed
+/// on-screen `target`.
 fn first_frame(
     input: &mut ff::format::context::Input,
     video_index: usize,
     video_time_base: f64,
     start_offset: f64,
-    shared: &Shared,
+    target: u64,
 ) -> Option<(f64, ColorImage)> {
     let parameters = input.stream(video_index)?.parameters();
-    // dav1d's own threading already delivers frame one quickly.
-    if parameters.id() == ff::codec::Id::AV1 {
-        return None;
-    }
     let mut codec = ff::codec::Context::from_parameters(parameters).ok()?;
     codec.set_threading(ff::codec::threading::Config {
         kind: ff::codec::threading::Type::Slice,
@@ -1404,7 +1777,6 @@ fn first_frame(
         decoder.receive_frame(&mut frame).ok()?;
     }
     let pts = frame.timestamp().or(frame.pts())? as f64 * video_time_base - start_offset;
-    let target = shared.target.load(Relaxed);
     let (width, height) = scaled_size(frame.width(), frame.height(), target);
     let mut rgba = ff::frame::Video::empty();
     Scaler::new()?
@@ -1558,6 +1930,73 @@ mod tests {
 
     fn update(ctx: &eframe::egui::Context, player: &mut super::Player) {
         GPU.with_borrow_mut(|gpu| player.update(ctx, gpu.as_mut().map(|(_, gpu)| gpu)));
+    }
+
+    /// Every file in a folder of audio samples opens without video, plays,
+    /// seeks and reaches its end (muted):
+    /// OMMATA_TEST_AUDIO_DIR=dir cargo test --release plays_audio -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn plays_audio_files() {
+        let dir = std::env::var("OMMATA_TEST_AUDIO_DIR").unwrap();
+        ffmpeg_next::init().unwrap();
+        let ctx = eframe::egui::Context::default();
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        let mut failed = Vec::new();
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let mut player = super::Player::open(path, &ctx, None);
+            player.muted = true;
+            let started = std::time::Instant::now();
+            while player.info.is_none() && player.error.is_none() && started.elapsed().as_secs() < 5
+            {
+                player.update(&ctx, None);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let result = (|| {
+                if let Some(error) = &player.error {
+                    return Err(format!("error: {error}"));
+                }
+                if player.has_video() {
+                    return Err("opened as video".into());
+                }
+                pump(&ctx, &mut player, 1.0);
+                // Lengths the container doesn't give are counted meanwhile.
+                let duration = player.duration();
+                let played = player.shared.audio.pos();
+                if played < 0.3f64.min(duration * 0.5) {
+                    return Err(format!("audio only reached {played:.2}s of {duration:.2}s"));
+                }
+                // An estimated length (ADTS) can be seconds short.
+                player.seek((duration - 1.0).max(0.0), true);
+                let started = std::time::Instant::now();
+                while !player.at_end() {
+                    if started.elapsed().as_secs() > 15 {
+                        return Err(format!(
+                            "no end, at {:.2}s of {duration:.2}s",
+                            player.position
+                        ));
+                    }
+                    pump(&ctx, &mut player, 0.05);
+                }
+                Ok(format!(
+                    "{duration:.2}s, {} Hz",
+                    player.info.as_ref().unwrap().audio_rate.unwrap_or(0)
+                ))
+            })();
+            match result {
+                Ok(note) => eprintln!("ok   {name}: {note}"),
+                Err(error) => {
+                    eprintln!("FAIL {name}: {error}");
+                    failed.push(name);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "failed: {failed:?}");
     }
 
     /// Decodes a first frame headlessly: OMMATA_TEST_VIDEO=a.webm cargo test first_frame -- --ignored

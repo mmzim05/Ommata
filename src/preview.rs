@@ -3,7 +3,7 @@
 //! keyframes are decoded (one packet each), so it stays fast on long-GOP 4K.
 
 use crate::lock;
-use crate::video::{Scaler, start_time};
+use crate::video::{Scaler, start_time, video_stream};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use ffmpeg_next as ff;
 use std::collections::HashMap;
@@ -103,11 +103,9 @@ fn run(
 ) -> Result<(), ff::Error> {
     let mut input = ff::format::input(path)?;
     let start_offset = start_time(&input);
-    let stream = input
-        .streams()
-        .best(ff::media::Type::Video)
-        .ok_or(ff::Error::StreamNotFound)?;
+    let stream = video_stream(&input).ok_or(ff::Error::StreamNotFound)?;
     let (video_index, time_base) = (stream.index(), f64::from(stream.time_base()));
+    let turns = crate::video::display_turns(&stream);
     // Slice threads, not frame threads: frame threading would hold the one
     // frame back, while camera files split each frame into slices that decode
     // in parallel (about 6x faster on a 4K keyframe).
@@ -165,7 +163,7 @@ fn run(
         let scaled = (f64::from(WIDTH) * f64::from(height) / f64::from(width)).round() as u32;
         let thumb_height = scaled.max(2) & !1;
         if scaler.run(&frame, &mut rgba, WIDTH, thumb_height) {
-            let image = crate::video::to_color_image(&rgba);
+            let image = crate::video::turn_image(crate::video::to_color_image(&rgba), turns);
             if sender.send((time, keyframe.max(0.0), image)).is_err() {
                 // The Preview is gone.
                 return Ok(());

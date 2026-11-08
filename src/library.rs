@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 pub enum Kind {
     Image,
     Video,
+    Audio,
+}
+
+impl Kind {
+    /// Whether the file plays in the player (video, or audio alone).
+    pub fn plays(self) -> bool {
+        matches!(self, Self::Video | Self::Audio)
+    }
 }
 
 const IMAGE_EXT: &[&str] = &[
@@ -21,6 +29,13 @@ const VIDEO_EXT: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ivf", "avi", "ts", "mts", "m2ts", "flv", "ogv", "wmv",
     "mpg", "mpeg", "3gp",
 ];
+/// Audio-only files, played through the video player with nothing to show.
+const AUDIO_EXT: &[&str] = &[
+    "mp3", "mp2", "mp1", "m4a", "m4b", "aac", "adts", "flac", "wav", "wave", "ogg", "oga", "opus",
+    "spx", "weba", "mka", "wma", "aif", "aiff", "aifc", "ape", "wv", "tta", "tak", "amr", "awb",
+    "au", "snd", "caf", "w64", "voc", "dsf", "dff", "mpc", "mp+", "ra", "rm", "ac3", "eac3", "dts",
+    "thd", "mlp", "shn", "gsm", "qoa", "oma",
+];
 
 /// The media kind of `path`, from its extension.
 pub fn kind(path: &Path) -> Option<Kind> {
@@ -29,6 +44,8 @@ pub fn kind(path: &Path) -> Option<Kind> {
         Some(Kind::Image)
     } else if VIDEO_EXT.contains(&ext.as_str()) {
         Some(Kind::Video)
+    } else if AUDIO_EXT.contains(&ext.as_str()) {
+        Some(Kind::Audio)
     } else {
         None
     }
@@ -163,6 +180,16 @@ pub fn remove_temp(temp: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kinds_by_extension() {
+        assert_eq!(kind(Path::new("a.JPG")), Some(Kind::Image));
+        assert_eq!(kind(Path::new("a.mkv")), Some(Kind::Video));
+        assert_eq!(kind(Path::new("a.FLAC")), Some(Kind::Audio));
+        assert_eq!(kind(Path::new("a.mp+")), Some(Kind::Audio));
+        assert_eq!(kind(Path::new("a.txt")), None);
+        assert!(Kind::Audio.plays() && Kind::Video.plays() && !Kind::Image.plays());
+    }
 
     #[test]
     fn natural_order() {

@@ -1,4 +1,4 @@
-//! Making Ommata the app that opens photos and videos, through `xdg-mime`
+//! Making Ommata the app that opens photos, videos and audio, through `xdg-mime`
 //! (xdg-utils, on every desktop Linux) and the desktop entry the system
 //! knows Ommata by.
 
@@ -10,7 +10,7 @@ const ENTRY: &str = include_str!("../assets/ommata.desktop");
 /// Its icon, for an entry written here.
 const ICON: &str = include_str!("../assets/ommata.svg");
 
-/// Every type the desktop entry opens: photos, RAW files and videos.
+/// Every type the desktop entry opens: photos, RAW files, videos and audio.
 pub fn mime_types() -> Vec<&'static str> {
     ENTRY
         .lines()
@@ -179,13 +179,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opens_photos_raw_and_video() {
+    fn opens_photos_raw_video_and_audio() {
         let types = mime_types();
         for kind in [
             "image/jpeg",
             "image/x-sony-arw",
             "video/mp4",
             "video/x-matroska",
+            "audio/mpeg",
+            "audio/flac",
         ] {
             assert!(types.contains(&kind), "{kind}");
         }

@@ -12,7 +12,7 @@ use crate::tags::{self, Filter};
 use crate::theme::{Theme, lerp};
 use crate::trim::{self, Progress};
 use crate::update::{self, Updater};
-use crate::video::Player;
+use crate::video::{self, Player};
 use crate::waveform::Waveform;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Key, Mesh, Pos2, Rect, Sense,
@@ -93,6 +93,17 @@ pub fn resolve_start(path: &Path, loader: &Loader) -> Start {
     Start { files, index }
 }
 
+/// A picture the canvas drew, kept to draw again while the next file has
+/// nothing to show yet.
+struct Drawn {
+    path: PathBuf,
+    shape: Shape,
+    /// Keeps a photo's texture alive.
+    _image: Option<TextureHandle>,
+    /// Keeps a video's frame alive, paused.
+    player: Option<Player>,
+}
+
 enum Slot {
     Loading,
     Ready {
@@ -169,7 +180,7 @@ enum Page {
     Filter,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsTab {
     General,
     Tags,
@@ -213,8 +224,34 @@ pub struct App {
     loader: Loader,
     files: Vec<PathBuf>,
     index: usize,
+    /// Direction of the last step through the folder (1 or -1): trashing a
+    /// file moves on the same way.
+    last_step: isize,
     images: HashMap<PathBuf, Slot>,
     player: Option<(PathBuf, Player)>,
+    /// What the canvas last drew for the current file.
+    drawn: Option<Drawn>,
+    /// When the shown file last changed, and when its loading starts if that
+    /// waits for quick skipping to stop.
+    last_go: Option<Instant>,
+    loads_due: Option<Instant>,
+    /// Bottom of the top bar when it was last drawn (none without a file),
+    /// and the tag bar's height: pages open below both, whether or not the
+    /// tag bar shows.
+    top_bar_bottom: Option<f32>,
+    tag_bar_height: f32,
+    /// What Help's key search holds.
+    help_search: String,
+    /// Tags copied with Ctrl+C, to paste onto other files.
+    copied_tags: Option<std::collections::BTreeSet<String>>,
+    /// What was drawn for the file just left: it stays on screen until the
+    /// new file has a picture, instead of a blank screen.
+    held: Option<Drawn>,
+    /// Frame one of the current video and the ones either side of it, shown
+    /// the moment one opens; `None` while decoding or when it has none.
+    posters: HashMap<PathBuf, Option<egui::TextureHandle>>,
+    poster_sender: Sender<(PathBuf, Option<egui::ColorImage>)>,
+    poster_receiver: Receiver<(PathBuf, Option<egui::ColorImage>)>,
     edits: HashMap<PathBuf, Edit>,
     trims: HashMap<PathBuf, Trim>,
     trim_mode: bool,
@@ -272,6 +309,10 @@ pub struct App {
     top_bar_wrap: bool,
     /// Natural widths of the top bar's name and controls, last frame.
     top_bar_widths: (f32, f32),
+    /// Width of the save buttons last frame, and whether they fit beside the
+    /// top bar (else they go in it).
+    save_width: f32,
+    save_beside: bool,
     quitting: bool,
     settings: Settings,
     /// Set while the playhead is dragged: whether to resume playing after.
@@ -330,6 +371,7 @@ impl App {
                 .ok()
         });
         let (snap_sender, snap_receiver) = channel();
+        let (poster_sender, poster_receiver) = channel();
         let (meta_sender, meta_receiver) = channel();
         let settings = Settings::load();
         let check_updates = settings.check_updates;
@@ -338,8 +380,20 @@ impl App {
             loader,
             files: Vec::new(),
             index: 0,
+            last_step: 1,
             images: HashMap::new(),
             player: None,
+            drawn: None,
+            last_go: None,
+            loads_due: None,
+            copied_tags: None,
+            top_bar_bottom: None,
+            tag_bar_height: 46.0,
+            help_search: String::new(),
+            held: None,
+            posters: HashMap::new(),
+            poster_sender,
+            poster_receiver,
             edits: HashMap::new(),
             trims: HashMap::new(),
             trim_mode: false,
@@ -375,6 +429,8 @@ impl App {
             focus_tag_input: false,
             top_bar_wrap: false,
             top_bar_widths: (0.0, 0.0),
+            save_width: 0.0,
+            save_beside: true,
             quitting: false,
             settings,
             resume_after_drag: None,
@@ -495,7 +551,11 @@ impl App {
     /// The tags to suggest while typing one: the tag list, the folder's
     /// tags and the quick tags.
     fn known_tags(&self) -> std::collections::BTreeSet<String> {
-        let quick = self.settings.quick_tags.iter().map(|tag| tags::normalize(tag));
+        let quick = self
+            .settings
+            .quick_tags
+            .iter()
+            .map(|tag| tags::normalize(tag));
         let mut known = self.folder_tags();
         known.extend(self.tag_list.iter().cloned());
         known.extend(quick.filter(|tag| !tag.is_empty()));
@@ -506,7 +566,6 @@ impl App {
     fn set_meta(&mut self, ctx: &egui::Context, path: &Path, meta: Meta) {
         match sidecar::write(path, &meta) {
             Ok(()) => {
-                self.remember_tags(meta.tags.iter().cloned());
                 self.meta_written.insert(path.to_path_buf());
                 self.meta.insert(path.to_path_buf(), meta);
             }
@@ -528,7 +587,10 @@ impl App {
     fn toggle_quick_tag(&mut self, ctx: &egui::Context, index: usize) {
         let tag = tags::normalize(&self.settings.quick_tags[index]);
         if tag.is_empty() {
-            self.notify(ctx, format!("Quick tag {} isn't set yet (Settings)", index + 1));
+            self.notify(
+                ctx,
+                format!("Quick tag {} isn't set yet (Settings)", index + 1),
+            );
             return;
         }
         let mut added = false;
@@ -538,7 +600,62 @@ impl App {
                 meta.tags.remove(&tag);
             }
         });
-        self.notify(ctx, if added { format!("Tagged {tag}") } else { format!("Removed {tag}") });
+        self.notify(
+            ctx,
+            if added {
+                format!("Tagged {tag}")
+            } else {
+                format!("Removed {tag}")
+            },
+        );
+    }
+
+    /// Keep the current file's tags to paste onto others.
+    fn copy_tags(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.current().cloned() else {
+            return;
+        };
+        let tags: std::collections::BTreeSet<String> = self
+            .meta_of(&path)
+            .tags
+            .into_iter()
+            .filter(|tag| !sidecar::is_internal(tag))
+            .collect();
+        let count = tags.len();
+        // On the clipboard too: Ctrl+V only reaches Ommata while the
+        // clipboard holds something, and the tags are handy as text.
+        ctx.copy_text(tags.iter().cloned().collect::<Vec<_>>().join(", "));
+        self.copied_tags = Some(tags);
+        self.notify(
+            ctx,
+            format!("Copied {count} tag{}", if count == 1 { "" } else { "s" }),
+        );
+    }
+
+    /// Put the copied tags on the current file: added to its own, or in
+    /// place of them with `replace`.
+    fn paste_tags(&mut self, ctx: &egui::Context, replace: bool) {
+        let Some(copied) = self.copied_tags.clone() else {
+            self.notify(ctx, "No tags copied yet (Ctrl+C on a file copies its tags)");
+            return;
+        };
+        self.edit_meta(ctx, |meta| {
+            if replace {
+                // Ommata's own markers stay; the tags people see are swapped.
+                meta.tags.retain(|tag| sidecar::is_internal(tag));
+            }
+            meta.tags.extend(copied.iter().cloned());
+        });
+        let count = copied.len();
+        let plural = if count == 1 { "" } else { "s" };
+        self.notify(
+            ctx,
+            if replace {
+                format!("Replaced the tags with {count} copied tag{plural}")
+            } else {
+                format!("Pasted {count} tag{plural}")
+            },
+        );
     }
 
     /// Ctrl+0 to 5: set the rating; the same rating again clears it.
@@ -548,25 +665,34 @@ impl App {
             meta.rating = if meta.rating == rating { 0 } else { rating };
             now = meta.rating;
         });
-        self.notify(ctx, match now {
-            -1 => "Rejected".to_string(),
-            0 => "No rating".to_string(),
-            stars => format!("{stars} star{}", if stars == 1 { "" } else { "s" }),
-        });
+        self.notify(
+            ctx,
+            match now {
+                -1 => "Rejected".to_string(),
+                0 => "No rating".to_string(),
+                stars => format!("{stars} star{}", if stars == 1 { "" } else { "s" }),
+            },
+        );
     }
 
     /// Ctrl+6 to 9: set a colour label; the same one again clears it.
     fn set_label(&mut self, ctx: &egui::Context, label: &str) {
         let mut now = None;
         self.edit_meta(ctx, |meta| {
-            let same = meta.label.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(label));
+            let same = meta
+                .label
+                .as_deref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(label));
             meta.label = (!same).then(|| label.to_string());
             now = meta.label.clone();
         });
-        self.notify(ctx, match now {
-            Some(label) => format!("{label} label"),
-            None => "No label".to_string(),
-        });
+        self.notify(
+            ctx,
+            match now {
+                Some(label) => format!("{label} label"),
+                None => "No label".to_string(),
+            },
+        );
     }
 
     fn current(&self) -> Option<&PathBuf> {
@@ -597,31 +723,79 @@ impl App {
         let path = self.files[self.index].clone();
         self.trim_mode = self.trims.contains_key(&path);
 
+        let keep = self.neighbourhood();
+        self.images.retain(|image, _| keep.contains(image));
+        self.posters.retain(|video, _| keep.contains(video));
+        if let Some(drawn) = self.drawn.take_if(|drawn| drawn.path != path) {
+            self.held = Some(drawn);
+        }
+        if self.player.as_ref().is_some_and(|(open, _)| *open != path) {
+            // A video being left keeps its frame alive while it is held on
+            // screen; paused, so it stops sounding.
+            if let Some((old_path, mut old)) = self.player.take()
+                && let Some(held) = self.held.as_mut().filter(|held| held.path == old_path)
+            {
+                old.set_paused(true);
+                held.player = Some(old);
+            }
+            self.sync_waveform(ctx);
+        }
+        // Skipping quickly: load only the file the skipping stops on, once
+        // it stops, rather than every file passed on the way.
+        let now = Instant::now();
+        let skipping = self.last_go.is_some_and(|at| now - at < SKIP_SETTLE);
+        self.last_go = Some(now);
+        if skipping {
+            self.loads_due = Some(now + SKIP_SETTLE);
+            ctx.request_repaint_after(SKIP_SETTLE);
+        } else {
+            self.start_loads(ctx);
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Ommata")));
+    }
+
+    /// The current file and the ones either side of it.
+    fn neighbourhood(&self) -> Vec<PathBuf> {
         let count = self.files.len();
-        let keep: Vec<PathBuf> = [count - 1, 0, 1]
+        [count - 1, 0, 1]
             .iter()
             .map(|offset| self.files[(self.index + offset) % count].clone())
-            .collect();
-        self.images.retain(|image, _| keep.contains(image));
+            .collect()
+    }
+
+    /// Start decoding the current file and preloading its neighbours: the
+    /// photos, the first frames of the videos, and the player.
+    fn start_loads(&mut self, ctx: &egui::Context) {
+        self.loads_due = None;
+        let Some(path) = self.current().cloned() else {
+            return;
+        };
+        let keep = self.neighbourhood();
         for image in &keep {
             if library::kind(image) == Some(Kind::Image) && !self.images.contains_key(image) {
                 self.images.insert(image.clone(), Slot::Loading);
                 self.loader.spawn(image.clone());
             }
         }
-
-        match library::kind(&path) {
-            Some(Kind::Video) => {
-                if self.player.as_ref().is_none_or(|(open, _)| *open != path) {
-                    let gpu = self.gpu.as_ref().filter(|gpu| !gpu.failed);
-                    self.player = Some((path.clone(), Player::open(path.clone(), ctx, gpu)));
-                }
+        let screen = ctx.content_rect().size() * ctx.pixels_per_point();
+        for video in &keep {
+            if library::kind(video) == Some(Kind::Video) && !self.posters.contains_key(video) {
+                self.posters.insert(video.clone(), None);
+                let (video, sender, ctx) = (video.clone(), self.poster_sender.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let image = video::poster(&video, screen.x as u32, screen.y as u32);
+                    // The app may have quit meanwhile; nothing to update.
+                    let _ = sender.send((video, image));
+                    ctx.request_repaint();
+                });
             }
-            _ => self.player = None,
+        }
+        if library::kind(&path).is_some_and(Kind::plays) && self.player.is_none() {
+            let gpu = self.gpu.as_ref().filter(|gpu| !gpu.failed);
+            self.player = Some((path.clone(), Player::open(path, ctx, gpu)));
         }
         self.sync_waveform(ctx);
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Ommata")));
     }
 
     /// Keep a waveform scan running for the current video while the setting is on.
@@ -657,6 +831,7 @@ impl App {
     }
 
     fn step(&mut self, ctx: &egui::Context, delta: isize) {
+        self.last_step = delta.signum();
         // Tags may have changed since the filter last ran.
         if self.filter.is_active() {
             self.apply_filter(ctx, None);
@@ -710,11 +885,14 @@ impl App {
             }
             scanned = true;
         }
-        if scanned {
-            self.remember_tags(self.folder_tags());
-        }
         if scanned && self.filter.is_active() {
             self.apply_filter(ctx, None);
+        }
+        while let Ok((path, image)) = self.poster_receiver.try_recv() {
+            if let Some(slot) = self.posters.get_mut(&path) {
+                *slot = image
+                    .map(|image| ctx.load_texture("poster", image, egui::TextureOptions::LINEAR));
+            }
         }
         while let Ok((path, result)) = self.loader.receiver.try_recv() {
             if !self.images.contains_key(&path) {
@@ -735,11 +913,14 @@ impl App {
         }
         while let Ok((path, cut)) = self.snap_receiver.try_recv() {
             if let Some(trim) = self.trims.get_mut(&path) {
+                let moved = (cut.min(trim.end) - trim.start).abs() > 1e-4;
                 trim.start = cut.min(trim.end);
-                // Show the frame the trimmed video will actually start on.
+                // Show the frame the trimmed video will actually start on,
+                // if that isn't the one on screen already.
                 if let Some((open, player)) = &mut self.player
                     && *open == path
                     && player.paused
+                    && moved
                 {
                     player.seek(trim.start, true);
                 }
@@ -834,21 +1015,36 @@ impl App {
                 let edit = self.edits.get(&src).copied().unwrap_or_default();
                 let (source, thread_ctx) = (src.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let result =
-                        save_to(&source, &dst, mode, |temp| picture::save(&source, temp, &edit));
+                    let result = save_to(&source, &dst, mode, |temp| {
+                        picture::save(&source, temp, &edit)
+                    });
                     thread_ctx.request_repaint();
                     result.map(|note| (dst, note))
                 })
             }
-            Some(Kind::Video) => {
-                let Some(trim) = self.trims.get(&src).copied() else {
+            Some(Kind::Video | Kind::Audio) => {
+                let turns = self.turns_of(&src);
+                if turns != 0 && !trim::can_rotate(&src) {
+                    self.notify(ctx, "A turn can't be saved in this format");
+                    return;
+                }
+                // A turned video that isn't trimmed keeps all of itself.
+                let whole =
+                    self.player
+                        .as_ref()
+                        .filter(|(path, _)| *path == src)
+                        .map(|(_, player)| Trim {
+                            start: 0.0,
+                            end: player.duration(),
+                        });
+                let Some(trim) = self.trims.get(&src).copied().or(whole) else {
                     return;
                 };
                 let (source, thread_ctx) = (src.clone(), ctx.clone());
                 let job_progress = progress.clone();
                 std::thread::spawn(move || {
                     let result = save_to(&source, &dst, mode, |temp| {
-                        trim::export(&source, temp, trim.start, trim.end, job_progress)
+                        trim::export(&source, temp, trim.start, trim.end, turns, job_progress)
                     });
                     thread_ctx.request_repaint();
                     result.map(|note| (dst, note))
@@ -882,7 +1078,11 @@ impl App {
             return;
         }
         if let Some(path) = self.current() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             self.rename = Some(Rename { name, fresh: true });
         }
     }
@@ -1019,8 +1219,10 @@ impl App {
                     .to_string_lossy()
                     .to_string();
                 self.notify(ctx, format!("Moved {name} to trash"));
-                let index = self.index.min(self.files.len().saturating_sub(1));
-                self.go(ctx, index);
+                self.go(
+                    ctx,
+                    after_removal(self.index, self.files.len(), self.last_step),
+                );
             }
             Err(error) => {
                 self.notify(ctx, format!("Couldn't trash: {error}"));
@@ -1097,9 +1299,16 @@ impl App {
         self.edits.entry(path).or_default().crop = (!full).then_some(tool.rect);
     }
 
+    /// The current file's edit: a photo's, or a video's (which only turns).
     fn edit_mut(&mut self) -> Option<&mut Edit> {
         let path = self.current().cloned()?;
-        (library::kind(&path) == Some(Kind::Image)).then(|| self.edits.entry(path).or_default())
+        matches!(library::kind(&path), Some(Kind::Image | Kind::Video))
+            .then(|| self.edits.entry(path).or_default())
+    }
+
+    /// Quarter turns clockwise the user has turned `path`, not yet saved.
+    fn turns_of(&self, path: &Path) -> u8 {
+        self.edits.get(path).map_or(0, |edit| edit.turns)
     }
 
     /// Apply `change` to the current edit, moving the in-progress crop rect
@@ -1130,15 +1339,27 @@ impl App {
     }
 
     fn flip(&mut self) {
-        self.transform(Edit::flip_h);
+        // Videos turn but don't mirror.
+        if self.current_kind() == Some(Kind::Image) {
+            self.transform(Edit::flip_h);
+        }
     }
 
     // ---- trim ---------------------------------------------------------------
 
-    fn toggle_trim(&mut self) {
+    fn toggle_trim(&mut self, ctx: &egui::Context) {
         let Some(path) = self.current().cloned() else {
             return;
         };
+        match library::kind(&path) {
+            Some(Kind::Video) => {}
+            Some(Kind::Audio) if trim::can_trim_audio(&path) => {}
+            Some(Kind::Audio) => {
+                self.notify(ctx, "This audio format can't be trimmed");
+                return;
+            }
+            _ => return,
+        }
         let Some((_, player)) = &self.player else {
             return;
         };
@@ -1223,11 +1444,22 @@ impl App {
                 return;
             }
         }
-        if ctx.egui_wants_keyboard_input()
-            || self.confirm_quit
-            || self.confirm_trash.is_some()
-            || self.page.is_some()
+        if self.confirm_quit || self.confirm_trash.is_some() || self.page.is_some() {
+            return;
+        }
+        // A button keeps the focus a click gave it, and would take Space and
+        // Enter too: let go of it, the keys are the app's.
+        if let Some(id) = ctx.memory(|memory| memory.focused())
+            && !text_field_focused(ctx)
         {
+            ctx.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        if text_field_focused(ctx) {
+            // Only the tag bar's field lets keys through, and only with Ctrl
+            // or Alt held: quick tags and the rest work while typing a tag.
+            if self.tag_bar && self.rename.is_none() {
+                self.modified_keys(ctx);
+            }
             return;
         }
         let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|input| {
@@ -1241,17 +1473,103 @@ impl App {
                         modifiers,
                         ..
                     } => Some((*key, *modifiers)),
+                    // The window turns Ctrl+X, C and V into clipboard events
+                    // and sends no key for them: they are keys here.
+                    // (Shift+Delete counts as cut too.)
+                    egui::Event::Cut if !input.modifiers.command => {
+                        Some((Key::Delete, input.modifiers))
+                    }
+                    egui::Event::Cut => Some((Key::X, input.modifiers)),
+                    egui::Event::Copy => Some((Key::C, input.modifiers)),
+                    egui::Event::Paste(_) | egui::Event::PasteImage(_) => {
+                        Some((Key::V, input.modifiers))
+                    }
                     _ => None,
                 })
                 .collect()
         });
+        let mut handled = false;
         for (key, modifiers) in pressed {
             if self.mode_key(ctx, key, modifiers) {
+                handled = true;
                 continue;
             }
             if let Some(action) = self.settings.keys.action(Chord::pressed(key, modifiers)) {
+                handled = true;
                 self.run(ctx, action);
             }
+        }
+        // Typing that no key took starts a tag: the tag bar opens with the
+        // text in its field, and typing carries on there.
+        if !handled && self.current().is_some() && self.crop.is_none() {
+            let typed: String = ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            if !typed.trim().is_empty() {
+                self.tag_bar = true;
+                self.focus_tag_input = true;
+                self.tag_input.push_str(&typed);
+            }
+        }
+    }
+
+    /// While the tag field has the cursor: run the keymap's Ctrl and Alt
+    /// keys, and keep them (and what they type) from the field until the
+    /// modifier is released. Text editing keeps its own: copy, cut, paste,
+    /// select all, undo, and Ctrl with the arrows, Backspace or Delete.
+    fn modified_keys(&mut self, ctx: &egui::Context) {
+        let editing = |key: Key, modifiers: egui::Modifiers| {
+            !modifiers.alt
+                && matches!(
+                    key,
+                    Key::A
+                        | Key::C
+                        | Key::V
+                        | Key::X
+                        | Key::Z
+                        | Key::Y
+                        | Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::Backspace
+                        | Key::Delete
+                        | Key::Home
+                        | Key::End
+                )
+        };
+        let mut actions = Vec::new();
+        ctx.input_mut(|input| {
+            let held = input.modifiers.alt || input.modifiers.command;
+            input.events.retain(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } if (modifiers.alt || modifiers.command) && !editing(*key, *modifiers) => {
+                    if *pressed
+                        && let Some(action) =
+                            self.settings.keys.action(Chord::pressed(*key, *modifiers))
+                    {
+                        actions.push(action);
+                    }
+                    false
+                }
+                // What the held modifier would type into the field.
+                egui::Event::Text(_) => !held,
+                _ => true,
+            });
+        });
+        for action in actions {
+            self.run(ctx, action);
         }
     }
 
@@ -1264,7 +1582,7 @@ impl App {
                 if self.crop.is_some() {
                     self.crop = None;
                 } else if self.trim_mode {
-                    self.toggle_trim();
+                    self.toggle_trim(ctx);
                 } else if self.tag_bar {
                     self.tag_bar = false;
                 } else if ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)) {
@@ -1296,11 +1614,17 @@ impl App {
                 self.set_label(ctx, label);
             }
             Action::TagBar if has_file => self.toggle_tag_bar(),
+            Action::CopyTags if has_file => self.copy_tags(ctx),
+            Action::PasteTags if has_file => self.paste_tags(ctx, false),
+            Action::PasteTagsReplace if has_file => self.paste_tags(ctx, true),
             Action::QuickTag(_)
             | Action::Rate(_)
             | Action::Reject
             | Action::Label(_)
-            | Action::TagBar => {}
+            | Action::TagBar
+            | Action::CopyTags
+            | Action::PasteTags
+            | Action::PasteTagsReplace => {}
             Action::Filter => self.page = Some(Page::Filter),
             Action::Save => self.save(ctx, SaveMode::Overwrite),
             Action::SaveCopy => self.save(ctx, SaveMode::Copy),
@@ -1323,7 +1647,11 @@ impl App {
             }
             Action::VolumeUp | Action::VolumeDown => {
                 if let Some((_, player)) = &mut self.player {
-                    let change = if action == Action::VolumeUp { 0.05 } else { -0.05 };
+                    let change = if action == Action::VolumeUp {
+                        0.05
+                    } else {
+                        -0.05
+                    };
                     player.volume = (player.volume + change).clamp(0.0, 1.0);
                     player.muted = false;
                 }
@@ -1337,7 +1665,7 @@ impl App {
             Action::RotateRight => self.rotate(true),
             Action::RotateLeft => self.rotate(false),
             Action::Flip => self.flip(),
-            Action::Trim => self.toggle_trim(),
+            Action::Trim => self.toggle_trim(ctx),
             Action::TrimStart | Action::TrimEnd => {
                 if let Some((_, player)) = &self.player {
                     let position = player.position;
@@ -1384,7 +1712,11 @@ impl App {
             }
         }
         let now = self.player.as_ref().map(|(path, player)| media::Now {
-            title: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            title: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
             duration: player.duration(),
             playing: !player.paused,
             position: player.position,
@@ -1449,31 +1781,54 @@ impl App {
         };
         match library::kind(&path) {
             Some(Kind::Image) => self.image_canvas(ui, rect, &response, &path),
-            Some(Kind::Video) => {
+            Some(Kind::Video | Kind::Audio) => {
                 let Some((_, player)) = &self.player else {
+                    // Not opened yet (skipping past).
+                    self.video_stand_in(ui, rect, &response, &path);
                     return;
                 };
                 if let Some(error) = &player.error {
                     centered_text(
                         ui,
                         rect,
-                        &format!("Can't play this video\n{error}"),
+                        &format!("Can't play this file\n{error}"),
                         palette.muted,
                     );
+                    self.held = None;
+                    return;
+                }
+                if player.info.is_some() && !player.has_video() {
+                    self.held = None;
+                    // Audio alone: an empty screen that still plays and pauses.
+                    if response.clicked() {
+                        self.toggle_play();
+                    }
                     return;
                 }
                 let (Some(texture), Some(info)) = (player.texture(), &player.info) else {
+                    // Not started yet: its first frame if decoded ahead,
+                    // else the frame of the video just left.
+                    self.video_stand_in(ui, rect, &response, &path);
                     return;
                 };
-                let size = vec2(info.size[0] as f32, info.size[1] as f32);
+                // The file's own turn (phone video) and the user's.
+                let turns = (info.turns + self.turns_of(&path)) % 4;
+                let mut size = vec2(info.size[0] as f32, info.size[1] as f32);
+                if turns % 2 == 1 {
+                    size = vec2(size.y, size.x);
+                }
                 let frame_rect = self.zoom_view(ui, rect, rect, &response, size, f32::INFINITY);
                 // Decode at the size shown, zoomed in or not; the decoder
-                // never goes past the video's own resolution.
+                // never goes past the video's own resolution. It decodes
+                // before turning, so a quarter turn swaps the sides.
                 let scale = ui.ctx().pixels_per_point();
-                let target = (
+                let mut target = (
                     (frame_rect.width() * scale) as u32,
                     (frame_rect.height() * scale) as u32,
                 );
+                if turns % 2 == 1 {
+                    target = (target.1, target.0);
+                }
                 if let Some((_, player)) = &mut self.player {
                     player.set_target(target.0, target.1);
                     // A paused frame was decoded for the old size: decode it
@@ -1495,13 +1850,116 @@ impl App {
                     }
                 }
                 self.video_target = Some(target);
-                let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-                ui.painter().image(texture, frame_rect, uv, Color32::WHITE);
+                let shape = turned_image(texture, frame_rect, turns);
+                ui.painter().add(shape.clone());
+                self.drew(&path, shape, None);
                 if response.clicked() {
                     self.toggle_play();
                 }
             }
             None => {}
+        }
+    }
+
+    /// Note what the canvas drew for `path`: the file left before it needs
+    /// holding on screen no longer.
+    fn drew(&mut self, path: &Path, shape: Shape, image: Option<TextureHandle>) {
+        self.held = None;
+        self.drawn = Some(Drawn {
+            path: path.to_path_buf(),
+            shape,
+            _image: image,
+            player: None,
+        });
+    }
+
+    /// The first key of `action`, as shown in tips.
+    fn key_name(&self, action: Action) -> Option<String> {
+        self.settings
+            .keys
+            .keys(action)
+            .first()
+            .map(ToString::to_string)
+    }
+
+    /// `text` with the first key of `action` after it, for a tooltip.
+    fn tip(&self, text: &str, action: Action) -> String {
+        match self.key_name(action) {
+            Some(key) => format!("{text} ({key})"),
+            None => text.to_string(),
+        }
+    }
+
+    /// Previous and next buttons on the left and right edges, halfway down.
+    /// Each shows only while the pointer is over it, on a dark backing so it
+    /// reads on any picture.
+    fn nav_arrows(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        if self.files.len() < 2 || self.crop.is_some() || self.page.is_some() {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        for (delta, side) in [(-1, rect.left()), (1, rect.right())] {
+            let zone = Rect::from_center_size(
+                pos2(side - delta as f32 * NAV_ZONE.x / 2.0, rect.center().y),
+                NAV_ZONE,
+            );
+            let response = ui
+                .interact(zone, Id::unique(("nav arrow", delta)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let shown = ctx.animate_bool_with_time(response.id, response.hovered(), 0.15);
+            if shown > 0.0 {
+                let backing = Rect::from_center_size(zone.center(), vec2(44.0, 88.0));
+                let alpha = |full: f32| (full * shown) as u8;
+                ui.painter()
+                    .rect_filled(backing, 22.0, Color32::from_black_alpha(alpha(150.0)));
+                // A chevron pointing the way it steps.
+                let (center, reach) = (backing.center(), 7.0 * delta as f32);
+                let points = vec![
+                    center + vec2(-reach, -14.0),
+                    center + vec2(reach, 0.0),
+                    center + vec2(-reach, 14.0),
+                ];
+                let color = Color32::from_white_alpha(alpha(235.0));
+                ui.painter()
+                    .add(Shape::line(points, Stroke::new(3.0, color)));
+            }
+            if response.clicked() {
+                self.step(&ctx, delta);
+            }
+        }
+    }
+
+    /// A video with no frame of its own yet: its first frame if decoded
+    /// ahead, else the picture of the file just left.
+    fn video_stand_in(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        response: &egui::Response,
+        path: &Path,
+    ) {
+        let Some(poster) = self.posters.get(path).and_then(Option::as_ref).cloned() else {
+            self.draw_held(ui);
+            return;
+        };
+        // The poster is turned as the file asks; the user's turn is added here.
+        let turns = self.turns_of(path);
+        let mut size = poster.size_vec2();
+        if turns % 2 == 1 {
+            size = vec2(size.y, size.x);
+        }
+        let frame_rect = self.zoom_view(ui, rect, rect, response, size, f32::INFINITY);
+        let shape = turned_image(poster.id(), frame_rect, turns);
+        ui.painter().add(shape.clone());
+        // Held in turn if the next file isn't ready either, rather than a
+        // frame from files ago.
+        self.drew(path, shape, Some(poster));
+    }
+
+    /// The picture of the file just left, while the current one has none yet.
+    fn draw_held(&self, ui: &egui::Ui) {
+        if let Some(held) = &self.held {
+            ui.painter().add(held.shape.clone());
         }
     }
 
@@ -1518,7 +1976,7 @@ impl App {
         ui.painter().text(
             center + vec2(0.0, 4.0),
             Align2::CENTER_CENTER,
-            "Drop a photo or video here",
+            "Drop a photo, video or audio file here",
             FontId::proportional(14.0),
             palette.muted,
         );
@@ -1617,9 +2075,13 @@ impl App {
                     &format!("Can't open this image\n{error}"),
                     palette.muted,
                 );
+                self.held = None;
                 return;
             }
-            _ => return,
+            _ => {
+                self.draw_held(ui);
+                return;
+            }
         };
         let edit = self.edits.get(path).copied().unwrap_or_default();
         // While cropping, show the whole rotated image with the crop overlaid.
@@ -1657,7 +2119,9 @@ impl App {
             });
         }
         mesh.indices.extend([0, 1, 2, 0, 2, 3]);
-        ui.painter().with_clip_rect(rect).add(Shape::mesh(mesh));
+        let shape = Shape::mesh(mesh);
+        ui.painter().with_clip_rect(rect).add(shape.clone());
+        self.drew(path, shape, Some(texture));
 
         if self.crop.is_some() {
             self.crop_overlay(ui, image_rect, response, size, &edit);
@@ -1903,7 +2367,25 @@ impl App {
             self.top_bar_wrap = wrap_now;
             ctx.request_discard("top bar layout");
         }
-        Some(area.response.rect.bottom())
+        // The save buttons sit beside the bar, not in it, so the bar stays put
+        // when edits come and go; in it only when the window has no room.
+        let bar = area.response.rect;
+        let room = ctx.content_rect().right() - BAR_MARGIN - (bar.right() + 8.0);
+        self.save_beside = self.save_width + 24.0 <= room;
+        if self.save_beside && (dirty || self.job.is_some()) {
+            egui::Area::new(Id::unique("save"))
+                .fixed_pos(bar.right_top() + vec2(8.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_opacity(opacity);
+                    bar_frame(&palette).show(ui, |ui| {
+                        // As tall as the bar, the buttons level with its own.
+                        ui.set_height(bar.height() - 14.0);
+                        let layout = egui::Layout::left_to_right(egui::Align::Center);
+                        ui.with_layout(layout, |ui| self.save_row(ctx, ui, kind, &palette));
+                    });
+                });
+        }
+        Some(bar.bottom())
     }
 
     /// Show or hide the tag bar; shown, its field takes the cursor.
@@ -1924,14 +2406,17 @@ impl App {
         let focus = std::mem::take(&mut self.focus_tag_input);
         let mut result = (false, false);
         let known = self.known_tags();
-        egui::Area::new(Id::unique("tag bar"))
+        let reject_key = self.key_name(Action::Reject);
+        let shown = egui::Area::new(Id::unique("tag bar"))
             .anchor(Align2::CENTER_TOP, vec2(0.0, top + 6.0))
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
                 bar_frame(&palette).show(ui, |ui| {
-                    result = tags::bar(ui, &mut meta, &mut input, focus, &known, &palette);
+                    let reject = reject_key.as_deref();
+                    result = tags::bar(ui, &mut meta, &mut input, focus, &known, reject, &palette);
                 });
             });
+        self.tag_bar_height = shown.response.rect.height();
         self.tag_input = input;
         let (changed, edit) = result;
         if changed {
@@ -1990,29 +2475,26 @@ impl App {
                 self.start_rename();
             }
         }
+        // Its room is kept without edits too, so the bar doesn't move.
+        let (dot, response) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
         if dirty {
-            let (dot, response) =
-                ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
             ui.painter()
                 .circle_filled(dot.center(), 3.5, palette.accent);
             response.on_hover_text("Unsaved edits");
         }
         if self.files.len() > 1 {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} / {}",
-                    self.index + 1,
-                    self.files.len()
-                ))
-                .color(palette.muted),
+                egui::RichText::new(format!("{} / {}", self.index + 1, self.files.len()))
+                    .color(palette.muted),
             );
         }
         if self.filter.is_active() {
             let (matching, total) = self.filter_count();
+            let filter_tip = self.tip("Filter", Action::Filter);
             let text =
                 egui::RichText::new(format!("Filter {matching}/{total}")).color(palette.accent);
             if hand(ui.selectable_label(true, text))
-                .on_hover_text("Filter (Ctrl+F)")
+                .on_hover_text(filter_tip)
                 .clicked()
             {
                 self.page = Some(Page::Filter);
@@ -2023,6 +2505,75 @@ impl App {
             Some(tags::SummaryClick::TagBar) => self.toggle_tag_bar(),
             Some(tags::SummaryClick::EditTags) => self.page = Some(Page::Tags),
             None => {}
+        }
+    }
+
+    /// Saving's progress, or Revert, Save copy and Save; measured for
+    /// `save_width`.
+    fn save_row(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        kind: Option<Kind>,
+        palette: &crate::theme::Palette,
+    ) {
+        let row = ui.horizontal(|ui| {
+            if let Some(job) = &self.job {
+                ui.add(egui::Spinner::new());
+                let fraction = job.progress.fraction();
+                ui.label(if fraction > 0.0 {
+                    format!("Saving {:.0}%", fraction * 100.0)
+                } else {
+                    "Saving…".into()
+                });
+                if kind.is_some_and(Kind::plays) && ui.button("Cancel").clicked() {
+                    job.progress.cancel.store(true, Relaxed);
+                }
+            } else {
+                if ui
+                    .button("Revert")
+                    .on_hover_text("Discard edits (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.revert(ctx);
+                }
+                if ui
+                    .button("Save copy")
+                    .on_hover_text("Save as name-edit (Ctrl+Shift+S)")
+                    .clicked()
+                {
+                    self.save(ctx, SaveMode::Copy);
+                }
+                if filled_button(ui, "Save", palette.accent, &palette)
+                    .on_hover_text("Overwrite the original (Ctrl+S)")
+                    .clicked()
+                {
+                    self.save(ctx, SaveMode::Overwrite);
+                }
+            }
+        });
+        self.save_width = row.response.rect.width();
+    }
+
+    /// Rotate left and right, for photos and videos.
+    fn rotate_buttons(&mut self, ui: &mut egui::Ui) {
+        if icon(
+            ui,
+            Icon::RotateLeft,
+            &self.tip("Rotate left", Action::RotateLeft),
+        )
+        .clicked()
+        {
+            self.rotate(false);
+        }
+        if icon(
+            ui,
+            Icon::RotateRight,
+            &self.tip("Rotate right", Action::RotateRight),
+        )
+        .clicked()
+        {
+            self.rotate(true);
         }
     }
 
@@ -2052,23 +2603,27 @@ impl App {
         }
         match kind {
             Some(Kind::Image) => {
-                if icon(ui, Icon::RotateLeft, "Rotate left (Shift+R)").clicked() {
-                    self.rotate(false);
-                }
-                if icon(ui, Icon::RotateRight, "Rotate right (R)").clicked() {
-                    self.rotate(true);
-                }
-                if icon(ui, Icon::Flip, "Flip (H)").clicked() {
+                self.rotate_buttons(ui);
+                if icon(ui, Icon::Flip, &self.tip("Flip", Action::Flip)).clicked() {
                     self.flip();
                 }
-                if icon(ui, Icon::Crop, "Crop (C)").clicked() {
+                if icon(ui, Icon::Crop, &self.tip("Crop", Action::Crop)).clicked() {
                     self.start_crop();
                 }
             }
-            Some(Kind::Video) => {
-                let tip = "Trim (T), set in/out with I / O";
-                if icon_toggle(ui, Icon::Trim, self.trim_mode, tip).clicked() {
-                    self.toggle_trim();
+            Some(Kind::Video | Kind::Audio) => {
+                if kind == Some(Kind::Video) {
+                    self.rotate_buttons(ui);
+                }
+                let key = |action| self.key_name(action).unwrap_or_default();
+                let tip = format!(
+                    "Trim ({}), set in/out with {} / {}",
+                    key(Action::Trim),
+                    key(Action::TrimStart),
+                    key(Action::TrimEnd)
+                );
+                if icon_toggle(ui, Icon::Trim, self.trim_mode, &tip).clicked() {
+                    self.toggle_trim(ctx);
                 }
             }
             None => {}
@@ -2076,56 +2631,28 @@ impl App {
         if icon_toggle(ui, Icon::Tag, self.tag_bar, "Tags and rating (Ctrl+K)").clicked() {
             self.toggle_tag_bar();
         }
-        if dirty || self.job.is_some() {
+        if (dirty || self.job.is_some()) && !self.save_beside {
             ui.separator();
-            if let Some(job) = &self.job {
-                ui.add(egui::Spinner::new());
-                let fraction = job.progress.fraction();
-                ui.label(if fraction > 0.0 {
-                    format!("Saving {:.0}%", fraction * 100.0)
-                } else {
-                    "Saving…".into()
-                });
-                if kind == Some(Kind::Video) && ui.button("Cancel").clicked() {
-                    job.progress.cancel.store(true, Relaxed);
-                }
-            } else {
-                if ui
-                    .button("Revert")
-                    .on_hover_text("Discard edits (Ctrl+Z)")
-                    .clicked()
-                {
-                    self.revert(ctx);
-                }
-                if ui
-                    .button("Save copy")
-                    .on_hover_text("Save as name-edit (Ctrl+Shift+S)")
-                    .clicked()
-                {
-                    self.save(ctx, SaveMode::Copy);
-                }
-                if filled_button(ui, "Save", palette.accent, &palette)
-                    .on_hover_text("Overwrite the original (Ctrl+S)")
-                    .clicked()
-                {
-                    self.save(ctx, SaveMode::Overwrite);
-                }
-            }
+            self.save_row(ctx, ui, kind, palette);
         }
         ui.separator();
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         let (screen_icon, screen_tip) = if fullscreen {
-            (Icon::ExitFullscreen, "Leave fullscreen (F)")
+            (
+                Icon::ExitFullscreen,
+                self.tip("Leave fullscreen", Action::Fullscreen),
+            )
         } else {
-            (Icon::Fullscreen, "Fullscreen (F)")
+            (Icon::Fullscreen, self.tip("Fullscreen", Action::Fullscreen))
         };
-        if icon(ui, screen_icon, screen_tip).clicked() {
+        if icon(ui, screen_icon, &screen_tip).clicked() {
             toggle_fullscreen(ctx);
         }
+        ui.add_space(8.0);
         if icon(ui, Icon::Settings, "Settings").clicked() {
             self.page = Some(Page::Settings(SettingsTab::General));
         }
-        if icon(ui, Icon::Help, "Help (?)").clicked() {
+        if icon(ui, Icon::Help, &self.tip("Help", Action::Help)).clicked() {
             self.page = Some(Page::Help(HelpTab::Keys));
         }
         // Last, and set apart, so a click meant for Help can't land on it.
@@ -2168,8 +2695,20 @@ impl App {
         let timeline_width = (width - 24.0 - 256.0).max(40.0);
         let step = wave_step(ctx.pixels_per_point());
         let columns = ((timeline_width - 12.0) / step).max(1.0) as usize;
-        let wave = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
+        let levels = self.wave_columns(columns, duration).map(<[f32]>::to_vec);
         let settings = self.settings.clone();
+        let wave = levels
+            .as_deref()
+            .filter(|_| settings.waveform)
+            .map(|levels| Wave {
+                levels,
+                min: settings.wave_min,
+                max: settings.wave_max,
+                filled: settings.wave_filled,
+            });
+        let mute_tip = self.tip("Mute", Action::Mute);
+        // Seek-bar thumbnails come turned as the file asks; add the user's turn.
+        let turns = self.current().map_or(0, |path| self.turns_of(path));
         let Some((_, player)) = &mut self.player else {
             return;
         };
@@ -2181,6 +2720,10 @@ impl App {
                 bar_frame(&palette).show(ui, |ui| {
                     ui.set_width(width - 24.0);
                     ui.horizontal(|ui| {
+                        // The row centres each item in its height so far, so
+                        // it starts at the seek bar's full height: otherwise
+                        // play and the time sit higher than the waveform.
+                        ui.set_min_height(timeline_height(wave.as_ref()));
                         let play = if player.paused {
                             Icon::Play
                         } else {
@@ -2192,26 +2735,17 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{} / {}",
-                                fmt_time(player.position),
+                                fmt_time(player.shown_time()),
                                 fmt_time(duration)
                             ))
                             .monospace()
                             .size(12.0),
                         );
                         let volume_width = 90.0;
-                        let wave =
-                            wave.as_deref()
-                                .filter(|_| settings.waveform)
-                                .map(|levels| Wave {
-                                    levels,
-                                    min: settings.wave_min,
-                                    max: settings.wave_max,
-                                    filled: settings.wave_filled,
-                                });
                         let (timeline_action, hover) = timeline(
                             ui,
                             timeline_width,
-                            player.position,
+                            player.shown_time(),
                             duration,
                             trim,
                             wave,
@@ -2222,14 +2756,14 @@ impl App {
                             action = timeline_action;
                         }
                         if let Some((time, at)) = hover {
-                            hover_preview(ctx, player, time, at, &palette);
+                            hover_preview(ctx, player, time, at, turns, &palette);
                         }
                         let volume_icon = if player.muted || player.volume == 0.0 {
                             Icon::Muted
                         } else {
                             Icon::Volume
                         };
-                        if icon(ui, volume_icon, "Mute (M)").clicked() {
+                        if icon(ui, volume_icon, &mute_tip).clicked() {
                             player.muted = !player.muted;
                         }
                         let muted = player.muted;
@@ -2279,9 +2813,8 @@ impl App {
         palette: &crate::theme::Palette,
         full: bool,
     ) {
-        let accent = |ui: &mut egui::Ui, text: String| {
-            filled_button(ui, text, palette.accent, palette)
-        };
+        let accent =
+            |ui: &mut egui::Ui, text: String| filled_button(ui, text, palette.accent, palette);
         let muted = |text: &str| egui::RichText::new(text).color(palette.muted);
         match self.updater.state() {
             update::State::Unknown if full => {
@@ -2300,7 +2833,8 @@ impl App {
                 }
             }
             update::State::CheckFailed(error) if full => {
-                ui.label(muted("Couldn't check for updates.")).on_hover_text(error);
+                ui.label(muted("Couldn't check for updates."))
+                    .on_hover_text(error);
                 if ui.button("Try again").clicked() {
                     self.updater.check();
                 }
@@ -2371,7 +2905,9 @@ impl App {
         let mut filter_changed = false;
         let count = self.filter_count();
         let mut tag_input = std::mem::take(&mut self.tag_input);
-        let mut rebinding = self.rebinding.filter(|_| page == Page::Settings(SettingsTab::Keybinds));
+        let mut rebinding = self
+            .rebinding
+            .filter(|_| page == Page::Settings(SettingsTab::Keybinds));
         if let Some(rebind) = rebinding
             && let Some((key, modifiers)) = take_key_press(ctx)
         {
@@ -2398,7 +2934,15 @@ impl App {
                 }
             }
         }
-        let modal = modal("page", ctx, &palette).show(ctx, |ui| {
+        // Pages hang from just under the top and tag bars, so switching tabs
+        // never moves their top; the space left decides their height.
+        let page_top = self
+            .top_bar_bottom
+            .map_or(24.0, |bottom| bottom + 6.0 + self.tag_bar_height + 12.0);
+        let page_room = ctx.content_rect().height() - page_top - 170.0;
+        let area = egui::Modal::default_area(Id::unique("page"))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, page_top));
+        let modal = modal("page", ctx, &palette).area(area).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
                 let title = match page {
@@ -2438,13 +2982,36 @@ impl App {
                     ui.separator();
                     match tab {
                         SettingsTab::Keybinds => {
-                            let keys = &mut new_settings.keys;
-                            keybinds_ui(ui, keys, &mut rebinding, &settings.quick_tags, &palette);
+                            // In a window too small for the list and its tabs,
+                            // the whole page scrolls instead of running off it.
+                            let screen = ctx.content_rect().size();
+                            let room = page_room.max(60.0);
+                            // The whole list and the button under it; the modal lays
+                            // out within last frame's size, so without this minimum
+                            // the page never grows past its first guess.
+                            let page = keybinds_list_height(ui) + 70.0;
+                            egui::ScrollArea::both()
+                                .id_salt("keybinds page")
+                                .max_height(room)
+                                .min_scrolled_height(page.min(room))
+                                .max_width((screen.x - 80.0).max(120.0))
+                                .show(ui, |ui| {
+                                    let keys = &mut new_settings.keys;
+                                    keybinds_ui(
+                                        ui,
+                                        keys,
+                                        &mut rebinding,
+                                        &settings.quick_tags,
+                                        &palette,
+                                    );
+                                });
                         }
                         _ => {
                             let is_default = tab == SettingsTab::General
-                                && *self.is_default.get_or_insert_with(crate::desktop::is_default);
-                            let height = (ctx.content_rect().height() - 200.0).max(120.0);
+                                && *self
+                                    .is_default
+                                    .get_or_insert_with(crate::desktop::is_default);
+                            let height = page_room.max(60.0);
                             // The modal lays out within last frame's size, so without a
                             // minimum the scroll area never grows past its first guess.
                             egui::ScrollArea::vertical()
@@ -2456,6 +3023,7 @@ impl App {
                                         tab,
                                         &mut new_settings,
                                         &self.tag_list,
+                                        &known,
                                         &mut self.list_input,
                                         is_default,
                                         &palette,
@@ -2499,8 +3067,8 @@ impl App {
                     ui.separator();
                     match tab {
                         HelpTab::Keys => {
-                            let kind = current.as_deref().and_then(library::kind);
-                            keys_overview(ui, &settings, kind, &palette);
+                            let room = (page_room - 100.0).max(120.0);
+                            keys_overview(ui, &settings, &mut self.help_search, room, &palette);
                         }
                         HelpTab::Version => self.version_ui(ctx, ui, &palette),
                         HelpTab::Report => self.report_ui(ctx, ui, &palette),
@@ -2513,13 +3081,17 @@ impl App {
             // Checked again next time, in case another app took over.
             self.is_default = None;
         }
-        self.rebinding = rebinding.filter(|_| self.page == Some(Page::Settings(SettingsTab::Keybinds)));
+        self.rebinding =
+            rebinding.filter(|_| self.page == Some(Page::Settings(SettingsTab::Keybinds)));
         self.tag_input = tag_input;
         match settings_change {
             Some(SettingsChange::MakeDefault) => {
                 match crate::desktop::make_default() {
                     Ok(count) => {
-                        self.notify(ctx, format!("Ommata now opens {count} photo and video types"));
+                        self.notify(
+                            ctx,
+                            format!("Ommata now opens {count} photo and video types"),
+                        );
                     }
                     Err(error) => {
                         self.notify(ctx, format!("Couldn't make Ommata the default: {error}"));
@@ -2829,6 +3401,8 @@ impl eframe::App for App {
             .filter(|_| self.trim_mode);
         let mut next = None;
         if let Some((_, player)) = &mut self.player {
+            // Playback shows no frame past the out point.
+            player.stop = trim.map(|trim| trim.end);
             next = player.update(&ctx, self.gpu.as_mut());
             if let Some(trim) = trim
                 && !player.paused
@@ -2843,10 +3417,19 @@ impl eframe::App for App {
         }
 
         self.media_keys(&ctx);
+        if let Some(due) = self.loads_due {
+            let now = Instant::now();
+            if now >= due {
+                self.start_loads(&ctx);
+            } else {
+                ctx.request_repaint_after(due - now);
+            }
+        }
 
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, self.theme.palette.bg);
         self.canvas(ui, rect);
+        self.nav_arrows(ui, rect);
 
         // Auto-hiding chrome: after CHROME_SECS without input the bars fade
         // out and the cursor hides, in every mode; any input brings them back.
@@ -2862,7 +3445,7 @@ impl eframe::App for App {
             || self.confirm_trash.is_some()
             || self.page.is_some()
             || self.rename.is_some()
-            || ctx.egui_wants_keyboard_input()
+            || text_field_focused(&ctx)
             || ctx.is_pointer_over_egui();
         let visible = pinned || now < self.chrome_until;
         if !visible {
@@ -2873,7 +3456,9 @@ impl eframe::App for App {
         }
         let opacity = ctx.animate_bool_with_time(Id::unique("chrome"), visible, 0.15);
         if opacity > 0.0 {
-            if let Some(bottom) = self.top_bar(&ctx, opacity)
+            let top = self.top_bar(&ctx, opacity);
+            self.top_bar_bottom = top;
+            if let Some(bottom) = top
                 && self.tag_bar
             {
                 self.tag_bar(&ctx, bottom, opacity);
@@ -2895,8 +3480,6 @@ impl eframe::App for App {
         self.theme.palette.bg.to_normalized_gamma_f32()
     }
 }
-
-
 
 /// Write a copy atomically, or overwrite while keeping the original in the trash.
 fn save_to(
@@ -2920,7 +3503,11 @@ fn replace_with_new(
     write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
     library::write_atomic(dst, write)?;
-    let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let name = src
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     Ok(Some(match trash::delete(src) {
         Ok(()) => format!("Saved. Original {name} is in the trash"),
         Err(error) => format!("Saved, but couldn't trash {name}: {error}"),
@@ -2968,6 +3555,35 @@ fn replace_trashing_original(
     }))
 }
 
+/// The file to show after the one at `removed` left a folder of `count`
+/// remaining files: the next one going `direction` (1 or -1), wrapping round
+/// as stepping does.
+fn after_removal(removed: usize, count: usize, direction: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let next = if direction < 0 {
+        removed as isize - 1
+    } else {
+        removed as isize
+    };
+    next.rem_euclid(count as isize) as usize
+}
+
+/// Whether a text field has the cursor. A clicked button keeps keyboard
+/// focus too (egui lets Space press it again), which must not stop the keys.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| memory.focused())
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
+/// Files shown less than this apart count as skipping past: only the one the
+/// skipping stops on is loaded.
+const SKIP_SETTLE: Duration = Duration::from_millis(150);
+
+/// Where the pointer shows a previous or next arrow, at each side edge.
+const NAV_ZONE: Vec2 = vec2(80.0, 160.0);
+
 /// Seek-bar waveform: column levels and the bar heights they map to.
 #[derive(Clone, Copy)]
 struct Wave<'a> {
@@ -2975,6 +3591,11 @@ struct Wave<'a> {
     min: f32,
     max: f32,
     filled: bool,
+}
+
+/// Height of the seek bar: taller when it shows a waveform.
+fn timeline_height(wave: Option<&Wave>) -> f32 {
+    wave.map_or(24.0, |wave| (wave.max + 8.0).max(24.0))
 }
 
 /// The seek bar. Returns what the pointer did, and the hovered time with the
@@ -2990,7 +3611,7 @@ fn timeline(
     drag: &mut Option<Handle>,
     palette: &crate::theme::Palette,
 ) -> (Option<BarAction>, Option<(f64, Pos2)>) {
-    let height = wave.map_or(24.0, |wave| (wave.max + 8.0).max(24.0));
+    let height = timeline_height(wave.as_ref());
     let (rect, response) =
         ui.allocate_exact_size(vec2(width.max(40.0), height), Sense::click_and_drag());
     let track = Rect::from_center_size(rect.center(), vec2(rect.width() - 12.0, 4.0));
@@ -3014,16 +3635,22 @@ fn timeline(
             Some(Handle::End)
         }
     };
+    // The parts a trim cuts off are dead: no seeking into them.
+    let cut_off = |x: f32| trim.is_some_and(|trim| x < x_of(trim.start) || x > x_of(trim.end));
     // Decide from where the button went down (a drag registers only after
     // the pointer has moved a few pixels), matching the hover cursor.
     let press = ui.input(|input| input.pointer.press_origin());
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = press.or(response.interact_pointer_pos())
     {
-        *drag = Some(handle_at(pointer.x).unwrap_or(Handle::Seek));
+        *drag = handle_at(pointer.x).or_else(|| (!cut_off(pointer.x)).then_some(Handle::Seek));
     }
     if let (Some(handle), Some(pointer)) = (*drag, response.interact_pointer_pos()) {
-        let time = time_of(pointer.x);
+        let time = match (handle, trim) {
+            // A seek dragged past an end stops at it.
+            (Handle::Seek, Some(trim)) => time_of(pointer.x).clamp(trim.start, trim.end),
+            _ => time_of(pointer.x),
+        };
         let released = response.drag_stopped() || response.clicked();
         action = Some(match handle {
             Handle::Seek if released => BarAction::Seek(time, true),
@@ -3045,8 +3672,14 @@ fn timeline(
             .and_then(|pointer| handle_at(pointer.x))
             .is_some(),
     };
+    let over_cut = drag.is_none()
+        && response
+            .hover_pos()
+            .is_some_and(|pointer| cut_off(pointer.x));
     if over_handle {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
+    } else if over_cut {
+        // Nothing happens here.
     } else if response.hovered() || drag.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -3057,7 +3690,9 @@ fn timeline(
     let pressed = ui.input(|input| input.pointer.any_down());
     let hover = response
         .hover_pos()
-        .filter(|pointer| drag.is_none() && !pressed && handle_at(pointer.x).is_none())
+        .filter(|pointer| {
+            drag.is_none() && !pressed && handle_at(pointer.x).is_none() && !cut_off(pointer.x)
+        })
         .map(|pointer| {
             (
                 time_of(pointer.x),
@@ -3066,6 +3701,8 @@ fn timeline(
         });
     let painter = ui.painter();
     let base = lerp(palette.surface, palette.fg, 0.18);
+    // What a trim cuts off the front shows as unplayed, like the cut tail.
+    let kept_from = trim.map_or(f32::NEG_INFINITY, |trim| x_of(trim.start));
     // Grey out the parts the trim will cut, over whatever the bar shows.
     let shade_clipped = || {
         let Some(trim) = trim else {
@@ -3098,7 +3735,7 @@ fn timeline(
         // Waveform, accent up to the playhead.
         let unplayed = lerp(palette.surface, palette.fg, 0.32);
         let color_at = |x: f32| {
-            if x <= playhead_x {
+            if x <= playhead_x && x >= kept_from {
                 palette.accent
             } else {
                 unplayed
@@ -3155,8 +3792,11 @@ fn timeline(
         return (action, hover);
     }
     painter.rect_filled(track, CornerRadius::same(2), base);
-    let played = Rect::from_x_y_ranges(track.left()..=playhead_x, track.y_range());
-    painter.rect_filled(played, CornerRadius::same(2), palette.accent);
+    let played_from = kept_from.max(track.left());
+    if playhead_x > played_from {
+        let played = Rect::from_x_y_ranges(played_from..=playhead_x, track.y_range());
+        painter.rect_filled(played, CornerRadius::same(2), palette.accent);
+    }
     shade_clipped();
     trim_handles(4.0, 6.0, 18.0, palette.accent);
     painter.circle_filled(
@@ -3175,6 +3815,30 @@ fn wave_step(pixels_per_point: f32) -> f32 {
     (WAVE_STEP * pixels_per_point).round().max(2.0) / pixels_per_point
 }
 
+/// `texture` drawn to fill `rect`, turned `turns` quarter turns clockwise.
+fn turned_image(texture: egui::TextureId, rect: Rect, turns: u8) -> Shape {
+    let edit = Edit {
+        turns: turns % 4,
+        ..Edit::default()
+    };
+    let mut mesh = Mesh::with_texture(texture);
+    let corners = [
+        (rect.left_top(), pos2(0.0, 0.0)),
+        (rect.right_top(), pos2(1.0, 0.0)),
+        (rect.right_bottom(), pos2(1.0, 1.0)),
+        (rect.left_bottom(), pos2(0.0, 1.0)),
+    ];
+    for (pos, point) in corners {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv: edit.to_uv(point),
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+    Shape::mesh(mesh)
+}
+
 /// YouTube-style thumbnail above the hovered timeline point: the nearest
 /// keyframe at or before `time`, with the hovered time under it.
 fn hover_preview(
@@ -3182,12 +3846,16 @@ fn hover_preview(
     player: &mut Player,
     time: f64,
     at: Pos2,
+    turns: u8,
     palette: &crate::theme::Palette,
 ) {
     let thumbnail = player
         .preview_at(time, ctx)
         .map(|texture| (texture.id(), texture.size_vec2()));
-    let size = thumbnail.map_or(vec2(0.0, 0.0), |(_, size)| size * 0.75);
+    let mut size = thumbnail.map_or(vec2(0.0, 0.0), |(_, size)| size * 0.75);
+    if turns % 2 == 1 {
+        size = vec2(size.y, size.x);
+    }
     egui::Area::new(Id::unique("hover-preview"))
         .order(egui::Order::Tooltip)
         .interactable(false)
@@ -3202,9 +3870,14 @@ fn hover_preview(
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         if let Some((id, _)) = thumbnail {
-                            let image =
-                                egui::Image::new((id, size)).corner_radius(CornerRadius::same(7));
-                            ui.add(image);
+                            if turns == 0 {
+                                let image = egui::Image::new((id, size))
+                                    .corner_radius(CornerRadius::same(7));
+                                ui.add(image);
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                                ui.painter().add(turned_image(id, rect, turns));
+                            }
                         }
                         ui.label(egui::RichText::new(fmt_time(time)).monospace().size(11.0));
                     });
@@ -3219,12 +3892,14 @@ enum SettingsChange {
 }
 
 /// A tab of Settings other than Keybinds. `list` is the tag list,
-/// `list_input` the tag being typed for it.
+/// `folder` the current folder's tags, `list_input` the tag being typed for
+/// the list.
 fn settings_ui(
     ui: &mut egui::Ui,
     tab: SettingsTab,
     settings: &mut Settings,
     list: &std::collections::BTreeSet<String>,
+    folder: &std::collections::BTreeSet<String>,
     list_input: &mut String,
     is_default: bool,
     palette: &crate::theme::Palette,
@@ -3255,12 +3930,21 @@ fn settings_ui(
             }
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Updates").strong());
-            hand(ui.checkbox(&mut settings.check_updates, "Check for updates when Ommata opens"));
-            hint(ui, "Asks GitHub for the newest version number; nothing else is sent.");
+            hand(ui.checkbox(
+                &mut settings.check_updates,
+                "Check for updates when Ommata opens",
+            ));
+            hint(
+                ui,
+                "Asks GitHub for the newest version number; nothing else is sent.",
+            );
         }
         SettingsTab::Tags => {
             ui.label(egui::RichText::new("Quick tags").strong());
-            hint(ui, "Its key adds or removes the tag; / to nest. Change keys in Keybinds.");
+            hint(
+                ui,
+                "Its key adds or removes the tag; / to nest. Change keys in Keybinds.",
+            );
             egui::Grid::new("quick-tags")
                 .num_columns(4)
                 .spacing([8.0, 6.0])
@@ -3296,6 +3980,9 @@ fn settings_ui(
             if let Some(list_change) = tags::list_editor(ui, list, list_input, palette) {
                 change = Some(SettingsChange::List(list_change));
             }
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Folder tags").strong());
+            tags::folder_list(ui, folder, palette);
         }
         SettingsTab::Video => {
             ui.label(egui::RichText::new("Seek bar").strong());
@@ -3347,105 +4034,214 @@ pub(crate) fn quick_tag_keys(keymap: &Keymap) -> [String; 9] {
     })
 }
 
-/// Help's overview of the keys that matter for what is open (`kind`): no
-/// video keys for a photo, no photo keys for a video. Ratings and
-/// labels share a row each, and only quick tags that are set are listed.
+/// One row of Help's key search: the keys, what they do, their group, and
+/// the colour dot of a label action.
+struct KeyRow {
+    keys: String,
+    label: String,
+    group: &'static str,
+    dot: Option<Color32>,
+}
+
+/// Help's key search: every shortcut on a row of its own, filtered and
+/// ranked by a fuzzy match of `query` against the keys, the action and its
+/// group. Quick tags are listed by their tag, and only when set.
 fn keys_overview(
     ui: &mut egui::Ui,
     settings: &Settings,
-    kind: Option<Kind>,
+    query: &mut String,
+    room: f32,
     palette: &crate::theme::Palette,
 ) {
     let keymap = &settings.keys;
-    let first = |action: Action| keymap.keys(action).first().map(ToString::to_string);
-    let range = |from: Action, to: Action| Some(format!("{} – {}", first(from)?, first(to)?));
-    let groups: Vec<(&str, Vec<(String, String)>)> = keys::GROUPS
-        .iter()
-        .filter(|group| match **group {
-            "Video" => kind == Some(Kind::Video),
-            "Photo" => kind == Some(Kind::Image),
-            "Tags" | "Save" => kind.is_some(),
-            _ => true,
-        })
-        .map(|group| {
-            let mut rows = Vec::new();
-            for action in Action::all().into_iter().filter(|a| a.group() == *group) {
-                let row = match action {
-                    Action::Rate(1) => {
-                        range(Action::Rate(1), Action::Rate(5)).map(|key| (key, "1 to 5 stars".into()))
-                    }
-                    Action::Rate(stars) if stars > 1 => None,
-                    Action::Label(0) => range(Action::Label(0), Action::Label(3))
-                        .map(|key| (key, "Red, yellow, green, blue label".into())),
-                    Action::Label(_) => None,
-                    Action::QuickTag(index) => {
-                        let tag = tags::normalize(&settings.quick_tags[usize::from(index)]);
-                        if tag.is_empty() {
-                            None
-                        } else {
-                            first(action).map(|key| (key, tag))
-                        }
-                    }
-                    _ => first(action).map(|key| (key, action.label())),
-                };
-                rows.extend(row);
+    let mut rows = Vec::new();
+    for group in keys::GROUPS {
+        for action in Action::all().into_iter().filter(|a| a.group() == group) {
+            let keys = keymap.keys(action);
+            if keys.is_empty() {
+                continue;
             }
-            // Keys that work only in a mode, and can't be changed.
-            let fixed: &[(&str, &str)] = match *group {
-                "Video" => &[("Esc", "Leave trim")],
-                "Tags" => &[("Esc", "Close the tag bar")],
-                "Photo" => &[
-                    ("Enter", "Apply crop"),
-                    ("Esc", "Leave crop"),
-                    ("1 – 5", "Crop shape, while cropping"),
-                ],
-                "View" => &[("Esc", "Leave fullscreen")],
-                _ => &[],
+            let label = match action {
+                Action::QuickTag(index) => {
+                    let tag = tags::normalize(&settings.quick_tags[usize::from(index)]);
+                    if tag.is_empty() {
+                        continue;
+                    }
+                    format!("Quick tag: {tag}")
+                }
+                _ => action.label(),
             };
-            rows.extend(fixed.iter().map(|(key, label)| (key.to_string(), label.to_string())));
-            (*group, rows)
+            let dot = match action {
+                Action::Label(index) => tags::LABELS.get(usize::from(index)).map(|(_, c)| *c),
+                _ => None,
+            };
+            let keys = keys.iter().map(ToString::to_string).collect::<Vec<_>>();
+            rows.push(KeyRow {
+                keys: keys.join(", "),
+                label,
+                group,
+                dot,
+            });
+        }
+        // Keys that work only in a mode, and can't be changed.
+        let fixed: &[(&str, &str)] = match group {
+            "Video" => &[("Esc", "Leave trim")],
+            "Tags" => &[("Esc", "Close the tag bar")],
+            "Photo" => &[("Enter", "Apply crop"), ("Esc", "Leave crop")],
+            "View" => &[("Esc", "Leave fullscreen")],
+            _ => &[],
+        };
+        rows.extend(fixed.iter().map(|(keys, label)| KeyRow {
+            keys: keys.to_string(),
+            label: label.to_string(),
+            group,
+            dot: None,
+        }));
+        if group == "Photo" {
+            rows.extend(ASPECTS.iter().enumerate().map(|(index, (name, _))| KeyRow {
+                keys: (index + 1).to_string(),
+                label: format!("Crop shape {name}, while cropping"),
+                group,
+                dot: None,
+            }));
+        }
+    }
+    let search = ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Search keys")
+            .desired_width(f32::INFINITY),
+    );
+    // Typing on the open page searches straight away.
+    if ui.memory(|memory| memory.focused().is_none()) {
+        search.request_focus();
+    }
+    let mut shown: Vec<(i32, &KeyRow)> = rows
+        .iter()
+        .filter_map(|row| {
+            let text = format!("{} {} {}", row.label, row.keys, row.group);
+            fuzzy_score(query, &text).map(|score| (score, row))
         })
-        .filter(|(_, rows)| !rows.is_empty())
         .collect();
+    // Best match first; ties keep the groups' order.
+    shown.sort_by_key(|(score, _)| -score);
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .id_salt("key search")
+        .max_height(room)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if shown.is_empty() {
+                ui.label(egui::RichText::new("No keys match.").color(palette.muted));
+            }
+            egui::Grid::new("key search rows")
+                .num_columns(3)
+                .spacing([14.0, 4.0])
+                .striped(false)
+                .show(ui, |ui| {
+                    for (_, row) in &shown {
+                        ui.label(
+                            egui::RichText::new(&row.keys)
+                                .monospace()
+                                .size(11.5)
+                                .color(palette.accent),
+                        );
+                        ui.horizontal(|ui| {
+                            if let Some(color) = row.dot {
+                                let (dot, _) =
+                                    ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                                ui.painter().circle_filled(dot.center(), 5.0, color);
+                            }
+                            ui.label(egui::RichText::new(&row.label).size(12.5));
+                        });
+                        ui.label(
+                            egui::RichText::new(row.group)
+                                .size(11.5)
+                                .color(palette.muted),
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new("Change keys and quick tags in Settings.")
             .color(palette.muted)
             .size(12.0),
     );
-    // Two columns, each group in the one with fewer rows so far.
-    let mut columns: [Vec<&(&str, Vec<(String, String)>)>; 2] = [Vec::new(), Vec::new()];
-    let mut heights = [0; 2];
-    for group in &groups {
-        let side = usize::from(heights[1] < heights[0]);
-        heights[side] += group.1.len() + 2;
-        columns[side].push(group);
-    }
-    ui.columns(2, |uis| {
-        for (ui, column) in uis.iter_mut().zip(&columns) {
-            for (name, rows) in column {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(*name).size(15.0).color(palette.fg));
-                egui::Grid::new(("overview", *name))
-                    .num_columns(2)
-                    .spacing([10.0, 2.0])
-                    .show(ui, |ui| {
-                        for (key, label) in rows {
-                            let key = egui::RichText::new(key)
-                                .monospace()
-                                .size(11.5)
-                                .color(palette.accent);
-                            ui.label(key);
-                            ui.label(egui::RichText::new(label).size(12.5));
-                            ui.end_row();
-                        }
-                    });
+}
+
+/// How well `query` fuzzily matches `text`, or `None` when it doesn't: each
+/// word of the query must appear in order, letters may be skipped. Runs of
+/// letters and matches at the start of a word score higher. Case is ignored.
+fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let mut total = 0;
+    // Where the previous query word's match ended, to reward words that
+    // follow on in the text ("ctrl f" finds "Ctrl+F" first).
+    let mut previous_end: Option<usize> = None;
+    for word in query.to_lowercase().split_whitespace() {
+        let word: Vec<char> = word.chars().collect();
+        let mut best: Option<(i32, usize)> = None;
+        // Try each place the word's first letter appears, keep the best.
+        for start in (0..text.len()).filter(|&i| text[i] == word[0]) {
+            let mut score = 0;
+            let mut at = start;
+            let mut last: Option<usize> = None;
+            let mut matched = true;
+            for &letter in &word {
+                let Some(found) = (at..text.len()).find(|&i| text[i] == letter) else {
+                    matched = false;
+                    break;
+                };
+                score += 1;
+                match last {
+                    Some(p) if p + 1 == found => score += 5,
+                    Some(p) => score -= (found - p - 1).min(5) as i32,
+                    None => {}
+                }
+                if found == 0 || !text[found - 1].is_alphanumeric() {
+                    score += 8;
+                }
+                last = Some(found);
+                at = found + 1;
+            }
+            if !matched {
+                continue;
+            }
+            // A whole word, not the start of a longer one.
+            if text.get(at).is_none_or(|c| !c.is_alphanumeric()) {
+                score += 3;
+            }
+            if previous_end.is_some_and(|end| start == end + 1) {
+                score += 10;
+            }
+            if best.is_none_or(|(b, _)| score > b) {
+                best = Some((score, at));
             }
         }
-    });
+        let (score, end) = best?;
+        total += score;
+        previous_end = Some(end);
+    }
+    Some(total)
 }
 
 /// Every keyboard shortcut, grouped. Clicking a key waits for the new one
 /// (`rebinding`); right-clicking takes it away; + adds another key.
+/// The keybind list's height: twice the category tabs beside it. Longer
+/// categories (Tags) scroll within it, so the page stays small.
+fn keybinds_list_height(ui: &egui::Ui) -> f32 {
+    let tabs = keys::GROUPS
+        .iter()
+        .filter(|group| **group != "Save")
+        .count() as f32;
+    let tab_pane = tabs * KEYBIND_TAB_HEIGHT + (tabs - 1.0) * ui.spacing().item_spacing.y + 8.0;
+    2.0 * tab_pane
+}
+
+/// Height of a category tab on the Keybinds page.
+const KEYBIND_TAB_HEIGHT: f32 = 26.0;
+
 fn keybinds_ui(
     ui: &mut egui::Ui,
     keymap: &mut Keymap,
@@ -3458,10 +4254,9 @@ fn keybinds_ui(
             .color(palette.muted)
             .size(12.0),
     );
-    // Room for the page's title, tabs and button in a short window.
-    let height = (ui.ctx().content_rect().height() - 280.0).clamp(120.0, 420.0);
     // The category picked on the left, kept while Settings is open.
-    let id = ui.scope_id().with("keybind group");
+    let id = Id::unique("keybind group");
+    let height = keybinds_list_height(ui);
     let mut picked: &str = ui
         .data(|data| data.get_temp(id))
         .filter(|group| *group != "Save")
@@ -3480,7 +4275,7 @@ fn keybinds_ui(
                     let editable = keys::GROUPS.into_iter().filter(|group| *group != "Save");
                     for group in editable {
                         let tab = egui::Button::selectable(picked == group, group)
-                            .min_size(vec2(90.0, 26.0));
+                            .min_size(vec2(90.0, KEYBIND_TAB_HEIGHT));
                         if hand(ui.add(tab)).clicked() {
                             picked = group;
                         }
@@ -3492,43 +4287,51 @@ fn keybinds_ui(
         let (line, _) = ui.allocate_exact_size(vec2(17.0, height), Sense::hover());
         let stroke = Stroke::new(1.0, palette.muted.gamma_multiply(0.5));
         ui.painter().vline(line.center().x, line.y_range(), stroke);
-        // A fixed height, so the window keeps its size between categories.
+        // A fixed height, so the page keeps its size between categories;
+        // the list scrolls within it.
         egui::ScrollArea::vertical()
+            .id_salt("keybind list")
             .max_height(height)
             .min_scrolled_height(height)
-            .auto_shrink([false, false])
+            .auto_shrink([true, false])
             // The row lays out sideways; the list inside runs down.
-            .show(ui, |ui| ui.vertical(|ui| {
-                egui::Grid::new(picked)
-                    .num_columns(2)
-                    .spacing([10.0, 3.0])
-                    .min_col_width(150.0)
-                    .show(ui, |ui| {
-                        for action in Action::all().into_iter().filter(|a| a.group() == picked) {
-                            let label = match action {
-                                Action::QuickTag(index) => {
-                                    let tag = tags::normalize(&quick_tags[usize::from(index)]);
-                                    if tag.is_empty() {
-                                        format!("Quick tag {} (not set)", index + 1)
-                                    } else {
-                                        format!("Tag {tag} on / off")
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    egui::Grid::new(picked)
+                        .num_columns(2)
+                        .spacing([10.0, 3.0])
+                        .min_col_width(150.0)
+                        .show(ui, |ui| {
+                            for action in Action::all().into_iter().filter(|a| a.group() == picked)
+                            {
+                                let label = match action {
+                                    Action::QuickTag(index) => {
+                                        let tag = tags::normalize(&quick_tags[usize::from(index)]);
+                                        if tag.is_empty() {
+                                            format!("Quick tag {} (not set)", index + 1)
+                                        } else {
+                                            format!("Tag {tag} on / off")
+                                        }
                                     }
-                                }
-                                _ => action.label(),
-                            };
-                            ui.label(egui::RichText::new(label).size(12.5));
-                            ui.horizontal(|ui| {
-                                keybind_buttons(ui, keymap, rebinding, action, palette);
-                            });
-                            ui.end_row();
-                        }
-                    });
-            }));
+                                    _ => action.label(),
+                                };
+                                ui.label(egui::RichText::new(label).size(12.5));
+                                ui.horizontal(|ui| {
+                                    keybind_buttons(ui, keymap, rebinding, action, palette);
+                                });
+                                ui.end_row();
+                            }
+                        });
+                })
+            });
     });
     ui.data_mut(|data| data.insert_temp(id, picked));
     ui.add_space(6.0);
     if ui
-        .add_enabled(!keymap.is_default(), egui::Button::new("Restore default keys"))
+        .add_enabled(
+            !keymap.is_default(),
+            egui::Button::new("Restore default keys"),
+        )
         .clicked()
     {
         *keymap = Keymap::default();
@@ -3566,7 +4369,9 @@ fn keybind_buttons(
         let text = if waiting(Some(index)) {
             egui::RichText::new("Press a key…").color(palette.fg)
         } else {
-            egui::RichText::new(chord.to_string()).monospace().color(palette.accent)
+            egui::RichText::new(chord.to_string())
+                .monospace()
+                .color(palette.accent)
         };
         let button = hand(ui.button(text)).on_hover_text("Click to change, right-click to remove");
         if button.clicked() {
@@ -3604,11 +4409,9 @@ fn icon_label_button(
     } else {
         palette.muted
     };
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::proportional(14.0),
-        color,
-    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), FontId::proportional(14.0), color);
     let width = 16.0 + 8.0 + galley.size().x;
     let left = rect.center().x - width / 2.0;
     paint_icon(ui.painter(), icon, pos2(left + 8.0, rect.center().y), color);
@@ -4100,6 +4903,35 @@ fn fmt_time(time: f64) -> String {
 mod save_tests {
     use super::*;
 
+    #[test]
+    fn fuzzy_key_search() {
+        assert!(fuzzy_score("", "Mute").is_some());
+        assert!(fuzzy_score("rlab", "Red label").is_some());
+        assert!(fuzzy_score("label red", "Red label").is_some());
+        assert!(fuzzy_score("zz", "Red label").is_none());
+        // Whole words and word starts beat scattered letters.
+        assert!(fuzzy_score("mute", "Mute") > fuzzy_score("mute", "Move to trash, Alt+e"));
+        assert!(
+            fuzzy_score("ctrl+f", "Fullscreen Ctrl+F")
+                > fuzzy_score("ctrl+f", "Filter Ctrl+Shift+F")
+        );
+        assert!(
+            fuzzy_score("ctrl f", "Fullscreen Ctrl+F, F11 View")
+                > fuzzy_score("ctrl f", "Open a file Ctrl+O Browse")
+        );
+    }
+
+    #[test]
+    fn trash_moves_on_in_the_last_direction() {
+        // Five files, the third trashed: four remain.
+        assert_eq!(after_removal(2, 4, 1), 2);
+        assert_eq!(after_removal(2, 4, -1), 1);
+        // Wrapping round at either end, as stepping does.
+        assert_eq!(after_removal(4, 4, 1), 0);
+        assert_eq!(after_removal(0, 4, -1), 3);
+        assert_eq!(after_removal(0, 0, 1), 0);
+    }
+
     /// A fresh folder for one test, inside a fake data home so the trash
     /// used is a test one, on the same disk as the files.
     fn folder(name: &str) -> PathBuf {
@@ -4175,3 +5007,7 @@ mod save_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "../tools/screenshots.rs"]
+mod screenshots;

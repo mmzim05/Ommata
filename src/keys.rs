@@ -4,6 +4,9 @@
 //! A few keys stay fixed because they depend on what is happening, not on a
 //! single action: Esc (leave crop, trim, the tag bar or fullscreen), Enter
 //! (apply a crop) and 1 to 5 (crop shape, while cropping).
+//!
+//! No default key types a character on its own: letters, digits and
+//! punctuation take Alt (or Ctrl), so typing starts a tag instead.
 
 use eframe::egui::{Key, Modifiers};
 use std::collections::BTreeMap;
@@ -38,6 +41,12 @@ pub enum Action {
     /// Colour label, as an index into `tags::LABELS` (red to blue).
     Label(u8),
     TagBar,
+    /// Copy the file's tags, to paste onto others.
+    CopyTags,
+    /// Add the copied tags to the file's.
+    PasteTags,
+    /// Replace the file's tags with the copied ones.
+    PasteTagsReplace,
     Filter,
     Crop,
     RotateRight,
@@ -85,9 +94,12 @@ impl Action {
         all.extend((0..9).map(QuickTag));
         all.extend((0..=5).map(Rate));
         all.push(Reject);
-        all.extend((0..4).map(Label));
+        all.extend((0..5).map(Label));
         all.extend([
             TagBar,
+            CopyTags,
+            PasteTags,
+            PasteTagsReplace,
             Filter,
             Crop,
             RotateRight,
@@ -128,7 +140,8 @@ impl Action {
             Previous | Next | First | Last | Trash | Rename | Open => "Browse",
             PlayPause | Back | Forward | FrameBack | FrameForward | Mute | VolumeUp
             | VolumeDown | Trim | TrimStart | TrimEnd => "Video",
-            QuickTag(_) | Rate(_) | Reject | Label(_) | TagBar | Filter => "Tags",
+            QuickTag(_) | Rate(_) | Reject | Label(_) | TagBar | CopyTags | PasteTags
+            | PasteTagsReplace | Filter => "Tags",
             Crop | RotateRight | RotateLeft | Flip => "Photo",
             ZoomIn | ZoomOut | Fit | ActualSize | Fullscreen | Help => "View",
             Save | SaveCopy | Revert | Quit => "Save",
@@ -162,10 +175,13 @@ impl Action {
             Rate(stars) => return format!("{stars} star{} (again: clear)", plural(stars)),
             Reject => "Reject",
             Label(index) => {
-                let name = ["Red", "Yellow", "Green", "Blue"][usize::from(index.min(3))];
+                let name = ["Red", "Yellow", "Green", "Blue", "Purple"][usize::from(index.min(4))];
                 return format!("{name} label");
             }
             TagBar => "Tag bar",
+            CopyTags => "Copy tags",
+            PasteTags => "Paste tags (add)",
+            PasteTagsReplace => "Paste tags (replace)",
             Filter => "Filter",
             Crop => "Crop",
             RotateRight => "Rotate right",
@@ -212,6 +228,9 @@ impl Action {
             Reject => "reject",
             Label(index) => return format!("label_{}", index + 1),
             TagBar => "tag_bar",
+            CopyTags => "copy_tags",
+            PasteTags => "paste_tags",
+            PasteTagsReplace => "paste_tags_replace",
             Filter => "filter",
             Crop => "crop",
             RotateRight => "rotate_right",
@@ -241,6 +260,11 @@ impl Action {
         let plain = Chord::plain;
         let ctrl = Chord::ctrl;
         let shift = Chord::shift;
+        let alt = Chord::alt;
+        let alt_shift = |key| Chord {
+            shift: true,
+            ..alt(key)
+        };
         match self {
             Previous => vec![plain(Key::ArrowLeft), plain(Key::PageUp)],
             Next => vec![plain(Key::ArrowRight), plain(Key::PageDown)],
@@ -250,32 +274,43 @@ impl Action {
             Rename => vec![plain(Key::F2)],
             Open => vec![ctrl(Key::O)],
             PlayPause => vec![plain(Key::Space)],
-            Back => vec![plain(Key::J), shift(Key::ArrowLeft)],
-            Forward => vec![plain(Key::L), shift(Key::ArrowRight)],
-            FrameBack => vec![plain(Key::Comma)],
-            FrameForward => vec![plain(Key::Period)],
-            Mute => vec![plain(Key::M)],
+            Back => vec![alt(Key::J), shift(Key::ArrowLeft)],
+            Forward => vec![alt(Key::L), shift(Key::ArrowRight)],
+            FrameBack => vec![alt(Key::Comma)],
+            FrameForward => vec![alt(Key::Period)],
+            Mute => vec![alt(Key::M)],
             VolumeUp => vec![plain(Key::ArrowUp)],
             VolumeDown => vec![plain(Key::ArrowDown)],
-            Trim => vec![plain(Key::T)],
-            TrimStart => vec![plain(Key::I)],
-            TrimEnd => vec![plain(Key::O)],
-            QuickTag(index) => vec![plain(DIGITS[usize::from(index) + 1])],
+            Trim => vec![alt(Key::T)],
+            TrimStart => vec![alt(Key::I)],
+            TrimEnd => vec![alt(Key::O)],
+            QuickTag(index) => vec![alt(DIGITS[usize::from(index) + 1])],
+            Rate(0) => vec![ctrl(Key::X)],
             Rate(stars) => vec![ctrl(DIGITS[usize::from(stars)])],
-            Reject => vec![plain(Key::X)],
-            Label(index) => vec![ctrl(DIGITS[usize::from(index) + 6])],
+            Reject => vec![plain(Key::Backspace)],
+            // Red to blue on Ctrl+6 to 9, purple on Ctrl+0.
+            Label(index) => vec![ctrl(DIGITS[(usize::from(index) + 6) % 10])],
             TagBar => vec![ctrl(Key::K)],
-            Filter => vec![ctrl(Key::F)],
-            Crop => vec![plain(Key::C)],
-            RotateRight => vec![plain(Key::R)],
-            RotateLeft => vec![shift(Key::R)],
-            Flip => vec![plain(Key::H)],
-            ZoomIn => vec![plain(Key::Plus), plain(Key::Equals)],
-            ZoomOut => vec![plain(Key::Minus)],
-            Fit => vec![plain(Key::Num0)],
-            ActualSize => vec![plain(Key::Z)],
-            Fullscreen => vec![plain(Key::F), plain(Key::F11)],
-            Help => vec![plain(Key::Questionmark), plain(Key::F1)],
+            CopyTags => vec![ctrl(Key::C)],
+            PasteTags => vec![ctrl(Key::V)],
+            PasteTagsReplace => vec![Chord {
+                shift: true,
+                ..ctrl(Key::V)
+            }],
+            Filter => vec![Chord {
+                shift: true,
+                ..ctrl(Key::F)
+            }],
+            Crop => vec![alt(Key::C)],
+            RotateRight => vec![alt(Key::R)],
+            RotateLeft => vec![alt_shift(Key::R)],
+            Flip => vec![alt(Key::H)],
+            ZoomIn => vec![alt(Key::Plus), alt(Key::Equals)],
+            ZoomOut => vec![alt(Key::Minus)],
+            Fit => vec![alt(Key::Num0)],
+            ActualSize => vec![alt(Key::Z)],
+            Fullscreen => vec![ctrl(Key::F), plain(Key::F11)],
+            Help => vec![alt(Key::Questionmark), plain(Key::F1)],
             Save => vec![ctrl(Key::S)],
             SaveCopy => vec![Chord {
                 shift: true,
@@ -334,6 +369,13 @@ impl Chord {
     pub fn shift(key: Key) -> Self {
         Self {
             shift: true,
+            ..Self::plain(key)
+        }
+    }
+
+    pub fn alt(key: Key) -> Self {
+        Self {
+            alt: true,
             ..Self::plain(key)
         }
     }
@@ -524,7 +566,10 @@ mod tests {
         let mut keys = Keymap::default();
         assert!(keys.read_setting("key_save", "Ctrl+W"));
         assert_eq!(keys.keys(Action::Save), Action::Save.default_keys());
-        let lost = keys.set(Action::Next, vec![Chord::plain(Key::N), Chord::ctrl(Key::S)]);
+        let lost = keys.set(
+            Action::Next,
+            vec![Chord::plain(Key::N), Chord::ctrl(Key::S)],
+        );
         assert!(lost.is_empty());
         assert_eq!(keys.keys(Action::Save), vec![Chord::ctrl(Key::S)]);
         assert_eq!(keys.keys(Action::Next), vec![Chord::plain(Key::N)]);
@@ -568,27 +613,68 @@ mod tests {
     }
 
     #[test]
-    fn plain_numbers_toggle_quick_tags() {
+    fn alt_numbers_toggle_quick_tags() {
         let keys = Keymap::default();
         assert_eq!(
-            keys.action(Chord::plain(Key::Num1)),
+            keys.action(Chord::alt(Key::Num1)),
             Some(Action::QuickTag(0))
         );
         assert_eq!(
-            keys.action(Chord::plain(Key::Num9)),
+            keys.action(Chord::alt(Key::Num9)),
             Some(Action::QuickTag(8))
         );
         assert_eq!(keys.action(Chord::ctrl(Key::Num3)), Some(Action::Rate(3)));
         assert_eq!(keys.action(Chord::ctrl(Key::Num6)), Some(Action::Label(0)));
-        assert_eq!(keys.action(Chord::plain(Key::Num0)), Some(Action::Fit));
+        assert_eq!(keys.action(Chord::alt(Key::Num0)), Some(Action::Fit));
+        assert_eq!(keys.action(Chord::plain(Key::Num1)), None);
+    }
+
+    /// Typing goes to the tag field, so no default key is a character alone.
+    #[test]
+    fn default_keys_never_type_a_character() {
+        // Space is left plain: a blank never starts a tag.
+        let silent = |key: Key| {
+            use Key::*;
+            matches!(
+                key,
+                ArrowLeft
+                    | ArrowRight
+                    | ArrowUp
+                    | ArrowDown
+                    | Space
+                    | Delete
+                    | Home
+                    | End
+                    | PageUp
+                    | PageDown
+                    | Escape
+                    | Enter
+                    | Tab
+                    | Backspace
+                    | Insert
+            ) || key.name().starts_with('F')
+                && key.name().len() > 1
+                && key.name()[1..].chars().all(|c| c.is_ascii_digit())
+        };
+        let types = |key: Key| !silent(key);
+        for action in Action::all() {
+            for chord in action.default_keys() {
+                let modified = chord.ctrl || chord.alt;
+                assert!(modified || !types(chord.key), "{chord} types a character");
+            }
+        }
     }
 
     #[test]
     fn shift_is_ignored_only_without_an_exact_match() {
         let keys = Keymap::default();
-        assert_eq!(keys.action(Chord::shift(Key::R)), Some(Action::RotateLeft));
+        let alt_shift = |key| Chord {
+            shift: true,
+            ..Chord::alt(key)
+        };
+        assert_eq!(keys.action(alt_shift(Key::R)), Some(Action::RotateLeft));
         assert_eq!(
-            keys.action(Chord::shift(Key::Questionmark)),
+            keys.action(alt_shift(Key::Questionmark)),
             Some(Action::Help)
         );
         assert_eq!(keys.action(Chord::plain(Key::Y)), None);
@@ -597,11 +683,11 @@ mod tests {
     #[test]
     fn rebinding_takes_the_key_from_its_old_action() {
         let mut keys = Keymap::default();
-        let lost = keys.set(Action::Crop, vec![Chord::plain(Key::H)]);
+        let lost = keys.set(Action::Crop, vec![Chord::alt(Key::H)]);
         assert_eq!(lost, vec![Action::Flip]);
-        assert_eq!(keys.action(Chord::plain(Key::H)), Some(Action::Crop));
+        assert_eq!(keys.action(Chord::alt(Key::H)), Some(Action::Crop));
         assert_eq!(keys.keys(Action::Flip), Vec::new());
-        assert_eq!(keys.action(Chord::plain(Key::C)), None);
+        assert_eq!(keys.action(Chord::alt(Key::C)), None);
     }
 
     #[test]
@@ -611,13 +697,13 @@ mod tests {
         keys.set(
             Action::QuickTag(0),
             vec![Chord {
-                alt: true,
-                ..Chord::plain(Key::Num1)
+                shift: true,
+                ..Chord::alt(Key::Num1)
             }],
         );
         keys.set(Action::Mute, Vec::new());
         let text = keys.to_settings();
-        assert_eq!(text, "key_mute = \nkey_quick_tag_1 = Alt+1\n");
+        assert_eq!(text, "key_mute = \nkey_quick_tag_1 = Shift+Alt+1\n");
         let mut read = Keymap::default();
         for line in text.lines() {
             let (name, value) = line.split_once('=').unwrap_or_default();
