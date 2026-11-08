@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-07
+
 ### Added
 
 - Audio files play: MP3, AAC, M4A, FLAC, WAV, Ogg Vorbis, Opus, WMA, AIFF, ALAC, APE,
@@ -267,7 +269,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.4
 [0.5.3]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.3
 [0.5.2]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.2
 [0.5.1]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.1
