@@ -9,6 +9,8 @@ the new version.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-11-09
+
 ### Added
 
 - HEIC and HEIF photos open, iPhone photos included, turned upright. Edits to them can't be
@@ -274,7 +276,8 @@ First release.
 - File-manager thumbnailer.
 - AppImage release build.
 
-[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/mmzim05/Ommata/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.5
 [0.5.4]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.4
 [0.5.3]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.3
 [0.5.2]: https://github.com/mmzim05/Ommata/releases/tag/v0.5.2
