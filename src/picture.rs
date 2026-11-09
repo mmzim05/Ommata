@@ -13,7 +13,7 @@ pub struct Decoded {
 }
 
 /// Oriented pixels plus the raw EXIF and ICC chunks to carry over on save.
-type Read = (DynamicImage, Option<Vec<u8>>, Option<Vec<u8>>);
+pub type Read = (DynamicImage, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Whether `path` is a camera RAW file.
 pub fn is_raw(path: &Path) -> bool {
@@ -132,6 +132,9 @@ fn develop_half(mut raw: rawler::RawImage) -> rawler::Result<rawler::imgop::deve
 fn read(path: &Path, full: bool) -> Result<Read, String> {
     if is_raw(path) {
         return read_raw(path, full);
+    }
+    if matches!(ext(path).as_str(), "heic" | "heif") {
+        return crate::heif::read(path);
     }
     let reader = ImageReader::open(path)
         .and_then(|reader| reader.with_guessed_format())

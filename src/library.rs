@@ -18,7 +18,7 @@ impl Kind {
 }
 
 const IMAGE_EXT: &[&str] = &[
-    "jpg", "jpeg", "jpe", "png", "webp", "gif", "tif", "tiff", "bmp",
+    "jpg", "jpeg", "jpe", "png", "webp", "gif", "tif", "tiff", "bmp", "heic", "heif",
 ];
 /// Camera RAW extensions, decoded through rawler.
 pub const RAW_EXT: &[&str] = &[

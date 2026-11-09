@@ -9,6 +9,11 @@ the new version.
 
 ## [Unreleased]
 
+### Added
+
+- HEIC and HEIF photos open, iPhone photos included, turned upright. Edits to them can't be
+  saved yet.
+
 ## [0.5.4] - 2026-11-07
 
 ### Added

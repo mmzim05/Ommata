@@ -2,6 +2,7 @@ mod app;
 mod desktop;
 mod gpu;
 mod grain;
+mod heif;
 mod keys;
 mod library;
 mod media;

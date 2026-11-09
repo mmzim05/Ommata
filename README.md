@@ -32,7 +32,7 @@ your way.
 
 ### Photos and camera RAW
 
-Open JPEG, PNG, WebP and RAW files from most cameras. Zoom to actual pixels, fit to the
+Open JPEG, PNG, WebP, HEIC and RAW files from most cameras. Zoom to actual pixels, fit to the
 window, or go fullscreen. EXIF rotation is applied for you.
 
 <img src="docs/screenshots/photo.webp" alt="Zooming into a photo and stepping to a RAW file" width="800" />
@@ -198,7 +198,7 @@ file it happened with. Ideas are welcome as feature requests.
 
 | Kind       | Formats                                                                                                                           |
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Photos     | JPEG, PNG, WebP, GIF, TIFF, BMP                                                                                                   |
+| Photos     | JPEG, PNG, WebP, HEIC/HEIF, GIF, TIFF, BMP                                                                                        |
 | Camera RAW | Canon, Nikon, Sony, Fujifilm, Olympus, Panasonic, Pentax, Samsung, Leica and other DNG, Phase One, Kodak, Epson, Minolta          |
 | Video      | MP4, MOV, MKV, WebM, AVI, MPEG-TS, MPG, FLV, OGV, WMV, 3GP                                                                        |
 | Audio      | MP3, AAC, M4A, FLAC, WAV, Ogg Vorbis, Opus, WMA, AIFF, ALAC, APE, WavPack, TTA, TAK, Musepack, AC-3, DTS, TrueHD, AMR, DSD, more |
